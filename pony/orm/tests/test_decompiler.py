@@ -4,7 +4,7 @@ import ast
 import sys
 import re
 
-from pony.orm.decompiling import Decompiler
+from pony.orm.decompiling import Decompiler, test_lines
 from pony.orm.asttranslation import ast2src
 
 
@@ -96,7 +96,24 @@ def create_test(gen):
     return wrapped_test
 
 
+def create_test_line_test(line_number, source):
+    def wrapped_test(self):
+        self.assertTestLineDecompiles(source)
+
+    wrapped_test.__name__ = 'test_decompiling_line_%03d' % line_number
+    wrapped_test.__doc__ = source
+    return wrapped_test
+
+
 class TestDecompiler(unittest.TestCase):
+    def assertTestLineDecompiles(self, source):
+        code = compile(source, '<?>', 'eval').co_consts[0]
+        expected = ast.parse(source).body[0]
+        expected.value.generators[0].iter.id = '.0'
+        actual = ast.Expr(Decompiler(code).ast)
+        self.maxDiff = None
+        self.assertEqual(ast.dump(expected), ast.dump(actual))
+
     def assertDecompilesTo(self, src, expected):
         # skip test due to ast.dump has no indent parameter
         if sys.version_info[:2] <= (3, 8):
@@ -230,6 +247,14 @@ class TestDecompiler(unittest.TestCase):
             """
             )
 
+    def test_multiline_jump_to_loop(self):
+        for condition in ('x', 'not x', 'x is None', 'x is not None'):
+            with self.subTest(condition=condition):
+                source = """(m
+                    for m in T
+                    if %s)""" % condition
+                self.assertTestLineDecompiles(source)
+
     def test_ast_multiline(self):
         expr = """(m
                 for m in []
@@ -324,4 +349,12 @@ class TestDecompiler(unittest.TestCase):
 for i, gen in enumerate(generate_gens()):
     test_method = create_test(gen)
     test_method.__name__ = 'test_decompiler_%d' % i
+    setattr(TestDecompiler, test_method.__name__, test_method)
+
+
+for line_number, source in enumerate(test_lines.split('\n')):
+    source = source.strip()
+    if not source or source.startswith('#'):
+        continue
+    test_method = create_test_line_test(line_number, source)
     setattr(TestDecompiler, test_method.__name__, test_method)

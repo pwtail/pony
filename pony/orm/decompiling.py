@@ -96,6 +96,13 @@ double_load_store_ops = {
     'LOAD_FAST_BORROW_LOAD_FAST_BORROW',
 }
 
+direct_jump_to_loop_ops = {
+    'POP_JUMP_IF_FALSE': 'POP_JUMP_BACKWARD_IF_FALSE',
+    'POP_JUMP_IF_TRUE': 'POP_JUMP_BACKWARD_IF_TRUE',
+    'POP_JUMP_IF_NONE': 'POP_JUMP_BACKWARD_IF_NONE',
+    'POP_JUMP_IF_NOT_NONE': 'POP_JUMP_BACKWARD_IF_NOT_NONE',
+}
+
 def clean_assign(node):
     if isinstance(node, ast.Assign):
         return node.targets
@@ -314,6 +321,22 @@ class Decompiler(object):
                         decompiler.jump_map[endpos].append(decompiler.pos)
                     decompiler.instructions_map[decompiler.pos] = len(decompiler.instructions)
                     decompiler.instructions.append((decompiler.pos, i, opname, arg))
+            elif PY312 and not PY313 and not PYPY and opname == 'JUMP_BACKWARD':
+                # In py3.12 multiline generator expressions conditional jumps can point
+                # directly to the common JUMP_BACKWARD after YIELD_VALUE
+                jump_starts = decompiler.jump_map.get(decompiler.pos, [])
+                for jump_start in list(jump_starts):
+                    instruction_index = decompiler.instructions_map[jump_start]
+                    instruction = decompiler.instructions[instruction_index]
+                    pos, next_pos, jump_opname, _ = instruction
+                    backward_opname = direct_jump_to_loop_ops.get(jump_opname)
+                    if backward_opname is None:
+                        continue
+                    decompiler.instructions[instruction_index] = (
+                        pos, next_pos, backward_opname, [arg[0]])
+                    jump_starts.remove(jump_start)
+                    decompiler.jump_map[arg[0]].append(jump_start)
+                    decompiler.conditions_end = max(decompiler.conditions_end, next_pos)
             if opname == 'YIELD_VALUE':
                 before_yield = False
             decompiler.pos = i
@@ -430,11 +453,10 @@ class Decompiler(object):
         end = decompiler.stack.pop()
         start = decompiler.stack.pop()
         node1 = decompiler.stack.pop()
-        if PY313:
-            if isinstance(end, ast.Constant) and end.value is None:
-                end = None
-            if isinstance(start, ast.Constant) and start.value is None:
-                start = None
+        if isinstance(end, ast.Constant) and end.value is None:
+            end = None
+        if isinstance(start, ast.Constant) and start.value is None:
+            start = None
         node2 = ast.Slice(start, end)
         return ast.Subscript(value=node1, slice=node2, ctx=ast.Load())
 
