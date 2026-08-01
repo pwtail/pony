@@ -1,8 +1,11 @@
-from pony.orm import Database, Required, Optional
-from flask_login import UserMixin
 from datetime import datetime
 
+from flask_login import UserMixin
+
+from pony.orm import Database, Optional, Required
+
 db = Database()
+
 
 class User(db.Entity, UserMixin):
     login = Required(str, unique=True)

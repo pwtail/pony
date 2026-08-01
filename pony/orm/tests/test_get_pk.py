@@ -8,14 +8,17 @@ day = date.today()
 
 db = Database()
 
+
 class A(db.Entity):
     b = Required("B")
     c = Required("C")
     PrimaryKey(b, c)
 
+
 class B(db.Entity):
     id = PrimaryKey(date)
     a_set = Set(A)
+
 
 class C(db.Entity):
     x = Required("X")
@@ -23,9 +26,11 @@ class C(db.Entity):
     a_set = Set(A)
     PrimaryKey(x, y)
 
+
 class X(db.Entity):
     id = PrimaryKey(int)
     c_set = Set(C)
+
 
 class Y(db.Entity):
     id = PrimaryKey(int)

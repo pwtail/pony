@@ -1,19 +1,19 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
 
 from pony.orm.core import *
 from pony.orm.core import local
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 
 class TestGeneratorDbSession(unittest.TestCase):
     def setUp(self):
         db = Database()
+
         class Account(db.Entity):
             id = PrimaryKey(int)
             amount = Required(int)
+
         setup_database(db)
 
         self.db = db
@@ -29,29 +29,47 @@ class TestGeneratorDbSession(unittest.TestCase):
         assert local.db_session is None
         self.db = self.Account = None
 
-    @raises_exception(TypeError, 'db_session with `retry` option cannot be applied to generator function')
+    @raises_exception(
+        TypeError,
+        "db_session with `retry` option cannot be applied to generator function",
+    )
     def test1(self):
         @db_session(retry=3)
-        def f(): yield
+        def f():
+            yield
 
-    @raises_exception(TypeError, 'db_session with `ddl` option cannot be applied to generator function')
+    @raises_exception(
+        TypeError,
+        "db_session with `ddl` option cannot be applied to generator function",
+    )
     def test2(self):
         @db_session(ddl=True)
-        def f(): yield
+        def f():
+            yield
 
-    @raises_exception(TypeError, 'db_session with `serializable` option cannot be applied to generator function')
+    @raises_exception(
+        TypeError,
+        "db_session with `serializable` option cannot be applied to generator function",
+    )
     def test3(self):
         @db_session(serializable=True)
-        def f(): yield
+        def f():
+            yield
 
     def test4(self):
         @db_session(immediate=True)
-        def f(): yield
+        def f():
+            yield
 
-    @raises_exception(TransactionError, '@db_session-wrapped generator cannot be used inside another db_session')
+    @raises_exception(
+        TransactionError,
+        "@db_session-wrapped generator cannot be used inside another db_session",
+    )
     def test5(self):
         @db_session
-        def f(): yield
+        def f():
+            yield
+
         with db_session:
             next(f())
 
@@ -84,7 +102,8 @@ class TestGeneratorDbSession(unittest.TestCase):
         self.assertEqual(amount, 2000)
         self.assertEqual(local.db_session, None)
 
-        try: next(gen)
+        try:
+            next(gen)
         except StopIteration:
             self.assertFalse(cache.is_alive)
         else:
@@ -122,7 +141,10 @@ class TestGeneratorDbSession(unittest.TestCase):
             a2 = self.Account[2]
             self.assertEqual(a2.amount, 2100)
 
-    @raises_exception(TransactionError, 'You need to manually commit() changes before suspending the generator')
+    @raises_exception(
+        TransactionError,
+        "You need to manually commit() changes before suspending the generator",
+    )
     def test8(self):
         @db_session
         def f(id1):
@@ -130,7 +152,7 @@ class TestGeneratorDbSession(unittest.TestCase):
             a1.amount += 100
             yield a1.amount
 
-        for amount in f(1):
+        for _amount in f(1):
             pass
 
     def test9(self):
@@ -141,7 +163,7 @@ class TestGeneratorDbSession(unittest.TestCase):
             commit()
             yield a1.amount
 
-        for amount in f(1):
+        for _amount in f(1):
             pass
 
     def test10(self):
@@ -153,7 +175,7 @@ class TestGeneratorDbSession(unittest.TestCase):
 
         with db_session:
             a = self.Account[1].amount
-        for amount in f(1):
+        for _amount in f(1):
             pass
         with db_session:
             b = self.Account[1].amount
@@ -170,7 +192,7 @@ class TestGeneratorDbSession(unittest.TestCase):
         next(gen)
         gen.close()
 
-    @raises_exception(TypeError, 'error message')
+    @raises_exception(TypeError, "error message")
     def test13(self):
         @db_session
         def f(id1):
@@ -179,7 +201,8 @@ class TestGeneratorDbSession(unittest.TestCase):
 
         gen = f(1)
         next(gen)
-        gen.throw(TypeError('error message'))
+        gen.throw(TypeError("error message"))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

@@ -1,19 +1,18 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
 
 from pony.orm.core import *
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 db = Database()
 
-db = Database('sqlite', ':memory:')
+db = Database("sqlite", ":memory:")
+
 
 class Product(db.Entity):
     id = PrimaryKey(int)
     name = Required(str)
-    comments = Set('Comment')
+    comments = Set("Comment")
 
     @property
     def sum_01(self):
@@ -75,7 +74,7 @@ class Product(db.Entity):
 class Comment(db.Entity):
     id = PrimaryKey(int)
     points = Required(int)
-    product = Optional('Product')
+    product = Optional("Product")
 
 
 class TestQuerySetMonad(unittest.TestCase):
@@ -83,16 +82,22 @@ class TestQuerySetMonad(unittest.TestCase):
     def setUpClass(cls):
         setup_database(db)
         with db_session:
-            p1 = Product(id=1, name='P1')
-            p2 = Product(id=2, name='P1', comments=[
-                Comment(id=201, points=5)
-            ])
-            p3 = Product(id=3, name='P1', comments=[
-                Comment(id=301, points=1), Comment(id=302, points=2)
-            ])
-            p4 = Product(id=4, name='P1', comments=[
-                Comment(id=401, points=1), Comment(id=402, points=5), Comment(id=403, points=1)
-            ])
+            p1 = Product(id=1, name="P1")
+            p2 = Product(id=2, name="P1", comments=[Comment(id=201, points=5)])
+            p3 = Product(
+                id=3,
+                name="P1",
+                comments=[Comment(id=301, points=1), Comment(id=302, points=2)],
+            )
+            p4 = Product(
+                id=4,
+                name="P1",
+                comments=[
+                    Comment(id=401, points=1),
+                    Comment(id=402, points=5),
+                    Comment(id=403, points=1),
+                ],
+            )
 
     @classmethod
     def tearDownClass(cls):

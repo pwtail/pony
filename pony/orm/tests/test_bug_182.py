@@ -1,7 +1,7 @@
 import unittest
 
-from pony.orm import *
 from pony import orm
+from pony.orm import *
 from pony.orm.tests import setup_database, teardown_database
 
 db = Database()
@@ -19,6 +19,7 @@ class Worker(User):
 class Admin(Worker):
     pass
 
+
 # And M:1 relationship with another entity
 class Server(db.Entity):
     name = Required(str)
@@ -30,9 +31,9 @@ class Test(unittest.TestCase):
     def setUpClass(cls):
         setup_database(db)
         with orm.db_session:
-            Server(name='s1.example.com', user=User(name="Alex"))
-            Server(name='s2.example.com', user=Worker(name="John"))
-            Server(name='free.example.com', user=None)
+            Server(name="s1.example.com", user=User(name="Alex"))
+            Server(name="s2.example.com", user=Worker(name="John"))
+            Server(name="free.example.com", user=None)
 
     @classmethod
     def tearDownClass(cls):
@@ -41,9 +42,8 @@ class Test(unittest.TestCase):
     @db_session
     def test(self):
         qu = left_join((s.name, s.user.name) for s in db.Server)[:]
-        for server, user in qu:
+        for _server, user in qu:
             if user is None:
                 break
         else:
             self.fail()
-

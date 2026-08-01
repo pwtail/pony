@@ -1,6 +1,7 @@
-import sys, platform
+import platform
+import sys
 
-PYPY = platform.python_implementation() == 'PyPy'
+PYPY = platform.python_implementation() == "PyPy"
 PY36 = sys.version_info[:2] >= (3, 6)
 PY37 = sys.version_info[:2] >= (3, 7)
 PY38 = sys.version_info[:2] >= (3, 8)
@@ -14,6 +15,7 @@ PY314 = sys.version_info[:2] >= (3, 14)
 unicode = str
 buffer = bytes
 int_types = (int,)
+
 
 def cmp(a, b):
     return (a > b) - (a < b)

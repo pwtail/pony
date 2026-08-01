@@ -1,17 +1,17 @@
-from __future__ import print_function
+import sys
+import unittest
 
 from setuptools import setup
-import sys
 
-import unittest
 
 def test_suite():
     test_loader = unittest.TestLoader()
-    test_suite = test_loader.discover('pony.orm.tests', pattern='test_*.py')
+    test_suite = test_loader.discover("pony.orm.tests", pattern="test_*.py")
     return test_suite
 
+
 name = "pony"
-version = __import__('pony').__version__
+version = __import__("pony").__version__
 description = "Pony Object-Relational Mapper"
 long_description = """
 About
@@ -59,29 +59,31 @@ Pony ORM Links:
 """
 
 classifiers = [
-    'Development Status :: 4 - Beta',
-    'Intended Audience :: Developers',
-    'License :: OSI Approved :: Apache Software License',
-    'Operating System :: OS Independent',
-    'Programming Language :: Python',
-    'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.8',
-    'Programming Language :: Python :: 3.9',
-    'Programming Language :: Python :: 3.10',
-    'Programming Language :: Python :: 3.11',
-    'Programming Language :: Python :: 3.12',
-    'Programming Language :: Python :: 3.13',
-    'Programming Language :: Python :: 3.14',
-    'Programming Language :: Python :: Implementation :: PyPy',
-    'Topic :: Software Development :: Libraries',
-    'Topic :: Database'
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Database",
 ]
 
-author = ', '.join([
-    'Alexander Kozlovsky <alexander.kozlovsky@gmail.com>',
-    'Alexey Malashkevich <alexey@ponyorm.org>',
-    'Alexander Tischenko <sashaaero@yandex.ru>'
-])
+author = ", ".join(
+    [
+        "Alexander Kozlovsky <alexander.kozlovsky@gmail.com>",
+        "Alexey Malashkevich <alexey@ponyorm.org>",
+        "Alexander Tischenko <sashaaero@yandex.ru>",
+    ]
+)
 author_email = "team@ponyorm.com"
 url = "https://ponyorm.com"
 project_urls = {
@@ -100,12 +102,12 @@ packages = [
     "pony.orm.integration",
     "pony.orm.tests",
     "pony.thirdparty",
-    "pony.utils"
+    "pony.utils",
 ]
 
 package_data = {
-    'pony.flask.example': ['templates/*.html'],
-    'pony.orm.tests': ['queries.txt']
+    "pony.flask.example": ["templates/*.html"],
+    "pony.orm.tests": ["queries.txt"],
 }
 
 download_url = "http://pypi.python.org/pypi/pony/"
@@ -113,9 +115,11 @@ download_url = "http://pypi.python.org/pypi/pony/"
 if __name__ == "__main__":
     pv = sys.version_info[:2]
     if pv < (3, 8) or pv > (3, 14):
-        s = "Sorry, but %s %s requires Python of one of the following versions: 3.8-3.14." \
+        s = (
+            "Sorry, but %s %s requires Python of one of the following versions: 3.8-3.14."
             " You have version %s"
-        print(s % (name, version, sys.version.split(' ', 1)[0]))
+        )
+        print(s % (name, version, sys.version.split(" ", 1)[0]))
         sys.exit(1)
 
     setup(
@@ -132,5 +136,5 @@ if __name__ == "__main__":
         packages=packages,
         package_data=package_data,
         download_url=download_url,
-        test_suite='setup.test_suite'
+        test_suite="setup.test_suite",
     )

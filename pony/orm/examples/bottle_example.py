@@ -1,9 +1,8 @@
-from __future__ import absolute_import, print_function
-
-from bottle import default_app, install, route, request, redirect, run, template
+from bottle import install, redirect, request, route, run, template
 
 # Import eStore model http://editor.ponyorm.com/user/pony/eStore
-from pony.orm.examples.estore import *
+from pony.orm import select
+from pony.orm.examples.estore import Product
 from pony.orm.integration.bottle_plugin import PonyPlugin
 
 # After the plugin is installed each request will be processed
@@ -14,21 +13,26 @@ from pony.orm.integration.bottle_plugin import PonyPlugin
 #  * return the database connection to the connection pool
 install(PonyPlugin())
 
-@route('/')
-@route('/products/')
+
+@route("/")
+@route("/products/")
 def all_products():
     # Get the list of all products from the database
     products = select(p for p in Product)
-    return template('''
+    return template(
+        """
     <h1>List of products</h1>
     <ul>
     %for p in products:
         <li><a href="/products/{{ p.id }}/">{{ p.name }}</a>
     %end
     </ul>
-    ''', products=products)
+    """,
+        products=products,
+    )
 
-@route('/products/:id/')
+
+@route("/products/:id/")
 def show_product(id):
     # Get the instance of the Product entity by the primary key
     p = Product[id]
@@ -36,7 +40,8 @@ def show_product(id):
     # In this examples it is many-to-many relationship p.categories
     # Since the data were not loaded into the cache yet,
     # it will result in a separate SQL query.
-    return template('''
+    return template(
+        """
     <h1>{{ p.name }}</h1>
     <p>Price: {{ p.price }}</p>
     <p>Product categories:</p>
@@ -47,13 +52,17 @@ def show_product(id):
     </ul>
     <a href="/products/{{ p.id }}/edit/">Edit product info</a>
     <a href="/products/">Return to all products</a>
-    ''', p=p)
+    """,
+        p=p,
+    )
 
-@route('/products/:id/edit/')
+
+@route("/products/:id/edit/")
 def edit_product(id):
     # Get the instance of the Product entity and display its attributes
     p = Product[id]
-    return template('''
+    return template(
+        """
     <form action='/products/{{ p.id }}/edit/' method='post'>
       <table>
         <tr>
@@ -69,15 +78,18 @@ def edit_product(id):
     </form>
     <p><a href="/products/{{ p.id }}/">Discard changes</a>
     <p><a href="/products/">Return to all products</a>
-    ''', p=p)
+    """,
+        p=p,
+    )
 
-@route('/products/:id/edit/', method='POST')
+
+@route("/products/:id/edit/", method="POST")
 def save_product(id):
     # Get the instance of the Product entity
     p = Product[id]
     # Update the attributes with the new values
-    p.name = request.forms.get('name')
-    p.price = request.forms.get('price')
+    p.name = request.forms.get("name")
+    p.price = request.forms.get("price")
     # We might put the commit() command here, but it is not necessary
     # because PonyPlugin will take care of this.
     redirect("/products/%d/" % p.id)
@@ -88,4 +100,4 @@ def save_product(id):
     # and closes the session with commit.
 
 
-run(debug=True, host='localhost', port=8080, reloader=True)
+run(debug=True, host="localhost", port=8080, reloader=True)

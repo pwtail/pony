@@ -1,10 +1,11 @@
 import unittest
 
 from pony.orm import *
-from pony.orm.tests.testutils import raises_exception
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import raises_exception
 
 db = Database()
+
 
 class Person(db.Entity):
     name = Required(str)
@@ -22,15 +23,16 @@ class TestAutostrip(unittest.TestCase):
 
     @db_session
     def test_1(self):
-        p = Person(name=' John  ', tel=' ')
+        p = Person(name=" John  ", tel=" ")
         p.flush()
-        self.assertEqual(p.name, 'John')
-        self.assertEqual(p.tel, '')
+        self.assertEqual(p.name, "John")
+        self.assertEqual(p.tel, "")
 
-    @raises_exception(ValueError, 'Attribute Person.name is required')
+    @raises_exception(ValueError, "Attribute Person.name is required")
     @db_session
     def test_2(self):
-        p = Person(name=' ')
+        p = Person(name=" ")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

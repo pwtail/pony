@@ -1,11 +1,9 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
 from datetime import date, datetime, timedelta
 
 from pony.orm.core import *
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 db = Database()
 
@@ -92,16 +90,24 @@ class TestDate(unittest.TestCase):
         self.assertEqual(set(result), {1})
 
     def test_date_sub_const_timedelta(self):
-        result = select(e.id for e in Entity1 if e.d - timedelta(days=500) < date(2009, 1, 1))
+        result = select(
+            e.id for e in Entity1 if e.d - timedelta(days=500) < date(2009, 1, 1)
+        )
         self.assertEqual(set(result), {1})
 
     def test_datetime_sub_timedelta_param(self):
         td = timedelta(days=500)
-        result = select(e.id for e in Entity1 if e.dt - td < datetime(2009, 1, 1, 10, 20, 30))
+        result = select(
+            e.id for e in Entity1 if e.dt - td < datetime(2009, 1, 1, 10, 20, 30)
+        )
         self.assertEqual(set(result), {1})
 
     def test_datetime_sub_const_timedelta(self):
-        result = select(e.id for e in Entity1 if e.dt - timedelta(days=500) < datetime(2009, 1, 1, 10, 20, 30))
+        result = select(
+            e.id
+            for e in Entity1
+            if e.dt - timedelta(days=500) < datetime(2009, 1, 1, 10, 20, 30)
+        )
         self.assertEqual(set(result), {1})
 
     def test_date_add_timedelta_param(self):
@@ -110,7 +116,9 @@ class TestDate(unittest.TestCase):
         self.assertEqual(set(result), {3})
 
     def test_date_add_const_timedelta(self):
-        result = select(e.id for e in Entity1 if e.d + timedelta(days=500) > date(2013, 1, 1))
+        result = select(
+            e.id for e in Entity1 if e.d + timedelta(days=500) > date(2013, 1, 1)
+        )
         self.assertEqual(set(result), {3})
 
     def test_datetime_add_timedelta_param(self):
@@ -119,22 +127,29 @@ class TestDate(unittest.TestCase):
         self.assertEqual(set(result), {3})
 
     def test_datetime_add_const_timedelta(self):
-        result = select(e.id for e in Entity1 if e.dt + timedelta(days=500) > date(2013, 1, 1))
+        result = select(
+            e.id for e in Entity1 if e.dt + timedelta(days=500) > date(2013, 1, 1)
+        )
         self.assertEqual(set(result), {3})
 
-    @raises_exception(TypeError, "Unsupported operand types 'date' and 'str' for operation '-' in expression: e.d - s")
+    @raises_exception(
+        TypeError,
+        "Unsupported operand types 'date' and 'str' for operation '-' in expression: e.d - s",
+    )
     def test_date_sub_error(self):
-        s = 'hello'
+        s = "hello"
         result = select(e.id for e in Entity1 if e.d - s > timedelta(days=500))
         self.assertEqual(set(result), {1})
 
-    @raises_exception(TypeError,
-                      "Unsupported operand types 'datetime' and 'str' for operation '-' in expression: e.dt - s")
+    @raises_exception(
+        TypeError,
+        "Unsupported operand types 'datetime' and 'str' for operation '-' in expression: e.dt - s",
+    )
     def test_datetime_sub_error(self):
-        s = 'hello'
+        s = "hello"
         result = select(e.id for e in Entity1 if e.dt - s > timedelta(days=500))
         self.assertEqual(set(result), {1})
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

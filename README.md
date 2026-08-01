@@ -50,6 +50,30 @@ The documentation source is available at [https://github.com/ponyorm/pony-doc](h
 Please create new documentation related issues [here](https://github.com/ponyorm/pony-doc/issues) or make a pull request with your improvements.
 
 
+Development
+-----------
+
+Install the development tools:
+
+```console
+python -m pip install -r requirements-dev.txt
+```
+
+Format the Python code and apply safe lint fixes:
+
+```console
+python -m ruff check --fix .
+python -m ruff format .
+```
+
+Check the code without changing any files:
+
+```console
+python -m ruff check .
+python -m ruff format --check .
+```
+
+
 License
 -------
 

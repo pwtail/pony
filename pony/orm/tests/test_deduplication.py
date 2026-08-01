@@ -1,11 +1,11 @@
+import unittest
 from io import StringIO
 
 from pony.orm import *
 from pony.orm.tests import setup_database, teardown_database
 
-import unittest
-
 db = Database()
+
 
 class A(db.Entity):
     id = PrimaryKey(int)
@@ -44,11 +44,6 @@ class TestDeduplication(unittest.TestCase):
         stream = StringIO()
         q.show(stream=stream)
         s = stream.getvalue()
-        self.assertEqual(s, 'id|x    |y  \n'  
-                            '--+-----+---\n'
-                            '3 |False|1.0\n'
-                            '2 |True |4.0\n'
-                            '1 |False|3.0\n')
-
-
-
+        self.assertEqual(
+            s, "id|x    |y  \n--+-----+---\n3 |False|1.0\n2 |True |4.0\n1 |False|3.0\n"
+        )

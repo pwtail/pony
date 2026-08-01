@@ -1,10 +1,8 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
 
 from pony.orm.core import *
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 db = Database()
 
@@ -19,14 +17,14 @@ class TestFlush(unittest.TestCase):
         setup_database(db)
 
     @classmethod
-    def tearDownClass(self):
+    def tearDownClass(cls):
         teardown_database(db)
 
     def test1(self):
         with db_session:
-            a = Person(name='A')
-            b = Person(name='B')
-            c = Person(name='C')
+            a = Person(name="A")
+            b = Person(name="B")
+            c = Person(name="C")
             self.assertEqual(a.id, None)
             self.assertEqual(b.id, None)
             self.assertEqual(c.id, None)

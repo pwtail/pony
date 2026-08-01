@@ -1,27 +1,53 @@
-from __future__ import absolute_import, print_function, division
-from pony.py23compat import PY36, PY37, PY38, PY39, PY310, PY311, PY312, PY313, PY314, PYPY
-
-import sys, types, inspect
-from opcode import opname as opnames, HAVE_ARGUMENT, EXTENDED_ARG, cmp_op
-from opcode import hasconst, hasname, hasjrel, haslocal, hascompare, hasfree, hasjabs
+import inspect
+import types
 from collections import defaultdict
+from opcode import (
+    EXTENDED_ARG,
+    HAVE_ARGUMENT,
+    cmp_op,
+    hascompare,
+    hasconst,
+    hasfree,
+    hasjabs,
+    hasjrel,
+    haslocal,
+    hasname,
+)
+from opcode import opname as opnames
+
+from pony.py23compat import (
+    PY36,
+    PY37,
+    PY38,
+    PY39,
+    PY310,
+    PY311,
+    PY312,
+    PY313,
+    PY314,
+    PYPY,
+)
+
 try:
     from opcode import _nb_ops as nb_ops
 except ImportError:
     nb_ops = None
 
-#from pony.thirdparty.compiler import ast, parse
+# from pony.thirdparty.compiler import ast, parse
 import ast
 
-from pony.utils import throw, get_codeobject_id
+from pony.utils import get_codeobject_id, throw
 
 ##ast.And.__repr__ = lambda self: "And(%s: %s)" % (getattr(self, 'endpos', '?'), repr(self.nodes),)
 ##ast.Or.__repr__ = lambda self: "Or(%s: %s)" % (getattr(self, 'endpos', '?'), repr(self.nodes),)
 
+
 class DecompileError(NotImplementedError):
     pass
 
+
 ast_cache = {}
+
 
 def decompile(x):
     cells = {}
@@ -59,7 +85,7 @@ def simplify(clause):
             return clause
     else:
         return clause
-    if getattr(result, 'endpos', 0) < clause.endpos:
+    if getattr(result, "endpos", 0) < clause.endpos:
         result.endpos = clause.endpos
     return result
 
@@ -73,35 +99,37 @@ def binop(node_type):
         oper2 = decompiler.stack.pop()
         oper1 = decompiler.stack.pop()
         return ast.BinOp(left=oper1, op=node_type(), right=oper2)
+
     return method
 
 
 operator_mapping = {
-    '==': ast.Eq,
-    '!=': ast.NotEq,
-    '<': ast.Lt,
-    '<=': ast.LtE,
-    '>': ast.Gt,
-    '>=': ast.GtE,
-    'is': ast.Is,
-    'is not': ast.IsNot,
-    'in': ast.In,
-    'not in': ast.NotIn
+    "==": ast.Eq,
+    "!=": ast.NotEq,
+    "<": ast.Lt,
+    "<=": ast.LtE,
+    ">": ast.Gt,
+    ">=": ast.GtE,
+    "is": ast.Is,
+    "is not": ast.IsNot,
+    "in": ast.In,
+    "not in": ast.NotIn,
 }
 
 double_load_store_ops = {
-    'LOAD_FAST_LOAD_FAST',
-    'STORE_FAST_LOAD_FAST',
-    'STORE_FAST_STORE_FAST',
-    'LOAD_FAST_BORROW_LOAD_FAST_BORROW',
+    "LOAD_FAST_LOAD_FAST",
+    "STORE_FAST_LOAD_FAST",
+    "STORE_FAST_STORE_FAST",
+    "LOAD_FAST_BORROW_LOAD_FAST_BORROW",
 }
 
 direct_jump_to_loop_ops = {
-    'POP_JUMP_IF_FALSE': 'POP_JUMP_BACKWARD_IF_FALSE',
-    'POP_JUMP_IF_TRUE': 'POP_JUMP_BACKWARD_IF_TRUE',
-    'POP_JUMP_IF_NONE': 'POP_JUMP_BACKWARD_IF_NONE',
-    'POP_JUMP_IF_NOT_NONE': 'POP_JUMP_BACKWARD_IF_NOT_NONE',
+    "POP_JUMP_IF_FALSE": "POP_JUMP_BACKWARD_IF_FALSE",
+    "POP_JUMP_IF_TRUE": "POP_JUMP_BACKWARD_IF_TRUE",
+    "POP_JUMP_IF_NONE": "POP_JUMP_BACKWARD_IF_NONE",
+    "POP_JUMP_IF_NOT_NONE": "POP_JUMP_BACKWARD_IF_NOT_NONE",
 }
+
 
 def clean_assign(node):
     if isinstance(node, ast.Assign):
@@ -163,47 +191,49 @@ def slice_to_ast(value):
     return ast.Slice(start, stop, step)
 
 
-class Decompiler(object):
-    def __init__(decompiler, code, start=0, end=None):
-        decompiler.code = code
-        decompiler.start = decompiler.pos = start
-        if end is None: end = len(code.co_code)
-        decompiler.end = end
-        decompiler.stack = []
-        decompiler.jump_map = defaultdict(list)
-        decompiler.targets = {}
-        decompiler.ast = None
-        decompiler.names = set()
-        decompiler.assnames = set()
-        decompiler.conditions_end = 0
-        decompiler.instructions = []
-        decompiler.instructions_map = {}
-        decompiler.kw_names = None
-        decompiler.or_jumps = set()
-        decompiler.get_instructions()
-        decompiler.analyze_jumps()
-        decompiler.decompile()
-        decompiler.ast = decompiler.stack.pop()
-        decompiler.external_names = decompiler.names - decompiler.assnames
-        if decompiler.stack:
-            throw(DecompileError, 'Compiled code should represent a single expression')
-    def get_instructions(decompiler):
+class Decompiler:
+    def __init__(self, code, start=0, end=None):
+        self.code = code
+        self.start = self.pos = start
+        if end is None:
+            end = len(code.co_code)
+        self.end = end
+        self.stack = []
+        self.jump_map = defaultdict(list)
+        self.targets = {}
+        self.ast = None
+        self.names = set()
+        self.assnames = set()
+        self.conditions_end = 0
+        self.instructions = []
+        self.instructions_map = {}
+        self.kw_names = None
+        self.or_jumps = set()
+        self.get_instructions()
+        self.analyze_jumps()
+        self.decompile()
+        self.ast = self.stack.pop()
+        self.external_names = self.names - self.assnames
+        if self.stack:
+            throw(DecompileError, "Compiled code should represent a single expression")
+
+    def get_instructions(self):
         before_yield = True
-        code = decompiler.code
+        code = self.code
         co_code = code.co_code
         free = code.co_cellvars + code.co_freevars
-        decompiler.abs_jump_to_top = decompiler.for_iter_pos = -1
-        while decompiler.pos < decompiler.end:
-            i = decompiler.pos
+        self.abs_jump_to_top = self.for_iter_pos = -1
+        while self.pos < self.end:
+            i = self.pos
             op = code.co_code[i]
             if PY36:
                 extended_arg = 0
-                oparg = code.co_code[i+1]
+                oparg = code.co_code[i + 1]
                 while op == EXTENDED_ARG:
                     extended_arg = (extended_arg | oparg) << 8
                     i += 2
                     op = code.co_code[i]
-                    oparg = code.co_code[i+1]
+                    oparg = code.co_code[i + 1]
                 oparg = None if op < HAVE_ARGUMENT else oparg | extended_arg
                 i += 2
             else:
@@ -218,15 +248,15 @@ class Decompiler(object):
                         i += 2
 
             # CACHE bytes have inconvenient placement in py3.13, so we need to skip them
-            while i < len(code.co_code) and opnames[code.co_code[i]] == 'CACHE':
+            while i < len(code.co_code) and opnames[code.co_code[i]] == "CACHE":
                 i += 2
 
-            opname = opnames[op].replace('+', '_')
+            opname = opnames[op].replace("+", "_")
             if op >= HAVE_ARGUMENT:
                 if op in hasconst:
                     arg = [code.co_consts[oparg]]
                 elif op in hasname:
-                    if opname == 'LOAD_GLOBAL':
+                    if opname == "LOAD_GLOBAL":
                         push_null = False
                         if PY311:
                             push_null = oparg & 1
@@ -241,12 +271,19 @@ class Decompiler(object):
                     else:
                         arg = [code.co_names[oparg]]
                 elif op in hasjrel:
-                    arg = [i + oparg * (2 if PY310 else 1)
-                           * (-1 if 'BACKWARD' in opname else 1)]
+                    arg = [
+                        i
+                        + oparg
+                        * (2 if PY310 else 1)
+                        * (-1 if "BACKWARD" in opname else 1)
+                    ]
                 elif op in haslocal:
                     if opname in double_load_store_ops:
                         # py3.13: 2 4bit args
-                        arg = [code._varname_from_oparg(oparg >> 4), code._varname_from_oparg(oparg & 0x0f)]
+                        arg = [
+                            code._varname_from_oparg(oparg >> 4),
+                            code._varname_from_oparg(oparg & 0x0F),
+                        ]
                     elif PY313:
                         # co_varnames is incomplete now
                         arg = [code._varname_from_oparg(oparg)]
@@ -266,133 +303,159 @@ class Decompiler(object):
                     arg = [oparg * (2 if PY310 else 1)]
                 else:
                     arg = [oparg]
-            elif PY313 and opname == 'MAKE_FUNCTION' and opnames[code.co_code[i]] == 'SET_FUNCTION_ATTRIBUTE':
+            elif (
+                PY313
+                and opname == "MAKE_FUNCTION"
+                and opnames[code.co_code[i]] == "SET_FUNCTION_ATTRIBUTE"
+            ):
                 # pull attributes from next instruction
-                arg = [code.co_code[i+1]]
+                arg = [code.co_code[i + 1]]
                 i += 2
-            else: arg = []
-            if opname == 'FOR_ITER':
-                decompiler.for_iter_pos = decompiler.pos
-            if (opname in ('JUMP_ABSOLUTE', 'JUMP_NO_INTERRUPT')
-                    and arg[0] == decompiler.for_iter_pos):
-                decompiler.abs_jump_to_top = decompiler.pos
+            else:
+                arg = []
+            if opname == "FOR_ITER":
+                self.for_iter_pos = self.pos
+            if (
+                opname in ("JUMP_ABSOLUTE", "JUMP_NO_INTERRUPT")
+                and arg[0] == self.for_iter_pos
+            ):
+                self.abs_jump_to_top = self.pos
 
             # NOT_TAKEN has a similar problem as CACHE, but does not change rel jump addresses, so needs to be here
-            while i < len(code.co_code) and opnames[code.co_code[i]] == 'NOT_TAKEN':
+            while i < len(code.co_code) and opnames[code.co_code[i]] == "NOT_TAKEN":
                 i += 2
 
             if before_yield:
                 merge = False
-                if opname == 'JUMP_BACKWARD':
+                if opname == "JUMP_BACKWARD":
                     # in py 3.12 we have jump_if_true forward for yield
                     # and unconditional jump_backward for loop, so we
                     # fixup previous instruction to match pre-3.12,
                     # which is conditional jump backward for loop
                     # and fall through for yield
-                    prev = list(decompiler.instructions[-1])
+                    prev = list(self.instructions[-1])
                     endpos = arg[0]
                     merge = True
-                    if prev[2] == 'POP_JUMP_IF_TRUE':
-                        prev[2] = 'POP_JUMP_BACKWARD_IF_FALSE'
-                    elif prev[2] == 'POP_JUMP_IF_FALSE':
-                        prev[2] = 'POP_JUMP_BACKWARD_IF_TRUE'
-                    elif prev[2] == 'POP_JUMP_IF_NOT_NONE':
-                        prev[2] = 'POP_JUMP_BACKWARD_IF_NONE'
-                    elif prev[2] == 'POP_JUMP_IF_NONE':
-                        prev[2] = 'POP_JUMP_BACKWARD_IF_NOT_NONE'
-                    elif prev[2] == 'LIST_APPEND':
+                    if prev[2] == "POP_JUMP_IF_TRUE":
+                        prev[2] = "POP_JUMP_BACKWARD_IF_FALSE"
+                    elif prev[2] == "POP_JUMP_IF_FALSE":
+                        prev[2] = "POP_JUMP_BACKWARD_IF_TRUE"
+                    elif prev[2] == "POP_JUMP_IF_NOT_NONE":
+                        prev[2] = "POP_JUMP_BACKWARD_IF_NONE"
+                    elif prev[2] == "POP_JUMP_IF_NONE":
+                        prev[2] = "POP_JUMP_BACKWARD_IF_NOT_NONE"
+                    elif prev[2] == "LIST_APPEND":
                         merge = False
                     else:
-                        raise DecompileError(f"Unsupported instruction combination: {prev[2]} + {opname}")
+                        raise DecompileError(
+                            f"Unsupported instruction combination: {prev[2]} + {opname}"
+                        )
                     if merge:
                         old_endpos = prev[3][0]
                         prev[1] = i
                         prev[3] = arg
-                        decompiler.instructions[-1] = tuple(prev)
-                        if endpos < decompiler.pos:
-                            decompiler.conditions_end = i
-                        decompiler.jump_map[old_endpos].remove(prev[0])
-                        decompiler.jump_map[endpos].append(prev[0])
+                        self.instructions[-1] = tuple(prev)
+                        if endpos < self.pos:
+                            self.conditions_end = i
+                        self.jump_map[old_endpos].remove(prev[0])
+                        self.jump_map[endpos].append(prev[0])
                 if not merge:
-                    if 'JUMP' in opname:
+                    if "JUMP" in opname:
                         endpos = arg[0]
-                        if endpos < decompiler.pos:
-                            decompiler.conditions_end = i
-                        decompiler.jump_map[endpos].append(decompiler.pos)
-                    decompiler.instructions_map[decompiler.pos] = len(decompiler.instructions)
-                    decompiler.instructions.append((decompiler.pos, i, opname, arg))
-            elif PY312 and not PY313 and not PYPY and opname == 'JUMP_BACKWARD':
+                        if endpos < self.pos:
+                            self.conditions_end = i
+                        self.jump_map[endpos].append(self.pos)
+                    self.instructions_map[self.pos] = len(self.instructions)
+                    self.instructions.append((self.pos, i, opname, arg))
+            elif PY312 and not PY313 and not PYPY and opname == "JUMP_BACKWARD":
                 # In py3.12 multiline generator expressions conditional jumps can point
                 # directly to the common JUMP_BACKWARD after YIELD_VALUE
-                jump_starts = decompiler.jump_map.get(decompiler.pos, [])
+                jump_starts = self.jump_map.get(self.pos, [])
                 for jump_start in list(jump_starts):
-                    instruction_index = decompiler.instructions_map[jump_start]
-                    instruction = decompiler.instructions[instruction_index]
+                    instruction_index = self.instructions_map[jump_start]
+                    instruction = self.instructions[instruction_index]
                     pos, next_pos, jump_opname, _ = instruction
                     backward_opname = direct_jump_to_loop_ops.get(jump_opname)
                     if backward_opname is None:
                         continue
-                    decompiler.instructions[instruction_index] = (
-                        pos, next_pos, backward_opname, [arg[0]])
+                    self.instructions[instruction_index] = (
+                        pos,
+                        next_pos,
+                        backward_opname,
+                        [arg[0]],
+                    )
                     jump_starts.remove(jump_start)
-                    decompiler.jump_map[arg[0]].append(jump_start)
-                    decompiler.conditions_end = max(decompiler.conditions_end, next_pos)
-            if opname == 'YIELD_VALUE':
+                    self.jump_map[arg[0]].append(jump_start)
+                    self.conditions_end = max(self.conditions_end, next_pos)
+            if opname == "YIELD_VALUE":
                 before_yield = False
-            decompiler.pos = i
-    def analyze_jumps(decompiler):
-        if PYPY:
-            targets = decompiler.jump_map.pop(decompiler.abs_jump_to_top, [])
-            decompiler.jump_map[decompiler.for_iter_pos] = targets
-            for i, (x, y, opname, arg) in enumerate(decompiler.instructions):
-                if 'JUMP' in opname:
-                    target = arg[0]
-                    if target == decompiler.abs_jump_to_top:
-                        decompiler.instructions[i] = (x, y, opname, [decompiler.for_iter_pos])
-                        decompiler.conditions_end = y
+            self.pos = i
 
-        i = decompiler.instructions_map[decompiler.conditions_end]
+    def analyze_jumps(self):
+        if PYPY:
+            targets = self.jump_map.pop(self.abs_jump_to_top, [])
+            self.jump_map[self.for_iter_pos] = targets
+            for i, (x, y, opname, arg) in enumerate(self.instructions):
+                if "JUMP" in opname:
+                    target = arg[0]
+                    if target == self.abs_jump_to_top:
+                        self.instructions[i] = (
+                            x,
+                            y,
+                            opname,
+                            [self.for_iter_pos],
+                        )
+                        self.conditions_end = y
+
+        i = self.instructions_map[self.conditions_end]
         while i > 0:
-            pos, next_pos, opname, arg = decompiler.instructions[i]
-            if pos in decompiler.jump_map:
-                for jump_start_pos in decompiler.jump_map[pos]:
+            pos, next_pos, opname, arg = self.instructions[i]
+            if pos in self.jump_map:
+                for jump_start_pos in self.jump_map[pos]:
                     if jump_start_pos > pos:
                         continue
-                    for or_jump_start_pos in decompiler.or_jumps:
+                    for or_jump_start_pos in self.or_jumps:
                         if pos > or_jump_start_pos > jump_start_pos:
                             break  # And jump
                     else:
-                        decompiler.or_jumps.add(jump_start_pos)
+                        self.or_jumps.add(jump_start_pos)
             i -= 1
-    def decompile(decompiler):
-        for pos, next_pos, opname, arg in decompiler.instructions:
-            if pos in decompiler.targets:
-                decompiler.process_target(pos)
-            method = getattr(decompiler, opname, None)
+
+    def decompile(self):
+        for pos, next_pos, opname, arg in self.instructions:
+            if pos in self.targets:
+                self.process_target(pos)
+            method = getattr(self, opname, None)
             if method is None:
-                throw(DecompileError('Unsupported operation: %s' % opname))
-            decompiler.pos = pos
-            decompiler.next_pos = next_pos
+                throw(DecompileError("Unsupported operation: %s" % opname))
+            self.pos = pos
+            self.next_pos = next_pos
             x = method(*arg)
             if x is not None:
-                decompiler.stack.append(x)
+                self.stack.append(x)
 
-    def pop_items(decompiler, size):
-        if not size: return []
-        result = decompiler.stack[-size:]
-        decompiler.stack[-size:] = []
+    def pop_items(self, size):
+        if not size:
+            return []
+        result = self.stack[-size:]
+        self.stack[-size:] = []
         return result
-    def store(decompiler, node):
-        stack = decompiler.stack
+
+    def store(self, node):
+        stack = self.stack
         if not stack:
-            stack.append(node); return
+            stack.append(node)
+            return
         top = stack[-1]
         if isinstance(top, ast.Assign):
             target = top.targets
-            if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) < top.count:
+            if (
+                isinstance(target, (ast.Tuple, ast.List))
+                and len(target.elts) < top.count
+            ):
                 target.elts.append(clean_assign(node))
                 if len(target.elts) == top.count:
-                    decompiler.store(stack.pop())
+                    self.store(stack.pop())
             else:
                 stack.append(node)
         elif isinstance(top, ast.comprehension):
@@ -403,27 +466,27 @@ class Decompiler(object):
         else:
             stack.append(node)
 
-    BINARY_POWER        = binop(ast.Pow)
-    BINARY_MULTIPLY     = binop(ast.Mult)
-    BINARY_DIVIDE       = binop(ast.Div)
+    BINARY_POWER = binop(ast.Pow)
+    BINARY_MULTIPLY = binop(ast.Mult)
+    BINARY_DIVIDE = binop(ast.Div)
     BINARY_FLOOR_DIVIDE = binop(ast.FloorDiv)
-    BINARY_ADD          = binop(ast.Add)
-    BINARY_SUBTRACT     = binop(ast.Sub)
-    BINARY_LSHIFT       = binop(ast.LShift)
-    BINARY_RSHIFT       = binop(ast.RShift)
-    BINARY_AND          = binop(ast.BitAnd)
-    BINARY_XOR          = binop(ast.BitXor)
-    BINARY_OR           = binop(ast.BitOr)
-    BINARY_TRUE_DIVIDE  = BINARY_DIVIDE
-    BINARY_MODULO       = binop(ast.Mod)
+    BINARY_ADD = binop(ast.Add)
+    BINARY_SUBTRACT = binop(ast.Sub)
+    BINARY_LSHIFT = binop(ast.LShift)
+    BINARY_RSHIFT = binop(ast.RShift)
+    BINARY_AND = binop(ast.BitAnd)
+    BINARY_XOR = binop(ast.BitXor)
+    BINARY_OR = binop(ast.BitOr)
+    BINARY_TRUE_DIVIDE = BINARY_DIVIDE
+    BINARY_MODULO = binop(ast.Mod)
 
-    def BINARY_OP(decompiler, opcode):
+    def BINARY_OP(self, opcode):
         opname, symbol = nb_ops[opcode]
-        inplace = opname.startswith('NB_INPLACE_')
-        opname = opname.split('_', 2 if inplace else 1)[-1]
+        inplace = opname.startswith("NB_INPLACE_")
+        opname = opname.split("_", 2 if inplace else 1)[-1]
 
         if opname == "SUBSCR":
-            return decompiler.BINARY_SUBSCR()
+            return self.BINARY_SUBSCR()
 
         op = {
             "ADD": ast.Add,
@@ -441,18 +504,18 @@ class Decompiler(object):
             "XOR": ast.BitXor,
         }[opname]
 
-        oper2 = decompiler.stack.pop()
-        oper1 = decompiler.stack.pop()
+        oper2 = self.stack.pop()
+        oper1 = self.stack.pop()
         r = ast.BinOp(left=oper1, op=op(), right=oper2)
         if inplace:
             r = ast.Name(oper1, r)
         return r
 
-    def BINARY_SLICE(decompiler):
+    def BINARY_SLICE(self):
         # 3.12 optimized BUILD_SLICE + BINARY_SUBSCR
-        end = decompiler.stack.pop()
-        start = decompiler.stack.pop()
-        node1 = decompiler.stack.pop()
+        end = self.stack.pop()
+        start = self.stack.pop()
+        node1 = self.stack.pop()
         if isinstance(end, ast.Constant) and end.value is None:
             end = None
         if isinstance(start, ast.Constant) and start.value is None:
@@ -460,9 +523,9 @@ class Decompiler(object):
         node2 = ast.Slice(start, end)
         return ast.Subscript(value=node1, slice=node2, ctx=ast.Load())
 
-    def BINARY_SUBSCR(decompiler):
-        node2 = decompiler.stack.pop()
-        node1 = decompiler.stack.pop()
+    def BINARY_SUBSCR(self):
+        node2 = self.stack.pop()
+        node1 = self.stack.pop()
         if isinstance(node2, ast.Slice):  # and len(node2.nodes) == 2:
             if isinstance(node2.lower, ast.Constant) and node2.lower.value is None:
                 node2.lower = None
@@ -476,52 +539,57 @@ class Decompiler(object):
             # py3.14 has a different format for constant tuple of slices
             node2 = ast.Tuple(elts=[slice_to_ast(value) for value in node2.value])
         elif not PY38:
-            if isinstance(node2, ast.Tuple) and any(isinstance(item, ast.Slice) for item in node2.elts):
+            if isinstance(node2, ast.Tuple) and any(
+                isinstance(item, ast.Slice) for item in node2.elts
+            ):
                 node2 = ast.ExtSlice(node2.elts)
             else:
                 node2 = ast.Index(node2)
         return ast.Subscript(value=node1, slice=node2, ctx=ast.Load())
 
-    def BUILD_CONST_KEY_MAP(decompiler, length):
-        keys = decompiler.stack.pop()
+    def BUILD_CONST_KEY_MAP(self, length):
+        keys = self.stack.pop()
         if PY38:
             assert isinstance(keys, ast.Constant), keys
-            keys = [ make_const(key) for key in keys.value ]
+            keys = [make_const(key) for key in keys.value]
         else:
             assert isinstance(keys, ast.Tuple) and is_const(keys), keys
-            keys = [ make_const(key) for key in keys.elts ]
+            keys = [make_const(key) for key in keys.elts]
 
-        values = decompiler.pop_items(length)
+        values = self.pop_items(length)
         return ast.Dict(keys=keys, values=values)
 
-    def BUILD_LIST(decompiler, size):
-        return ast.List(decompiler.pop_items(size), ast.Load())
+    def BUILD_LIST(self, size):
+        return ast.List(self.pop_items(size), ast.Load())
 
-    def BUILD_MAP(decompiler, length):
-        if sys.version_info < (3, 5):
-            return ast.Dict(())
-        data = decompiler.pop_items(2 * length)  # [key1, value1, key2, value2, ...]
+    def BUILD_MAP(self, length):
+        data = self.pop_items(2 * length)  # [key1, value1, key2, value2, ...]
         keys, values = [], []
         for i in range(0, len(data), 2):
             keys.append(data[i])
-            values.append(data[i+1])
+            values.append(data[i + 1])
         return ast.Dict(keys=keys, values=values)
 
-    def BUILD_SET(decompiler, size):
-        return ast.Set(decompiler.pop_items(size))
+    def BUILD_SET(self, size):
+        return ast.Set(self.pop_items(size))
 
-    def BUILD_SLICE(decompiler, size):
-        items = decompiler.pop_items(size)
+    def BUILD_SLICE(self, size):
+        items = self.pop_items(size)
         if not PY38:
-            items = [None if isinstance(item, ast.NameConstant) and item.value is None else item for item in items]
+            items = [
+                None
+                if isinstance(item, ast.NameConstant) and item.value is None
+                else item
+                for item in items
+            ]
         items += [None] * (3 - len(items))
         return ast.Slice(*items, ctx=ast.Load())
 
-    def BUILD_TUPLE(decompiler, size):
-        return ast.Tuple(decompiler.pop_items(size), ast.Load())
+    def BUILD_TUPLE(self, size):
+        return ast.Tuple(self.pop_items(size), ast.Load())
 
-    def BUILD_STRING(decompiler, count):
-        items = list(reversed([decompiler.stack.pop() for _ in range(count)]))
+    def BUILD_STRING(self, count):
+        items = list(reversed([self.stack.pop() for _ in range(count)]))
         for i, item in enumerate(items):
             if isinstance(item, ast.Constant):
                 if not isinstance(item.value, str):
@@ -530,75 +598,73 @@ class Decompiler(object):
                 items[i] = ast.FormattedValue(item, -1)
         return ast.JoinedStr(items)
 
-    def CALL_FUNCTION(decompiler, argc, star=None, star2=None):
-        pop = decompiler.stack.pop
+    def CALL_FUNCTION(self, argc, star=None, star2=None):
+        pop = self.stack.pop
         kwarg, posarg = divmod(argc, 256)
         keywords = []
-        for i in range(kwarg):
+        for _i in range(kwarg):
             arg = pop()
             key = pop().value
             keywords.append(ast.keyword(unwrap_str(key), arg))
         keywords.reverse()
         args = []
-        for i in range(posarg):
+        for _i in range(posarg):
             args.append(pop())
         args.reverse()
         if star:
             args.append(ast.Starred(value=star))
         if star2:
             keywords.append(ast.keyword(value=star2))
-        return decompiler._call_function(args, keywords)
+        return self._call_function(args, keywords)
 
-    def _call_function(decompiler, args, keywords=None):
-        tos = decompiler.stack.pop()
+    def _call_function(self, args, keywords=None):
+        tos = self.stack.pop()
         if isinstance(tos, ast.GeneratorExp):
             assert len(args) == 1 and not keywords
             genexpr = tos
             qual = genexpr.generators[0]
             assert isinstance(qual.iter, ast.Name)
-            assert qual.iter.id == '.0'
+            assert qual.iter.id == ".0"
             qual.iter = args[0]
             return genexpr
         return ast.Call(tos, args, keywords)
 
-    def CACHE(decompiler):
+    def CACHE(self):
         pass
 
-    def CALL(decompiler, argc):
-        values = decompiler.pop_items(argc)
+    def CALL(self, argc):
+        values = self.pop_items(argc)
 
-        keys = decompiler.kw_names
-        decompiler.kw_names = None
+        keys = self.kw_names
+        self.kw_names = None
 
         args = values
         keywords = []
         if keys:
-            args = values[:-len(keys)]
-            keywords = [ast.keyword(k, v) for k, v in zip(keys, values[-len(keys):])]
+            args = values[: -len(keys)]
+            keywords = [ast.keyword(k, v) for k, v in zip(keys, values[-len(keys) :])]
 
         if PY313:
             # self/NULL and callable are swapped
-            self_ = decompiler.stack.pop()
-            callable_ = decompiler.stack.pop()
+            self_ = self.stack.pop()
+            callable_ = self.stack.pop()
             if self_ is not None:
                 args.insert(0, self_)
         else:
-            self_ = decompiler.stack.pop()
-            callable_ = decompiler.stack.pop()
+            self_ = self.stack.pop()
+            callable_ = self.stack.pop()
             if callable_ is None:
                 callable_ = self_
             else:
                 args.insert(0, self_)
-        decompiler.stack.append(callable_)
-        return decompiler._call_function(args, keywords)
+        self.stack.append(callable_)
+        return self._call_function(args, keywords)
 
-    def CALL_FUNCTION_VAR(decompiler, argc):
-        return decompiler.CALL_FUNCTION(argc, decompiler.stack.pop())
+    def CALL_FUNCTION_VAR(self, argc):
+        return self.CALL_FUNCTION(argc, self.stack.pop())
 
-    def CALL_FUNCTION_KW(decompiler, argc):
-        if sys.version_info < (3, 6):
-            return decompiler.CALL_FUNCTION(argc, star2=decompiler.stack.pop())
-        keys = decompiler.stack.pop()
+    def CALL_FUNCTION_KW(self, argc):
+        keys = self.stack.pop()
         assert is_const(keys), keys
         if PY38:
             assert isinstance(keys, ast.Constant)
@@ -606,120 +672,126 @@ class Decompiler(object):
         else:
             assert isinstance(keys, ast.Tuple)
             keys = keys.elts
-        values = decompiler.pop_items(argc)
+        values = self.pop_items(argc)
         assert len(keys) <= len(values)
-        args = values[:-len(keys)]
-        keywords = [ast.keyword(unwrap_str(k), v) for k, v in zip(keys, values[-len(keys):])]
-        return decompiler._call_function(args, keywords)
+        args = values[: -len(keys)]
+        keywords = [
+            ast.keyword(unwrap_str(k), v) for k, v in zip(keys, values[-len(keys) :])
+        ]
+        return self._call_function(args, keywords)
 
-    def CALL_FUNCTION_VAR_KW(decompiler, argc):
-        star2 = decompiler.stack.pop()
-        star = decompiler.stack.pop()
-        return decompiler.CALL_FUNCTION(argc, star, star2)
+    def CALL_FUNCTION_VAR_KW(self, argc):
+        star2 = self.stack.pop()
+        star = self.stack.pop()
+        return self.CALL_FUNCTION(argc, star, star2)
 
-    def CALL_FUNCTION_EX(decompiler, argc=1):
+    def CALL_FUNCTION_EX(self, argc=1):
         star2 = None
         if argc:
             if argc != 1:
                 throw(DecompileError)
-            star2 = decompiler.stack.pop()
-        star = decompiler.stack.pop()
+            star2 = self.stack.pop()
+        star = self.stack.pop()
         args = [ast.Starred(value=star)] if star else None
         keywords = [ast.keyword(value=star2)] if star2 else None
         if PY313:
             # self/NULL and callable are swapped; FIXME: this leaves NULL on the stack?
-            self_ = decompiler.stack.pop()
-            callable_ = decompiler.stack.pop()
-            decompiler.stack.append(self_)
-            decompiler.stack.append(callable_)
-        return decompiler._call_function(args, keywords)
+            self_ = self.stack.pop()
+            callable_ = self.stack.pop()
+            self.stack.append(self_)
+            self.stack.append(callable_)
+        return self._call_function(args, keywords)
 
-    def CALL_METHOD(decompiler, argc):
-        pop = decompiler.stack.pop
+    def CALL_METHOD(self, argc):
+        pop = self.stack.pop
         args = []
         keywords = []
         if argc >= 256:
             kwargc = argc // 256
             argc = argc % 256
-            for i in range(kwargc):
+            for _i in range(kwargc):
                 v = pop()
                 k = pop()
                 assert isinstance(k, ast.Constant)
                 k = k.value  # ast.Name(k.value)
                 keywords.append(ast.keyword(k, v))
-        for i in range(argc):
+        for _i in range(argc):
             args.append(pop())
         args.reverse()
         method = pop()
         return ast.Call(method, args, keywords)
 
-    def CALL_KW(decompiler, argc):
-        names = decompiler.stack.pop()
+    def CALL_KW(self, argc):
+        names = self.stack.pop()
         if isinstance(names, ast.Constant):
-            decompiler.kw_names = names.value
+            self.kw_names = names.value
         else:
-            raise NotImplementedError(f"CALL_KW for {names.__class__.__name__} not implemented")
-        return decompiler.CALL(argc)
+            raise NotImplementedError(
+                f"CALL_KW for {names.__class__.__name__} not implemented"
+            )
+        return self.CALL(argc)
 
-    def COMPARE_OP(decompiler, op):
-        oper2 = decompiler.stack.pop()
-        oper1 = decompiler.stack.pop()
+    def COMPARE_OP(self, op):
+        oper2 = self.stack.pop()
+        oper1 = self.stack.pop()
         op = operator_mapping[op]()
         return ast.Compare(oper1, [op], [oper2])
 
-    def CONVERT_VALUE(decompiler, conversion):
-        value = decompiler.stack.pop()
-        return value, [-1, ord('s'), ord('r'), ord('a')][conversion]
+    def CONVERT_VALUE(self, conversion):
+        value = self.stack.pop()
+        return value, [-1, ord("s"), ord("r"), ord("a")][conversion]
 
-    def COPY(decompiler, _):
+    def COPY(self, _):
         pass  # this is not great, but stack is not the same as during runtime
         # actual queries are hopefully covered by tests
 
-    def COPY_FREE_VARS(decompiler, n):
+    def COPY_FREE_VARS(self, n):
         pass
 
-    def CONTAINS_OP(decompiler, invert):
-        return decompiler.COMPARE_OP('not in' if invert else 'in')
+    def CONTAINS_OP(self, invert):
+        return self.COMPARE_OP("not in" if invert else "in")
 
-    def DUP_TOP(decompiler):
-        return decompiler.stack[-1]
+    def DUP_TOP(self):
+        return self.stack[-1]
 
-    def FOR_ITER(decompiler, endpos):
+    def FOR_ITER(self, endpos):
         target = None
-        iter = decompiler.stack.pop()
+        iter = self.stack.pop()
         ifs = []
         return ast.comprehension(target, iter, ifs, 0)
 
-    def FORMAT_VALUE(decompiler, flags):
+    def FORMAT_VALUE(self, flags):
         conversion = -1
         format_spec = None
         if flags in (0, 1, 2, 3):
-            value = decompiler.stack.pop()
+            value = self.stack.pop()
             if flags == 0:
                 conversion = -1
             elif flags == 1:
-                conversion = ord('s')  # str conversion
+                conversion = ord("s")  # str conversion
             elif flags == 2:
-                conversion = ord('r')  # repr conversion
+                conversion = ord("r")  # repr conversion
             elif flags == 3:
-                conversion = ord('a')  # ascii conversion
+                conversion = ord("a")  # ascii conversion
         elif flags == 4:
-            format_spec = decompiler.stack.pop()
-            value = decompiler.stack.pop()
-        return ast.FormattedValue(value=value, conversion=conversion, format_spec=format_spec)
+            format_spec = self.stack.pop()
+            value = self.stack.pop()
+        return ast.FormattedValue(
+            value=value, conversion=conversion, format_spec=format_spec
+        )
 
-    def FORMAT_SIMPLE(decompiler):
+    def FORMAT_SIMPLE(self):
         # see CONVERT_VALUE
-        args = decompiler.stack.pop()
+        args = self.stack.pop()
         if isinstance(args, tuple):
             value, conversion = args
         else:
             value, conversion = args, -1
         return ast.FormattedValue(value=value, conversion=conversion)
 
-    def FORMAT_WITH_SPEC(decompiler):
-        spec = decompiler.stack.pop()
-        args = decompiler.stack.pop()
+    def FORMAT_WITH_SPEC(self):
+        spec = self.stack.pop()
+        args = self.stack.pop()
         if isinstance(args, tuple):
             # FIXME: is this correct here? should we look for ast.FormattedValue instead?
             value, conversion = args
@@ -727,46 +799,46 @@ class Decompiler(object):
             value, conversion = args, -1
         return ast.FormattedValue(value=value, conversion=conversion, format_spec=spec)
 
-    def GEN_START(decompiler, kind):
+    def GEN_START(self, kind):
         assert kind == 0  # only support sync
 
-    def GET_ITER(decompiler):
+    def GET_ITER(self):
         pass
 
-    def JUMP_IF_FALSE(decompiler, endpos):
-        return decompiler.conditional_jump(endpos, False)
+    def JUMP_IF_FALSE(self, endpos):
+        return self.conditional_jump(endpos, False)
 
     JUMP_IF_FALSE_OR_POP = JUMP_IF_FALSE
 
-    def JUMP_IF_NOT_EXC_MATCH(decompiler, endpos):
+    def JUMP_IF_NOT_EXC_MATCH(self, endpos):
         raise NotImplementedError
 
-    def JUMP_IF_TRUE(decompiler, endpos):
-        return decompiler.conditional_jump(endpos, True)
+    def JUMP_IF_TRUE(self, endpos):
+        return self.conditional_jump(endpos, True)
 
     JUMP_IF_TRUE_OR_POP = JUMP_IF_TRUE
 
-    def conditional_jump(decompiler, endpos, if_true):
+    def conditional_jump(self, endpos, if_true):
         if PY37 or PYPY:
-            return decompiler.conditional_jump_new(endpos, if_true)
-        return decompiler.conditional_jump_old(endpos, if_true)
+            return self.conditional_jump_new(endpos, if_true)
+        return self.conditional_jump_old(endpos, if_true)
 
-    def conditional_jump_old(decompiler, endpos, if_true):
-        i = decompiler.next_pos
-        if i in decompiler.targets:
-            decompiler.process_target(i)
-        expr = decompiler.stack.pop()
+    def conditional_jump_old(self, endpos, if_true):
+        i = self.next_pos
+        if i in self.targets:
+            self.process_target(i)
+        expr = self.stack.pop()
         clausetype = ast.Or if if_true else ast.And
         clause = ast.BoolOp(op=clausetype(), values=[expr])
         clause.endpos = endpos
-        decompiler.targets.setdefault(endpos, clause)
+        self.targets.setdefault(endpos, clause)
         return clause
 
-    def conditional_jump_new(decompiler, endpos, if_true):
-        expr = decompiler.stack.pop()
-        if decompiler.pos >= decompiler.conditions_end:
+    def conditional_jump_new(self, endpos, if_true):
+        expr = self.stack.pop()
+        if self.pos >= self.conditions_end:
             clausetype = ast.Or if if_true else ast.And
-        elif decompiler.pos in decompiler.or_jumps:
+        elif self.pos in self.or_jumps:
             clausetype = ast.Or
             if not if_true:
                 expr = ast.UnaryOp(op=ast.Not(), operand=expr)
@@ -774,74 +846,74 @@ class Decompiler(object):
             clausetype = ast.And
             if if_true:
                 expr = ast.UnaryOp(op=ast.Not(), operand=expr)
-        decompiler.stack.append(expr)
+        self.stack.append(expr)
 
-        if decompiler.next_pos in decompiler.targets:
-            decompiler.process_target(decompiler.next_pos)
+        if self.next_pos in self.targets:
+            self.process_target(self.next_pos)
 
-        expr = decompiler.stack.pop()
+        expr = self.stack.pop()
         clause = ast.BoolOp(op=clausetype(), values=[expr])
         clause.endpos = endpos
-        decompiler.targets.setdefault(endpos, clause)
+        self.targets.setdefault(endpos, clause)
         return clause
 
-    def conditional_jump_none_impl(decompiler, endpos, negate):
-        expr = decompiler.stack.pop()
-        assert(decompiler.pos < decompiler.conditions_end)
-        if decompiler.pos in decompiler.or_jumps:
+    def conditional_jump_none_impl(self, endpos, negate):
+        expr = self.stack.pop()
+        assert self.pos < self.conditions_end
+        if self.pos in self.or_jumps:
             clausetype = ast.Or
             op = ast.IsNot if negate else ast.Is
         else:
             clausetype = ast.And
             op = ast.Is if negate else ast.IsNot
         expr = ast.Compare(expr, [op()], [ast.Constant(None)])
-        decompiler.stack.append(expr)
+        self.stack.append(expr)
 
-        if decompiler.next_pos in decompiler.targets:
-            decompiler.process_target(decompiler.next_pos)
+        if self.next_pos in self.targets:
+            self.process_target(self.next_pos)
 
-        expr = decompiler.stack.pop()
+        expr = self.stack.pop()
         clause = ast.BoolOp(op=clausetype(), values=[expr])
         clause.endpos = endpos
-        decompiler.targets.setdefault(endpos, clause)
+        self.targets.setdefault(endpos, clause)
         return clause
 
-    def jump_if_none(decompiler, endpos):
-        return decompiler.conditional_jump_none_impl(endpos, False)
+    def jump_if_none(self, endpos):
+        return self.conditional_jump_none_impl(endpos, False)
 
-    def jump_if_not_none(decompiler, endpos):
-        return decompiler.conditional_jump_none_impl(endpos, True)
+    def jump_if_not_none(self, endpos):
+        return self.conditional_jump_none_impl(endpos, True)
 
-    def POP_JUMP_IF_NONE(decompiler, endpos):
-        return decompiler.jump_if_none(endpos)
+    def POP_JUMP_IF_NONE(self, endpos):
+        return self.jump_if_none(endpos)
 
-    def POP_JUMP_IF_NOT_NONE(decompiler, endpos):
-        return decompiler.jump_if_not_none(endpos)
+    def POP_JUMP_IF_NOT_NONE(self, endpos):
+        return self.jump_if_not_none(endpos)
 
-    def process_target(decompiler, pos, partial=False):
+    def process_target(self, pos, partial=False):
         if pos is None:
             limit = None
         elif partial:
-            limit = decompiler.targets.get(pos, None)
+            limit = self.targets.get(pos, None)
         else:
-            limit = decompiler.targets.pop(pos, None)
-        top = decompiler.stack.pop()
+            limit = self.targets.pop(pos, None)
+        top = self.stack.pop()
         while True:
             top = simplify(top)
             if top is limit:
                 break
             if isinstance(top, ast.comprehension):
                 break
-            if not decompiler.stack:
+            if not self.stack:
                 break
-            if decompiler.stack[-1] is None:
-                decompiler.stack.pop()
-                if not decompiler.stack:
+            if self.stack[-1] is None:
+                self.stack.pop()
+                if not self.stack:
                     break
-            top2 = decompiler.stack[-1]
+            top2 = self.stack[-1]
             if isinstance(top2, ast.comprehension):
                 break
-            if partial and hasattr(top2, 'endpos') and top2.endpos == pos:
+            if partial and hasattr(top2, "endpos") and top2.endpos == pos:
                 break
 
             if isinstance(top2, ast.BoolOp):
@@ -851,162 +923,167 @@ class Decompiler(object):
                     top2.values.append(top)
             elif isinstance(top2, ast.IfExp):  # Python 2.5
                 top2.orelse = top
-                if hasattr(top, 'endpos'):
+                if hasattr(top, "endpos"):
                     top2.endpos = top.endpos
-                    if decompiler.targets.get(top.endpos) is top:
-                        decompiler.targets[top.endpos] = top2
+                    if self.targets.get(top.endpos) is top:
+                        self.targets[top.endpos] = top2
             else:
-                throw(DecompileError('Expression is too complex to decompile, try to pass query as string, '
-                                     'e.g. select("x for x in Something")'))
-            top2.endpos = max(top2.endpos, getattr(top, 'endpos', 0))
-            top = decompiler.stack.pop()
-        decompiler.stack.append(top)
+                throw(
+                    DecompileError(
+                        "Expression is too complex to decompile, try to pass query as string, "
+                        'e.g. select("x for x in Something")'
+                    )
+                )
+            top2.endpos = max(top2.endpos, getattr(top, "endpos", 0))
+            top = self.stack.pop()
+        self.stack.append(top)
 
-    def JUMP_FORWARD(decompiler, endpos):
-        i = decompiler.next_pos  # next instruction
-        decompiler.process_target(i, True)
-        then = decompiler.stack.pop()
-        decompiler.process_target(i, False)
-        test = decompiler.stack.pop()
+    def JUMP_FORWARD(self, endpos):
+        i = self.next_pos  # next instruction
+        self.process_target(i, True)
+        then = self.stack.pop()
+        self.process_target(i, False)
+        test = self.stack.pop()
         if_exp = ast.IfExp(test=simplify(test), body=simplify(then), orelse=None)
         if_exp.endpos = endpos
-        decompiler.targets.setdefault(endpos, if_exp)
-        if decompiler.targets.get(endpos) is then:
-            decompiler.targets[endpos] = if_exp
+        self.targets.setdefault(endpos, if_exp)
+        if self.targets.get(endpos) is then:
+            self.targets[endpos] = if_exp
         return if_exp
 
-    def KW_NAMES(decompiler, kw_names):
+    def KW_NAMES(self, kw_names):
         # Stash for CALL
-        decompiler.kw_names = kw_names
+        self.kw_names = kw_names
 
-    def IS_OP(decompiler, invert):
-        return decompiler.COMPARE_OP('is not' if invert else 'is')
+    def IS_OP(self, invert):
+        return self.COMPARE_OP("is not" if invert else "is")
 
-    def LIST_APPEND(decompiler, offset):
-        tos = decompiler.stack.pop()
-        list_node = decompiler.stack[-offset]
+    def LIST_APPEND(self, offset):
+        tos = self.stack.pop()
+        list_node = self.stack[-offset]
         if isinstance(list_node, ast.comprehension):
-            throw(InvalidQuery('Use generator expression (... for ... in ...) '
-                               'instead of list comprehension [... for ... in ...] inside query'))
+            throw(
+                InvalidQuery(
+                    "Use generator expression (... for ... in ...) "
+                    "instead of list comprehension [... for ... in ...] inside query"
+                )
+            )
 
         assert isinstance(list_node, ast.List), list_node
         list_node.elts.append(tos)
 
-    def LIST_EXTEND(decompiler, offset):
+    def LIST_EXTEND(self, offset):
         if offset != 1:
             raise NotImplementedError(offset)
-        items = decompiler.stack.pop()
+        items = self.stack.pop()
         if not isinstance(items, ast.Constant):
             raise NotImplementedError(type(items))
         if not isinstance(items.value, tuple):
             raise NotImplementedError(type(items.value))
-        lst = decompiler.stack.pop()
+        lst = self.stack.pop()
         if not isinstance(lst, ast.List):
             raise NotImplementedError(type(lst))
         values = [make_const(v) for v in items.value]
         lst.elts.extend(values)
         return lst
 
-    def LIST_TO_TUPLE(decompiler):
-        tos = decompiler.stack.pop()
+    def LIST_TO_TUPLE(self):
+        tos = self.stack.pop()
         if not isinstance(tos, ast.List):
-            throw(InvalidQuery, "Translation error, please contact developers: list expected, got: %r" % tos)
+            throw(
+                InvalidQuery,
+                "Translation error, please contact developers: list expected, got: %r"
+                % tos,
+            )
         return ast.Tuple(tos.elts, ast.Load())
 
-    def LOAD_ATTR(decompiler, attr_name, push_null):
-        res = ast.Attribute(decompiler.stack.pop(), attr_name, ast.Load())
+    def LOAD_ATTR(self, attr_name, push_null):
+        res = ast.Attribute(self.stack.pop(), attr_name, ast.Load())
         if push_null and PY313:
             # NULL and attr swapped
-            decompiler.stack.append(res)
-            decompiler.stack.append(None)
+            self.stack.append(res)
+            self.stack.append(None)
             return None
         elif push_null:
-            decompiler.stack.append(None)
+            self.stack.append(None)
         return res
 
-    def LOAD_CLOSURE(decompiler, freevar):
-        decompiler.names.add(freevar)
+    def LOAD_CLOSURE(self, freevar):
+        self.names.add(freevar)
         return ast.Name(freevar, ast.Load())
 
-    def LOAD_CONST(decompiler, const_value):
+    def LOAD_CONST(self, const_value):
         return make_const(const_value)
 
-    def LOAD_DEREF(decompiler, freevar):
-        decompiler.names.add(freevar)
+    def LOAD_DEREF(self, freevar):
+        self.names.add(freevar)
         return ast.Name(freevar, ast.Load())
 
-    def LOAD_FAST(decompiler, varname):
-        decompiler.names.add(varname)
+    def LOAD_FAST(self, varname):
+        self.names.add(varname)
         return ast.Name(varname, ast.Load())
 
     LOAD_FAST_AND_CLEAR = LOAD_FAST
     LOAD_FAST_BORROW = LOAD_FAST
 
-    def LOAD_FAST_LOAD_FAST(decompiler, varname1, varname2):
-        decompiler.names.add(varname1)
-        decompiler.stack.append(ast.Name(varname1, ast.Load()))
-        return decompiler.LOAD_FAST(varname2)
+    def LOAD_FAST_LOAD_FAST(self, varname1, varname2):
+        self.names.add(varname1)
+        self.stack.append(ast.Name(varname1, ast.Load()))
+        return self.LOAD_FAST(varname2)
 
     LOAD_FAST_BORROW_LOAD_FAST_BORROW = LOAD_FAST_LOAD_FAST
 
-    def LOAD_GLOBAL(decompiler, varname, push_null):
+    def LOAD_GLOBAL(self, varname, push_null):
         res = ast.Name(varname, ast.Load())
-        decompiler.names.add(varname)
+        self.names.add(varname)
         if push_null and PY313:
             # NULL and global swapped
-            decompiler.stack.append(res)
-            decompiler.stack.append(None)
+            self.stack.append(res)
+            self.stack.append(None)
             return None
         elif push_null and not PY313:
-            decompiler.stack.append(None)
+            self.stack.append(None)
         return res
 
-    def LOAD_METHOD(decompiler, methname):
-        return decompiler.LOAD_ATTR(methname, PY311)
+    def LOAD_METHOD(self, methname):
+        return self.LOAD_ATTR(methname, PY311)
 
     LOOKUP_METHOD = LOAD_METHOD  # For PyPy
 
-    def LOAD_NAME(decompiler, varname):
-        decompiler.names.add(varname)
+    def LOAD_NAME(self, varname):
+        self.names.add(varname)
         return ast.Name(varname, ast.Load())
 
-    def LOAD_SMALL_INT(decompiler, value):
+    def LOAD_SMALL_INT(self, value):
         return make_const(value)
 
-    def MAKE_CELL(decompiler, freevar):
+    def MAKE_CELL(self, freevar):
         pass
 
-    def MAKE_CLOSURE(decompiler, argc):
-        decompiler.stack[-3:-2] = []  # ignore freevars
-        return decompiler.MAKE_FUNCTION(argc)
+    def MAKE_CLOSURE(self, argc):
+        self.stack[-3:-2] = []  # ignore freevars
+        return self.MAKE_FUNCTION(argc)
 
-    def MAKE_FUNCTION(decompiler, argc=0):
+    def MAKE_FUNCTION(self, argc=0):
         defaults = []
-        if sys.version_info >= (3, 6):
-            if not PY311:
-                qualname = decompiler.stack.pop()
-            tos = decompiler.stack.pop()
-            if argc & 0x08:
-                func_closure = decompiler.stack.pop()
-            if argc & 0x04:
-                annotations = decompiler.stack.pop()
-            if argc & 0x02:
-                kwonly_defaults = decompiler.stack.pop()
-                throw(NotImplementedError)
-            if argc & 0x01:
-                defaults = decompiler.stack.pop()
-                assert isinstance(defaults, ast.Tuple)
-                defaults = defaults.elts
-        else:
-            qualname = decompiler.stack.pop()
-            tos = decompiler.stack.pop()
-            if argc:
-                defaults = [ decompiler.stack.pop() for i in range(argc) ]
-                defaults.reverse()
+        if not PY311:
+            self.stack.pop()  # qualname
+        tos = self.stack.pop()
+        if argc & 0x08:
+            self.stack.pop()  # function closure
+        if argc & 0x04:
+            self.stack.pop()  # annotations
+        if argc & 0x02:
+            self.stack.pop()  # keyword-only defaults
+            throw(NotImplementedError)
+        if argc & 0x01:
+            defaults = self.stack.pop()
+            assert isinstance(defaults, ast.Tuple)
+            defaults = defaults.elts
         codeobject = tos.value
         func_decompiler = Decompiler(codeobject)
         # decompiler.names.update(decompiler.names)  ???
-        if codeobject.co_varnames[:1] == ('.0',):
+        if codeobject.co_varnames[:1] == (".0",):
             return func_decompiler.ast  # generator
         argnames, vararg, kwarg = inspect.getargs(codeobject)
         args = ast.arguments(
@@ -1016,7 +1093,7 @@ class Decompiler(object):
             kw_defaults=[],
             defaults=defaults,
             vararg=ast.arg(arg=vararg) if vararg else None,
-            kwarg=ast.arg(arg=kwarg) if kwarg else None
+            kwarg=ast.arg(arg=kwarg) if kwarg else None,
         )
         return ast.Lambda(args, func_decompiler.ast)
 
@@ -1031,128 +1108,132 @@ class Decompiler(object):
     POP_JUMP_FORWARD_IF_NONE = jump_if_none
     POP_JUMP_FORWARD_IF_NOT_NONE = jump_if_not_none
 
-    def POP_TOP(decompiler):
+    def POP_TOP(self):
         pass
 
-    def PRECALL(decompiler, argc):
+    def PRECALL(self, argc):
         pass
 
-    def PUSH_NULL(decompiler):
-        decompiler.stack.append(None)
+    def PUSH_NULL(self):
+        self.stack.append(None)
 
-    def RETURN_VALUE(decompiler):
-        if decompiler.next_pos != decompiler.end:
+    def RETURN_VALUE(self):
+        if self.next_pos != self.end:
             throw(DecompileError)
-        expr = decompiler.stack.pop()
+        expr = self.stack.pop()
         return simplify(expr)
 
-    def RETURN_CONST(decompiler, val):
+    def RETURN_CONST(self, val):
         return make_const(val)
 
-    def RETURN_GENERATOR(decompiler):
+    def RETURN_GENERATOR(self):
         pass
 
-    def RESUME(decompiler, where):
+    def RESUME(self, where):
         pass
 
-    def ROT_TWO(decompiler):
-        tos = decompiler.stack.pop()
-        tos1 = decompiler.stack.pop()
-        decompiler.stack.append(tos)
-        decompiler.stack.append(tos1)
+    def ROT_TWO(self):
+        tos = self.stack.pop()
+        tos1 = self.stack.pop()
+        self.stack.append(tos)
+        self.stack.append(tos1)
 
-    def ROT_THREE(decompiler):
-        tos = decompiler.stack.pop()
-        tos1 = decompiler.stack.pop()
-        tos2 = decompiler.stack.pop()
-        decompiler.stack.append(tos)
-        decompiler.stack.append(tos2)
-        decompiler.stack.append(tos1)
+    def ROT_THREE(self):
+        tos = self.stack.pop()
+        tos1 = self.stack.pop()
+        tos2 = self.stack.pop()
+        self.stack.append(tos)
+        self.stack.append(tos2)
+        self.stack.append(tos1)
 
-    def SET_FUNCTION_ATTRIBUTE(decompiler, flag):
+    def SET_FUNCTION_ATTRIBUTE(self, flag):
         """This replaces the argument to MAKE_FUNCTION in py 3.13"""
         # This actually needs special handling in get_instructions because
         # the func will not be at the top of the stack when we get here.
         throw(NotImplementedError)
 
-    def SETUP_LOOP(decompiler, endpos):
+    def SETUP_LOOP(self, endpos):
         pass
 
-    def STORE_ATTR(decompiler, attrname):
-        decompiler.store(ast.Attribute(decompiler.stack.pop(), attrname, ast.Store()))
+    def STORE_ATTR(self, attrname):
+        self.store(ast.Attribute(self.stack.pop(), attrname, ast.Store()))
 
-    def STORE_DEREF(decompiler, freevar):
-        decompiler.assnames.add(freevar)
-        decompiler.store(ast.Name(freevar, ast.Store()))
+    def STORE_DEREF(self, freevar):
+        self.assnames.add(freevar)
+        self.store(ast.Name(freevar, ast.Store()))
 
-    def STORE_FAST(decompiler, varname):
-        if varname.startswith('_['):
-            throw(InvalidQuery('Use generator expression (... for ... in ...) '
-                               'instead of list comprehension [... for ... in ...] inside query'))
-        decompiler.assnames.add(varname)
-        decompiler.store(ast.Name(varname, ast.Store()))
+    def STORE_FAST(self, varname):
+        if varname.startswith("_["):
+            throw(
+                InvalidQuery(
+                    "Use generator expression (... for ... in ...) "
+                    "instead of list comprehension [... for ... in ...] inside query"
+                )
+            )
+        self.assnames.add(varname)
+        self.store(ast.Name(varname, ast.Store()))
 
-    def STORE_FAST_STORE_FAST(decompiler, varname1, varname2):
-        decompiler.STORE_FAST(varname1)
-        decompiler.STORE_FAST(varname2)
+    def STORE_FAST_STORE_FAST(self, varname1, varname2):
+        self.STORE_FAST(varname1)
+        self.STORE_FAST(varname2)
 
-    def STORE_FAST_LOAD_FAST(decompiler, varname1, varname2):
-        decompiler.STORE_FAST(varname1)
-        return decompiler.LOAD_FAST(varname2)
+    def STORE_FAST_LOAD_FAST(self, varname1, varname2):
+        self.STORE_FAST(varname1)
+        return self.LOAD_FAST(varname2)
 
-    def STORE_MAP(decompiler):
-        tos = decompiler.stack.pop()
-        tos1 = decompiler.stack.pop()
-        tos2 = decompiler.stack[-1]
+    def STORE_MAP(self):
+        tos = self.stack.pop()
+        tos1 = self.stack.pop()
+        tos2 = self.stack[-1]
         if not isinstance(tos2, ast.Dict):
             assert False  # pragma: no cover
         if tos2.items == ():
             tos2.items = []
         tos2.items.append((tos, tos1))
 
-    def STORE_SUBSCR(decompiler):
-        tos = decompiler.stack.pop()
-        tos1 = decompiler.stack.pop()
-        tos2 = decompiler.stack.pop()
+    def STORE_SUBSCR(self):
+        tos = self.stack.pop()
+        tos1 = self.stack.pop()
+        tos2 = self.stack.pop()
         if not isinstance(tos1, ast.Dict):
             assert False  # pragma: no cover
         if tos1.items == ():
             tos1.items = []
         tos1.items.append((tos, tos2))
 
-    def SWAP(decompiler, _):
+    def SWAP(self, _):
         pass  # this is not great, but stack is not the same as during runtime
         # actual queries are hopefully covered by tests
 
-    def TO_BOOL(decompiler):
+    def TO_BOOL(self):
         pass
 
-    def UNARY_POSITIVE(decompiler):
-        return ast.UnaryOp(op=ast.UAdd(), operand=decompiler.stack.pop())
+    def UNARY_POSITIVE(self):
+        return ast.UnaryOp(op=ast.UAdd(), operand=self.stack.pop())
 
-    def UNARY_NEGATIVE(decompiler):
-        return ast.UnaryOp(op=ast.USub(), operand=decompiler.stack.pop())
+    def UNARY_NEGATIVE(self):
+        return ast.UnaryOp(op=ast.USub(), operand=self.stack.pop())
 
-    def UNARY_NOT(decompiler):
-        return ast.UnaryOp(op=ast.Not(), operand=decompiler.stack.pop())
+    def UNARY_NOT(self):
+        return ast.UnaryOp(op=ast.Not(), operand=self.stack.pop())
 
-    def UNARY_INVERT(decompiler):
-        return ast.Invert(decompiler.stack.pop())
+    def UNARY_INVERT(self):
+        return ast.Invert(self.stack.pop())
 
-    def UNPACK_SEQUENCE(decompiler, count):
+    def UNPACK_SEQUENCE(self, count):
         ass_tuple = ast.Assign(targets=ast.Tuple([], ast.Store()))
         ass_tuple.count = count
         return ass_tuple
 
-    def YIELD_VALUE(decompiler, _=None):
-        expr = decompiler.stack.pop()
+    def YIELD_VALUE(self, _=None):
+        expr = self.stack.pop()
         generators = []
-        while decompiler.stack:
-            decompiler.process_target(None)
-            top = decompiler.stack.pop()
+        while self.stack:
+            self.process_target(None)
+            top = self.stack.pop()
             if not isinstance(top, ast.comprehension):
                 cond = top
-                top = decompiler.stack.pop()
+                top = self.stack.pop()
                 assert isinstance(top, ast.comprehension)
                 top.ifs.append(cond)
                 generators.append(top)
@@ -1160,6 +1241,7 @@ class Decompiler(object):
                 generators.append(top)
         generators.reverse()
         return ast.GeneratorExp(simplify(expr), generators)
+
 
 test_lines = """
     (a and b if c and d else e and f for i in T if (A and B if C and D else E and F))
@@ -1249,27 +1331,32 @@ test_lines = """
 ##    (i for i in T if (a and b or c and d if x and y or p and q else r and n or m and k))
 ##    (a and b or c and d if x and y or p and q else r and n or m and k for i in T if (A and B or C and D if X and Y or P and Q else R and N or M and K))
 
+
 def test(test_line=None):
     import sys
-    if sys.version[:3] > '2.4': outmost_iterable_name = '.0'
-    else: outmost_iterable_name = '[outmost-iterable]'
+
+    if sys.version[:3] > "2.4":
+        outmost_iterable_name = ".0"
+    else:
+        outmost_iterable_name = "[outmost-iterable]"
     import dis
-    for i, line in enumerate(test_lines.split('\n')):
+
+    for i, line in enumerate(test_lines.split("\n")):
         if test_line is not None and i != test_line:
             continue
         if not line or line.isspace():
             continue
         line = line.strip()
-        if line.startswith('#'):
+        if line.startswith("#"):
             continue
-        code = compile(line, '<?>', 'eval').co_consts[0]
+        code = compile(line, "<?>", "eval").co_consts[0]
         ast1 = ast.parse(line).body[0]
         ast1.value.generators[0].iter.id = outmost_iterable_name
         ast1 = ast.dump(ast1)
         try:
             ast2 = ast.Expr(Decompiler(code).ast)
             ast2 = ast.dump(ast2)
-        except Exception as e:
+        except Exception:
             print()
             print(i, line)
             print()
@@ -1287,8 +1374,11 @@ def test(test_line=None):
             print()
             dis.dis(code)
             break
-        else: print('%d OK: %s' % (i, line))
-    else: print('Done!')
+        else:
+            print("%d OK: %s" % (i, line))
+    else:
+        print("Done!")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     test()

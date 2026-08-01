@@ -1,11 +1,8 @@
-
-from __future__ import absolute_import, print_function, division
-
 import unittest
 
 from pony.orm.core import *
+from pony.orm.tests import setup_database, teardown_database
 from pony.orm.tests.testutils import *
-from pony.orm.tests import teardown_database, setup_database
 
 db = Database()
 
@@ -27,11 +24,11 @@ class TestCRUD(unittest.TestCase):
     def setUpClass(cls):
         setup_database(db)
         with db_session:
-            g1 = Group(id=1, number='g111')
-            g2 = Group(id=2, number='g222')
-            s1 = Student(id=1, name='S1', group=g1)
-            s2 = Student(id=2, name='S2', group=g1)
-            s3 = Student(id=3, name='S3', group=g2)
+            g1 = Group(id=1, number="g111")
+            g2 = Group(id=2, number="g222")
+            s1 = Student(id=1, name="S1", group=g1)
+            s2 = Student(id=2, name="S2", group=g1)
+            s3 = Student(id=3, name="S3", group=g2)
 
     @classmethod
     def tearDownClass(cls):
@@ -48,5 +45,5 @@ class TestCRUD(unittest.TestCase):
     def test_unique_load(self):
         s1 = Student[1]
         g1 = s1.group
-        g1.number = 'g123'
-        self.assertEqual(g1.number, 'g123')
+        g1.number = "g123"
+        self.assertEqual(g1.number, "g123")

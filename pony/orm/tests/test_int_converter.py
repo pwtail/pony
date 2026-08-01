@@ -1,10 +1,9 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
 
 from pony import orm
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
+
 
 class TestIntConverter1(unittest.TestCase):
     def setUp(self):
@@ -30,7 +29,9 @@ class TestIntConverter1(unittest.TestCase):
             foo = self.db.Foo[123]
             self.assertEqual(foo.x, 0)
 
-    @raises_exception(ValueError, "Value -1 of attr Foo.x is less than the minimum allowed value 0")
+    @raises_exception(
+        ValueError, "Value -1 of attr Foo.x is less than the minimum allowed value 0"
+    )
     @orm.db_session
     def test_2(self):
         foo = self.db.Foo[123]
@@ -45,7 +46,10 @@ class TestIntConverter1(unittest.TestCase):
             foo = self.db.Foo[123]
             self.assertEqual(foo.x, 255)
 
-    @raises_exception(ValueError, "Value 256 of attr Foo.x is greater than the maximum allowed value 255")
+    @raises_exception(
+        ValueError,
+        "Value 256 of attr Foo.x is greater than the maximum allowed value 255",
+    )
     @orm.db_session
     def test_4(self):
         foo = self.db.Foo[123]

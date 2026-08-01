@@ -1,8 +1,8 @@
 import unittest
-from pony.orm.tests.testutils import *
-from pony.orm.tests import db_params, setup_database, teardown_database
 
 from pony.orm import *
+from pony.orm.tests import db_params, setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 db = Database()
 
@@ -22,13 +22,22 @@ class Foo(db.Entity):
 class Test(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if db_params['provider'] not in ('sqlite', 'postgres'):
-            raise unittest.SkipTest('Arrays are only available for SQLite and PostgreSQL')
+        if db_params["provider"] not in ("sqlite", "postgres"):
+            raise unittest.SkipTest(
+                "Arrays are only available for SQLite and PostgreSQL"
+            )
 
         setup_database(db)
         with db_session:
-            Foo(id=1, a=1, b=3, c=-2, array1=[10, 20, 30, 40, 50], array2=[1.1, 2.2, 3.3, 4.4, 5.5],
-                array3=['foo', 'bar'])
+            Foo(
+                id=1,
+                a=1,
+                b=3,
+                c=-2,
+                array1=[10, 20, 30, 40, 50],
+                array2=[1.1, 2.2, 3.3, 4.4, 5.5],
+                array3=["foo", "bar"],
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -78,12 +87,12 @@ class Test(unittest.TestCase):
     @db_session
     def test_7(self):
         foo = Foo.select().first()
-        foo.array3.extend(['str', 123, 'str'])
+        foo.array3.extend(["str", 123, "str"])
 
     @db_session
     def test_8(self):
         foo = Foo.select().first()
-        foo.array3.extend(['str1', 'str2'])
+        foo.array3.extend(["str1", "str2"])
 
     @db_session
     def test_9(self):
@@ -191,12 +200,12 @@ class Test(unittest.TestCase):
     @db_session
     def test_28(self):
         x = 1
-        array = select(f.array1[x:f.b] for f in Foo).first()
+        array = select(f.array1[x : f.b] for f in Foo).first()
         self.assertEqual(array, [20, 30])
 
     @db_session
     def test_29(self):
-        array = select(f.array1[f.a:f.c] for f in Foo).first()
+        array = select(f.array1[f.a : f.c] for f in Foo).first()
         self.assertEqual(array, [20, 30])
 
     @db_session
@@ -211,17 +220,17 @@ class Test(unittest.TestCase):
 
     @db_session
     def test_32(self):
-        array = select(f.array1[:f.b] for f in Foo).first()
+        array = select(f.array1[: f.b] for f in Foo).first()
         self.assertEqual(array, [10, 20, 30])
 
     @db_session
     def test_33(self):
-        array = select(f.array1[:f.c] for f in Foo).first()
+        array = select(f.array1[: f.c] for f in Foo).first()
         self.assertEqual(array, [10, 20, 30])
 
     @db_session
     def test_34(self):
-        array = select(f.array1[f.c:] for f in Foo).first()
+        array = select(f.array1[f.c :] for f in Foo).first()
         self.assertEqual(array, [40, 50])
 
     @db_session
@@ -233,11 +242,11 @@ class Test(unittest.TestCase):
         self.assertTrue([20, 10] in foo.array1)
         self.assertTrue([10, 1000] not in foo.array1)
         self.assertTrue([] in foo.array1)
-        self.assertTrue('bar' in foo.array3)
-        self.assertTrue('baz' not in foo.array3)
-        self.assertTrue(['foo', 'bar'] in foo.array3)
-        self.assertTrue(['bar', 'foo'] in foo.array3)
-        self.assertTrue(['baz', 'bar'] not in foo.array3)
+        self.assertTrue("bar" in foo.array3)
+        self.assertTrue("baz" not in foo.array3)
+        self.assertTrue(["foo", "bar"] in foo.array3)
+        self.assertTrue(["bar", "foo"] in foo.array3)
+        self.assertTrue(["baz", "bar"] not in foo.array3)
         self.assertTrue([] in foo.array3)
 
     @db_session

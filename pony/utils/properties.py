@@ -1,14 +1,12 @@
-
-
-class cached_property(object):
+class cached_property:
     """
     A property that is only computed once per instance and then replaces itself
     with an ordinary attribute. Deleting the attribute resets the property.
     Source: https://github.com/bottlepy/bottle/commit/fa7733e075da0d790d809aa3d2f53071897e6f76
-    """  # noqa
+    """
 
     def __init__(self, func):
-        self.__doc__ = getattr(func, '__doc__')
+        self.__doc__ = func.__doc__
         self.func = func
 
     def __get__(self, obj, cls):
@@ -18,7 +16,7 @@ class cached_property(object):
         return value
 
 
-class class_property(object):
+class class_property:
     """
     Read-only class property
     """
@@ -29,8 +27,8 @@ class class_property(object):
     def __get__(self, instance, cls):
         return self.func(cls)
 
-class class_cached_property(object):
 
+class class_cached_property:
     def __init__(self, func):
         self.func = func
 

@@ -3,7 +3,7 @@ import unittest
 from copy import deepcopy
 
 from pony.py23compat import PY36
-from pony.utils import pickle_ast, unpickle_ast, IntegerGenerator
+from pony.utils import IntegerGenerator, pickle_ast, unpickle_ast
 
 
 class PickleTest(unittest.TestCase):

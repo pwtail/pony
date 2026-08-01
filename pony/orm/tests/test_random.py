@@ -1,8 +1,8 @@
 import unittest
 
 from pony.orm import *
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 db = Database()
 
@@ -17,11 +17,11 @@ class TestRandom(unittest.TestCase):
     def setUpClass(cls):
         setup_database(db)
         with db_session:
-            Person(id=1, name='John')
-            Person(id=2, name='Mary')
-            Person(id=3, name='Bob')
-            Person(id=4, name='Mike')
-            Person(id=5, name='Ann')
+            Person(id=1, name="John")
+            Person(id=2, name="Mary")
+            Person(id=3, name="Bob")
+            Person(id=4, name="Mike")
+            Person(id=5, name="Ann")
 
     @classmethod
     def tearDownClass(cls):
@@ -45,5 +45,6 @@ class TestRandom(unittest.TestCase):
         self.assertTrue(p1.id in range(1, 6))
         self.assertTrue(p2.id in range(1, 6))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

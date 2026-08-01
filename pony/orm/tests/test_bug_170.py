@@ -27,5 +27,5 @@ class Test(unittest.TestCase):
         self.assertTrue(pk_column.is_pk)
 
         with orm.db_session:
-            p1 = Person(name='John')
-            p2 = Person(name='Mike')
+            p1 = Person(name="John")
+            p2 = Person(name="Mike")

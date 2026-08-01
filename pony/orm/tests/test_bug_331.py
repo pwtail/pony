@@ -1,7 +1,7 @@
 import unittest
 
-from pony.orm.tests import setup_database, teardown_database
 from pony.orm import *
+from pony.orm.tests import setup_database, teardown_database
 
 db = Database()
 
@@ -46,8 +46,8 @@ class Test(unittest.TestCase):
             g2.persons.add(p5)
             commit()
 
-            foxes = Group['Foxes']
-            gorillas = Group['Gorillas']
+            foxes = Group["Foxes"]
+            gorillas = Group["Gorillas"]
 
             self.assertEqual(len(foxes), 3)
             self.assertEqual(len(gorillas), 2)

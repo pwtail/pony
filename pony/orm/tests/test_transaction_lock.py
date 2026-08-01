@@ -1,6 +1,5 @@
 import unittest
 
-
 from pony.orm import *
 from pony.orm.tests import setup_database, teardown_database
 
@@ -8,8 +7,8 @@ db = Database()
 
 
 class TestPost(db.Entity):
-    category = Optional('TestCategory')
-    name = Optional(str, default='Noname')
+    category = Optional("TestCategory")
+    name = Optional(str, default="Noname")
 
 
 class TestCategory(db.Entity):
@@ -41,7 +40,7 @@ class TransactionLockTestCase(unittest.TestCase):
 
     def test_update(self):
         p = TestPost[self.post.id]
-        p.name = 'Trash'
+        p.name = "Trash"
         p.flush()
         cache = db._get_cache()
         self.assertEqual(cache.immediate, True)

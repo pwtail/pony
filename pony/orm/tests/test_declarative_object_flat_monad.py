@@ -1,10 +1,10 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
+
 from pony.orm.core import *
 from pony.orm.tests import setup_database, teardown_database
 
 db = Database()
+
 
 class Student(db.Entity):
     name = Required(str)
@@ -12,16 +12,19 @@ class Student(db.Entity):
     group = Required("Group")
     marks = Set("Mark")
 
+
 class Group(db.Entity):
     number = PrimaryKey(int)
     department = Required(int)
     students = Set(Student)
     subjects = Set("Subject")
 
+
 class Subject(db.Entity):
     name = PrimaryKey(str)
     groups = Set(Group)
     marks = Set("Mark")
+
 
 class Mark(db.Entity):
     value = Required(int)
@@ -32,7 +35,7 @@ class Mark(db.Entity):
 
 class TestObjectFlatMonad(unittest.TestCase):
     @classmethod
-    def setUpClass(self):
+    def setUpClass(cls):
         setup_database(db)
         with db_session:
             Math = Subject(name="Math")
@@ -71,5 +74,6 @@ class TestObjectFlatMonad(unittest.TestCase):
         result = set(select(g.students for g in Group if g.department == 102))
         self.assertEqual(result, {Student[5], Student[4]})
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

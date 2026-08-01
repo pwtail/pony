@@ -20,24 +20,36 @@ class TestLambda(unittest.TestCase):
         setup_database(db)
 
     @classmethod
-    def setUp(self) -> None:
+    def setUp(cls) -> None:
         with db_session:
-            User(id=1, login='test', password='123456', created_at=datetime(2012, 12, 13, 5, 25, 30))
-            User(id=2, login='test2', password='123456', created_at=datetime(2015, 12, 13, 5, 25, 30))
-            User(id=3, login='test3', password='123456')
+            User(
+                id=1,
+                login="test",
+                password="123456",
+                created_at=datetime(2012, 12, 13, 5, 25, 30),
+            )
+            User(
+                id=2,
+                login="test2",
+                password="123456",
+                created_at=datetime(2015, 12, 13, 5, 25, 30),
+            )
+            User(id=3, login="test3", password="123456")
 
     @classmethod
     def tearDownClass(cls) -> None:
         teardown_database(db)
 
     @classmethod
-    def tearDown(self) -> None:
+    def tearDown(cls) -> None:
         with db_session:
             User.select().delete()
 
     @db_session
     def test_select(self):
-        result = User.select(lambda u: u.created_at < datetime.now() - timedelta(days=365))[:]
+        result = User.select(
+            lambda u: u.created_at < datetime.now() - timedelta(days=365)
+        )[:]
         self.assertEqual([u.id for u in result], [1, 2])
 
     @db_session
@@ -59,4 +71,3 @@ class TestLambda(unittest.TestCase):
     def test_order_by_4(self):
         result = User.select().order_by(lambda u: (desc(u.login), desc(u.id)))
         self.assertEqual([u.id for u in result], [3, 2, 1])
-

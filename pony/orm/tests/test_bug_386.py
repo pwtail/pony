@@ -21,6 +21,6 @@ class Test(unittest.TestCase):
 
     def test_1(self):
         with orm.db_session:
-            a = Person(name='John')
+            a = Person(name="John")
             a.delete()
-            Person.exists(name='Mike')
+            Person.exists(name="Mike")

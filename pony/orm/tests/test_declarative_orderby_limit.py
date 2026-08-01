@@ -1,12 +1,11 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
 
 from pony.orm.core import *
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 db = Database()
+
 
 class Student(db.Entity):
     name = Required(str)
@@ -39,19 +38,31 @@ class TestOrderbyLimit(unittest.TestCase):
 
     def test1(self):
         students = set(select(s for s in Student).order_by(Student.name))
-        self.assertEqual(students, {Student[3], Student[1], Student[2], Student[4], Student[5]})
+        self.assertEqual(
+            students, {Student[3], Student[1], Student[2], Student[4], Student[5]}
+        )
 
     def test2(self):
         students = set(select(s for s in Student).order_by(Student.name.asc))
-        self.assertEqual(students, {Student[3], Student[1], Student[2], Student[4], Student[5]})
+        self.assertEqual(
+            students, {Student[3], Student[1], Student[2], Student[4], Student[5]}
+        )
 
     def test3(self):
         students = set(select(s for s in Student).order_by(Student.id.desc))
-        self.assertEqual(students, {Student[5], Student[4], Student[3], Student[2], Student[1]})
+        self.assertEqual(
+            students, {Student[5], Student[4], Student[3], Student[2], Student[1]}
+        )
 
     def test4(self):
-        students = set(select(s for s in Student).order_by(Student.scholarship.asc, Student.group.desc))
-        self.assertEqual(students, {Student[1], Student[4], Student[3], Student[5], Student[2]})
+        students = set(
+            select(s for s in Student).order_by(
+                Student.scholarship.asc, Student.group.desc
+            )
+        )
+        self.assertEqual(
+            students, {Student[1], Student[4], Student[3], Student[5], Student[2]}
+        )
 
     def test5(self):
         students = set(select(s for s in Student).order_by(Student.name).limit(3))
@@ -89,7 +100,9 @@ class TestOrderbyLimit(unittest.TestCase):
     def test12(self):
         students = select(s for s in Student).order_by(Student.id)[-3:2]
 
-    @raises_exception(TypeError, 'If you want apply index to a query, convert it to list first')
+    @raises_exception(
+        TypeError, "If you want apply index to a query, convert it to list first"
+    )
     def test13(self):
         students = select(s for s in Student).order_by(Student.id)[3]
         self.assertEqual(students, Student[4])
@@ -112,7 +125,9 @@ class TestOrderbyLimit(unittest.TestCase):
 
     def test18(self):
         students = set(select(s for s in Student).order_by(Student.id)[:])
-        self.assertEqual(students, {Student[1], Student[2], Student[3], Student[4], Student[5]})
+        self.assertEqual(
+            students, {Student[1], Student[2], Student[3], Student[4], Student[5]}
+        )
 
     def test19(self):
         q = select(s for s in Student).order_by(Student.id)
@@ -121,16 +136,18 @@ class TestOrderbyLimit(unittest.TestCase):
         students = q[2:4]
         self.assertEqual(students, [Student[3], Student[4]])
         students = q[:]
-        self.assertEqual(students, [Student[1], Student[2], Student[3], Student[4], Student[5]])
+        self.assertEqual(
+            students, [Student[1], Student[2], Student[3], Student[4], Student[5]]
+        )
 
     def test20(self):
         q = select(s for s in Student).limit(offset=2)
         self.assertEqual(set(q), {Student[3], Student[4], Student[5]})
         last_sql = db.last_sql
-        if db.provider.dialect == 'PostgreSQL':
-            self.assertTrue('LIMIT null OFFSET 2' in last_sql)
+        if db.provider.dialect == "PostgreSQL":
+            self.assertTrue("LIMIT null OFFSET 2" in last_sql)
         else:
-            self.assertTrue('LIMIT -1 OFFSET 2' in last_sql)
+            self.assertTrue("LIMIT -1 OFFSET 2" in last_sql)
 
     def test21(self):
         q = select(s for s in Student).limit(0, offset=2)
@@ -143,7 +160,7 @@ class TestOrderbyLimit(unittest.TestCase):
     def test23(self):
         q = select(s for s in Student)[2:2]
         self.assertEqual(set(q), set())
-        self.assertTrue('LIMIT 0' in db.last_sql)
+        self.assertTrue("LIMIT 0" in db.last_sql)
 
     def test24(self):
         q = select(s for s in Student)[2:]

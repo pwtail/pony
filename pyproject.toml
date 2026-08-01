@@ -1,0 +1,54 @@
+[tool.ruff]
+target-version = "py38"
+line-length = 88
+include = ["pony/**/*.py", "setup.py"]
+extend-exclude = ["pony/thirdparty"]
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "W",
+    "I",
+    "N804",
+    "N805",
+    "UP",
+    "B",
+    "RUF100",
+]
+ignore = [
+    # Pony expressions intentionally overload comparisons with None and booleans.
+    "E711",
+    "E712",
+    # Exact type checks are intentional in converter and ORM internals.
+    "E721",
+    # Named lambdas are used as expression objects by the query translator.
+    "E731",
+    # Keep the existing interpolation style; changing SQL and error strings is
+    # unrelated to formatting and carries a higher compatibility risk.
+    "UP031",
+    # These assertions document unreachable internal states.
+    "B011",
+    # Pony wraps database exceptions deliberately and preserves its historical
+    # exception surface instead of exposing implementation exception chains.
+    "B904",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"pony/orm/dbproviders/mysql.py" = ["E402"]
+"pony/orm/dbproviders/postgres.py" = ["E402"]
+"pony/orm/__init__.py" = ["F403"]
+"pony/orm/examples/*.py" = ["F841"]
+"pony/orm/examples/inheritance1.py" = ["E402"]
+"pony/orm/sqltranslation.py" = ["B007", "B023"]
+"pony/orm/tests/*.py" = ["B018", "F403", "F405", "F811", "F841"]
+"pony/orm/tests/fixtures.py" = ["E402"]
+"pony/orm/tests/test_frames.py" = ["B023"]
+"pony/orm/tests/test_getattr.py" = ["B023"]
+"pony/orm/tests/test_hybrid_methods_and_properties.py" = ["B015"]
+"pony/utils/__init__.py" = ["F403"]
+
+[tool.ruff.format]
+line-ending = "lf"

@@ -1,4 +1,2 @@
-
-
-from .utils import *
 from .properties import *
+from .utils import *

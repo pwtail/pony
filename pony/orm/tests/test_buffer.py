@@ -20,7 +20,8 @@ class Baz(db.Entity):
     b = orm.Optional(orm.buffer, unique=True)
 
 
-buf = orm.buffer(b'123')
+buf = orm.buffer(b"123")
+
 
 class Test(unittest.TestCase):
     @classmethod

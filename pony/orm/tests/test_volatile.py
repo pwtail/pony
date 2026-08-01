@@ -1,8 +1,8 @@
-import sys, unittest
+import unittest
 
 from pony.orm import *
-from pony.orm.tests.testutils import *
 from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests.testutils import *
 
 
 class TestVolatile1(unittest.TestCase):
@@ -16,9 +16,9 @@ class TestVolatile1(unittest.TestCase):
         setup_database(db)
 
         with db_session:
-            Item(id=1, name='A', index=1)
-            Item(id=2, name='B', index=2)
-            Item(id=3, name='C', index=3)
+            Item(id=1, name="A", index=1)
+            Item(id=2, name="B", index=2)
+            Item(id=3, name="C", index=3)
 
     def tearDown(self):
         teardown_database(self.db)
@@ -39,12 +39,11 @@ class TestVolatile1(unittest.TestCase):
         self.assertEqual(a.index, 2)
         self.assertEqual(b.index, 3)
 
-
     @db_session
     def test_2(self):
         Item = self.db.Item
         item = Item[1]
-        item.name = 'X'
+        item.name = "X"
         item.flush()
         self.assertEqual(item.index, 1)
 
@@ -55,27 +54,27 @@ class TestVolatile2(unittest.TestCase):
 
         class Group(db.Entity):
             number = PrimaryKey(int)
-            students = Set('Student', volatile=True)
+            students = Set("Student", volatile=True)
 
         class Student(db.Entity):
             id = PrimaryKey(int)
             name = Required(str)
-            group = Required('Group')
-            courses = Set('Course')
+            group = Required("Group")
+            courses = Set("Course")
 
         class Course(db.Entity):
             id = PrimaryKey(int)
             name = Required(str)
-            students = Set('Student', volatile=True)
+            students = Set("Student", volatile=True)
 
         setup_database(db)
 
         with db_session:
             g1 = Group(number=123)
-            s1 = Student(id=1, name='A', group=g1)
-            s2 = Student(id=2, name='B', group=g1)
-            c1 = Course(id=1, name='C1', students=[s1, s2])
-            c2 = Course(id=2, name='C1', students=[s1])
+            s1 = Student(id=1, name="A", group=g1)
+            s2 = Student(id=2, name="B", group=g1)
+            c1 = Course(id=1, name="C1", students=[s1, s2])
+            c2 = Course(id=2, name="C1", students=[s1])
 
         self.Group = Group
         self.Student = Student
@@ -95,7 +94,7 @@ class TestVolatile2(unittest.TestCase):
             g1 = self.Group[123]
             students = set(s.id for s in g1.students)
             self.assertEqual(students, {1, 2})
-            self.db.execute('''insert into student values(3, 'C', 123)''')
+            self.db.execute("""insert into student values(3, 'C', 123)""")
             g1.students.load()
             students = set(s.id for s in g1.students)
             self.assertEqual(students, {1, 2, 3})
@@ -123,5 +122,5 @@ class TestVolatile2(unittest.TestCase):
             self.assertEqual(students, {1, 2, 3})
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

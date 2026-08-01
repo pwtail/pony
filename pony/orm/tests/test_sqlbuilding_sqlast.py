@@ -1,12 +1,11 @@
-from __future__ import absolute_import, print_function, division
-
 import unittest
+
 from pony.orm.core import Database, db_session
 from pony.orm.sqlsymbols import *
-from pony.orm.tests import setup_database, only_for
+from pony.orm.tests import only_for, setup_database
 
 
-@only_for('sqlite')
+@only_for("sqlite")
 class TestSQLAST(unittest.TestCase):
     def setUp(self):
         self.db = Database()
@@ -29,14 +28,17 @@ class TestSQLAST(unittest.TestCase):
 
     @db_session
     def test_alias(self):
-        sql_ast = [SELECT, [ALL, [COLUMN, "Group", "a"]],
-                           [FROM, ["Group", TABLE, "T1" ]]]
+        sql_ast = [
+            SELECT,
+            [ALL, [COLUMN, "Group", "a"]],
+            [FROM, ["Group", TABLE, "T1"]],
+        ]
         sql, adapter = self.db._ast2sql(sql_ast)
         cursor = self.db._exec_sql(sql)
+
     @db_session
     def test_alias2(self):
-        sql_ast = [SELECT, [ALL, [COLUMN, None, "a"]],
-                            [FROM, [None, TABLE, "T1"]]]
+        sql_ast = [SELECT, [ALL, [COLUMN, None, "a"]], [FROM, [None, TABLE, "T1"]]]
         sql, adapter = self.db._ast2sql(sql_ast)
         cursor = self.db._exec_sql(sql)
 

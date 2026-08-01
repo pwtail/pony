@@ -1,19 +1,20 @@
 import unittest
 
 from pony.orm import *
-from pony.orm.tests import setup_database, teardown_database, only_for
+from pony.orm.tests import setup_database, teardown_database
 
 db = Database()
 
+
 class X(db.Entity):
     id = PrimaryKey(int)
-    parent = Optional('X', reverse='children')
-    children = Set('X', reverse='parent', cascade_delete=True)
+    parent = Optional("X", reverse="children")
+    children = Set("X", reverse="parent", cascade_delete=True)
 
 
 class Y(db.Entity):
-    parent = Optional('Y', reverse='children')
-    children = Set('Y', reverse='parent', cascade_delete=True, lazy=True)
+    parent = Optional("Y", reverse="children")
+    children = Set("Y", reverse="parent", cascade_delete=True, lazy=True)
 
 
 class TestCascade(unittest.TestCase):
