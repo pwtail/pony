@@ -5,16 +5,11 @@ from uuid import UUID
 from pony.py23compat import buffer, int_types
 
 try:
-    import psycopg2
+    import psycopg
 except ImportError:
-    try:
-        from psycopg2cffi import compat
-    except ImportError:
-        raise ImportError(
-            "In order to use PonyORM with CockroachDB please install psycopg2 or psycopg2cffi"
-        )
-    else:
-        compat.register()
+    raise ImportError(
+        "In order to use PonyORM with CockroachDB please install psycopg (psycopg3)"
+    )
 
 from pony.orm import core, dbapiprovider, ormtypes
 from pony.orm.core import log_orm
@@ -90,7 +85,7 @@ class CRArrayConverter(PGArrayConverter):
 
 
 class CRProvider(PGProvider):
-    dbapi_module = psycopg2
+    dbapi_module = psycopg
     dbschema_cls = CRSchema
     translator_cls = CRTranslator
     sqlbuilder_cls = CRSQLBuilder

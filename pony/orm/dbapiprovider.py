@@ -83,9 +83,14 @@ class NotSupportedError(DatabaseError):
     pass
 
 
+def get_sqlstate(exc):
+    return getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+
+
 @decorator
 def wrap_dbapi_exceptions(func, provider, *args, **kwargs):
     dbapi_module = provider.dbapi_module
+    dbapi_errors = getattr(dbapi_module, "errors", dbapi_module)
     should_retry = False
     try:
         try:
@@ -97,39 +102,39 @@ def wrap_dbapi_exceptions(func, provider, *args, **kwargs):
                     return func(provider, *args, **kwargs)
                 finally:
                     provider.local_exceptions.keep_traceback = False
-        except dbapi_module.NotSupportedError as e:
+        except dbapi_errors.NotSupportedError as e:
             raise NotSupportedError(e)
-        except dbapi_module.ProgrammingError as e:
+        except dbapi_errors.ProgrammingError as e:
             if provider.dialect == "PostgreSQL":
                 msg = str(e)
                 if msg.startswith("operator does not exist:") and " json " in msg:
                     msg += " (Note: use column type `jsonb` instead of `json`)"
                     raise ProgrammingError(e, msg, *e.args[1:])
             raise ProgrammingError(e)
-        except dbapi_module.InternalError as e:
+        except dbapi_errors.InternalError as e:
             raise InternalError(e)
-        except dbapi_module.IntegrityError as e:
+        except dbapi_errors.IntegrityError as e:
             raise IntegrityError(e)
-        except dbapi_module.OperationalError as e:
-            if provider.dialect == "PostgreSQL" and e.pgcode == "40001":
+        except dbapi_errors.OperationalError as e:
+            if provider.dialect == "PostgreSQL" and get_sqlstate(e) == "40001":
                 should_retry = True
             if provider.dialect == "SQLite":
                 provider.restore_exception()
             raise OperationalError(e)
-        except dbapi_module.DataError as e:
+        except dbapi_errors.DataError as e:
             raise DataError(e)
-        except dbapi_module.DatabaseError as e:
+        except dbapi_errors.DatabaseError as e:
             raise DatabaseError(e)
-        except dbapi_module.InterfaceError as e:
+        except dbapi_errors.InterfaceError as e:
             if (
                 e.args == (0, "")
                 and getattr(dbapi_module, "__name__", None) == "MySQLdb"
             ):
                 throw(InterfaceError, e, "MySQL server misconfiguration")
             raise InterfaceError(e)
-        except dbapi_module.Error as e:
+        except dbapi_errors.Error as e:
             raise Error(e)
-        except dbapi_module.Warning as e:
+        except dbapi_errors.Warning as e:
             raise Warning(e)
     except Exception as e:
         if should_retry:

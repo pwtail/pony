@@ -224,14 +224,14 @@ class PostgresContext(DBContext):
         return d
 
     def init_db(self):
-        import psycopg2
+        import psycopg
 
-        conn = psycopg2.connect(**self.get_conn_dict(no_db=True))
-        conn.set_isolation_level(0)
+        conn = psycopg.connect(**self.get_conn_dict(no_db=True))
+        conn.autocommit = True
         with closing(conn.cursor()) as cursor:
             try:
                 self.drop_db(cursor)
-            except psycopg2.DatabaseError as exc:
+            except psycopg.DatabaseError as exc:
                 print("Failed to drop db: %s" % exc)
             cursor.execute("create database %s" % self.db_name)
 
