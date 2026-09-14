@@ -1,7 +1,7 @@
 import unittest
 
 from pony.orm import *
-from pony.orm.tests import db_params, teardown_database
+from pony.orm.tests import db_params, only_for, teardown_database
 from pony.orm.tests.testutils import *
 
 
@@ -293,6 +293,89 @@ class TestIndexes(unittest.TestCase):
             class Bad3(db.Entity):
                 a = Required(str, unique=123)
 
+    def test_11(self):  # invalid index method is rejected at class definition
+        db = self.db
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str)
+                b = Required(int)
+                composite_index(a, b, using="bogus")
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str, index=True, using="bogus")
+
+    def test_12(self):  # nulls_not_distinct is unique-only
+        db = self.db
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str)
+                b = Required(int)
+                composite_index(a, b, nulls_not_distinct=True)
+
+    def test_13(self):  # RawSQL constraints
+        db = self.db
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str)
+                composite_index(raw_sql("lower(a)"))
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str)
+                b = Required(int)
+                composite_index(raw_sql("lower(a)"), raw_sql("lower(b)"), name="ix")
+
+    def test_14(self):  # postgres-only options are rejected on other dialects
+        db = self.db
+        if db.provider.dialect == "PostgreSQL":
+            self.skipTest("postgres-only index options are allowed on PostgreSQL")
+
+        db1 = Database(**db_params)
+        with self.assertRaises(TypeError):
+            class Bad1(db1.Entity):
+                a = Required(str)
+                b = Required(int)
+                composite_index(a, b, using="gin")
+            db1.generate_mapping()
+        teardown_database(db1)
+
+        db2 = Database(**db_params)
+        with self.assertRaises(TypeError):
+            class Bad2(db2.Entity):
+                a = Required(str)
+                b = Required(int)
+                composite_index(a, b, where="b > 0")
+            db2.generate_mapping()
+        teardown_database(db2)
+
+        db3 = Database(**db_params)
+        with self.assertRaises(TypeError):
+            class Bad3(db3.Entity):
+                a = Required(str)
+                b = Required(int)
+                unique(a, desc(b))
+            db3.generate_mapping()
+        teardown_database(db3)
+
+    def test_15(self):  # attribute using/where require index or unique
+        db = self.db
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str, using="hash")
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str, where="a > ''")
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = PrimaryKey(int, using="hash")
+
     def test_5(self):
         db = self.db
 
@@ -311,6 +394,131 @@ class TestIndexes(unittest.TestCase):
         with db_session:
             Table2(height=2, length=1)
             Table2.exists(height=2, length=1)
+
+
+@only_for("PostgreSQL")
+class TestIndexOptionsPostgreSQL(unittest.TestCase):
+    def setUp(self):
+        self.db = Database(**db_params)
+
+    def tearDown(self):
+        teardown_database(self.db)
+
+    def test_using(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_index(a, b, name="ix_ab", using="gin")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE INDEX "ix_ab" ON "person" USING GIN ("a", "b")', script
+        )
+
+    def test_where(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_index(a, b, name="ix_ab", where="b > 0")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE INDEX "ix_ab" ON "person" ("a", "b") WHERE b > 0', script
+        )
+
+    def test_partial_unique(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            unique(a, b, name="unq_ab", where="a IS NOT NULL")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_ab" ON "person" ("a", "b") WHERE a IS NOT NULL',
+            script,
+        )
+        self.assertNotIn('CONSTRAINT "unq_ab"', script)
+
+    def test_desc(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_index(a, desc(b), name="ix_ab")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE INDEX "ix_ab" ON "person" ("a", "b" DESC)', script
+        )
+
+    def test_include(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            c = Required(int)
+            composite_index(a, b, name="ix_ab", include=(c,))
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE INDEX "ix_ab" ON "person" ("a", "b") INCLUDE ("c")', script
+        )
+
+    def test_expression(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            composite_index(raw_sql("lower(a)"), name="ix_lower")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn('CREATE INDEX "ix_lower" ON "person" ((lower(a)))', script)
+
+    def test_nulls_not_distinct(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            unique(a, b, name="unq_ab", nulls_not_distinct=True)
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CONSTRAINT "unq_ab" UNIQUE NULLS NOT DISTINCT ("a", "b")', script
+        )
+
+    def test_attribute_level_options(self):
+        db = self.db
+
+        class Person(db.Entity):
+            email = Required(str, unique=True, where="email IS NOT NULL")
+            name = Required(str, index="ix_name", using="hash")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_person__email" ON "person" ("email") '
+            "WHERE email IS NOT NULL",
+            script,
+        )
+        self.assertIn(
+            'CREATE INDEX "ix_name" ON "person" USING HASH ("name")', script
+        )
 
 
 if __name__ == "__main__":

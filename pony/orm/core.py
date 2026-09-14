@@ -1630,16 +1630,52 @@ class Database:
                 if index.is_pk:
                     continue
                 column_names = []
+                orders = []
+                expressions = []
                 attrs = index.attrs
-                for attr in attrs:
+                desc_positions = index.desc_attrs
+                for i, attr in enumerate(attrs):
+                    if isinstance(attr, RawSQL):
+                        column_names.append(None)
+                        orders.append(None)
+                        expressions.append(attr.sql)
+                        continue
+                    order = "DESC" if i in desc_positions else None
                     column_names.extend(attr.columns)
+                    orders.extend([order] * len(attr.columns))
+                    expressions.extend([None] * len(attr.columns))
                 index_name = index.name
                 if index_name is None and len(attrs) == 1:
-                    index_name = attrs[0].index
+                    attr = attrs[0]
+                    if isinstance(attr, Attribute):
+                        index_name = attr.index
+                include_columns = None
+                if index.include:
+                    include_column_names = []
+                    for attr in index.include:
+                        include_column_names.extend(attr.columns)
+                    include_columns = get_columns(table, include_column_names)
+                real_columns = get_columns(
+                    table, [c for c in column_names if c is not None]
+                )
+                key_spec_items = []
+                col_iter = iter(real_columns)
+                for col_name, order, expr in zip(
+                    column_names, orders, expressions
+                ):
+                    if expr is not None:
+                        key_spec_items.append((None, None, expr))
+                    else:
+                        key_spec_items.append((next(col_iter), order, None))
                 table.add_index(
                     index_name,
-                    get_columns(table, column_names),
+                    real_columns,
                     is_unique=index.is_unique,
+                    using=index.using,
+                    where=index.where,
+                    include=include_columns,
+                    nulls_not_distinct=index.nulls_not_distinct,
+                    key_spec=tuple(key_spec_items),
                 )
             columns = []
             columns_without_pk = []
@@ -1720,7 +1756,13 @@ class Database:
                         columns = tuple(
                             map(table.column_dict.__getitem__, attr.columns)
                         )
-                        table.add_index(attr.index, columns, is_unique=attr.is_unique)
+                        table.add_index(
+                            attr.index,
+                            columns,
+                            is_unique=attr.is_unique,
+                            using=attr.using,
+                            where=attr.where,
+                        )
             entity._initialize_bits_()
 
         if create_tables:
@@ -2956,6 +2998,8 @@ class Attribute:
         "cascade_delete",
         "index",
         "reverse_index",
+        "using",
+        "where",
         "original_default",
         "sql_default",
         "py_check",
@@ -3070,7 +3114,35 @@ class Attribute:
             self.columns = []
         self.index = kwargs.pop("index", None)
         self.reverse_index = kwargs.pop("reverse_index", None)
+        self.using = kwargs.pop("using", None)
+        self.where = kwargs.pop("where", None)
         self.fk_name = kwargs.pop("fk_name", None)
+        if self.using is not None:
+            if self.using not in ("btree", "hash", "gin", "gist", "brin"):
+                throw(
+                    TypeError,
+                    "Invalid index method %r. Allowed: btree, hash, gin, gist, brin"
+                    % self.using,
+                )
+            if isinstance(self, PrimaryKey):
+                throw(TypeError, "'using' option cannot be set for PrimaryKey attribute")
+        if self.where is not None:
+            if not isinstance(self.where, str):
+                throw(TypeError, "'where' option must be a string. Got: %r" % self.where)
+            if isinstance(self, PrimaryKey):
+                throw(TypeError, "'where' option cannot be set for PrimaryKey attribute")
+        if (self.using is not None or self.where is not None) and self.is_collection:
+            throw(
+                TypeError,
+                "'using' and 'where' options are not supported for collection attributes",
+            )
+        if (self.using is not None or self.where is not None) and not (
+            self.is_unique or self.index
+        ):
+            throw(
+                TypeError,
+                "'using' and 'where' options require 'index' or 'unique' option",
+            )
         self.col_paths = []
         self._columns_checked = False
         self.composite_keys = []
@@ -3854,7 +3926,18 @@ class Discriminator(Required):
 
 
 class Index:
-    __slots__ = "attrs", "entity", "is_pk", "is_unique", "name"
+    __slots__ = (
+        "attrs",
+        "entity",
+        "is_pk",
+        "is_unique",
+        "name",
+        "using",
+        "where",
+        "include",
+        "nulls_not_distinct",
+        "desc_attrs",
+    )
 
     def __init__(self, *attrs, **options):
         self.entity = None
@@ -3862,6 +3945,34 @@ class Index:
         self.name = options.pop("name", None)
         if self.name is not None and not isinstance(self.name, str):
             throw(TypeError, "Index name must be a string. Got: %r" % self.name)
+        self.using = options.pop("using", None)
+        if self.using is not None:
+            if self.using not in ("btree", "hash", "gin", "gist", "brin"):
+                throw(
+                    TypeError,
+                    "Invalid index method %r. Allowed: btree, hash, gin, gist, brin"
+                    % self.using,
+                )
+        self.where = options.pop("where", None)
+        if self.where is not None and not isinstance(self.where, str):
+            throw(TypeError, "Index 'where' option must be a string. Got: %r" % self.where)
+        self.include = options.pop("include", None)
+        if self.include is not None:
+            if not isinstance(self.include, (tuple, list)):
+                throw(
+                    TypeError,
+                    "Index 'include' option must be a tuple of attributes. Got: %r"
+                    % self.include,
+                )
+            self.include = tuple(self.include)
+        self.nulls_not_distinct = options.pop("nulls_not_distinct", False)
+        if not isinstance(self.nulls_not_distinct, bool):
+            throw(
+                TypeError,
+                "Index 'nulls_not_distinct' option must be bool. Got: %r"
+                % self.nulls_not_distinct,
+            )
+        self.desc_attrs = None
         self.is_pk = options.pop("is_pk", False)
         self.is_unique = options.pop("is_unique", True)
         assert not options
@@ -3869,7 +3980,23 @@ class Index:
     def _init_(self, entity):
         self.entity = entity
         attrs = self.attrs
+        desc_positions = set()
+        func_name = (
+            "PrimaryKey"
+            if self.is_pk
+            else "composite_key"
+            if self.is_unique
+            else "composite_index"
+        )
         for i, attr in enumerate(self.attrs):
+            if isinstance(attr, DescWrapper):
+                desc_positions.add(i)
+                attr = attr.attr
+                if not isinstance(attr, (str, Attribute)):
+                    throw(
+                        TypeError,
+                        "desc() argument must be an attribute. Got: %r" % attr,
+                    )
             if isinstance(attr, str):
                 try:
                     attr = getattr(entity, attr)
@@ -3879,21 +4006,20 @@ class Index:
                         "Entity %s does not have attribute %s"
                         % (entity.__name__, attr),
                     )
+            if isinstance(attr, RawSQL):
                 attrs[i] = attr
-        self.attrs = attrs = tuple(attrs)
-        for i, attr in enumerate(attrs):
+                continue
             if not isinstance(attr, Attribute):
-                func_name = (
-                    "PrimaryKey"
-                    if self.is_pk
-                    else "composite_key"
-                    if self.is_unique
-                    else "composite_index"
-                )
                 throw(
                     TypeError,
                     "%s() arguments must be attributes. Got: %r" % (func_name, attr),
                 )
+            attrs[i] = attr
+        self.attrs = attrs = tuple(attrs)
+        self.desc_attrs = frozenset(desc_positions)
+        for i, attr in enumerate(attrs):
+            if isinstance(attr, RawSQL):
+                continue
             if self.is_unique:
                 attr.is_part_of_unique_index = True
                 if len(attrs) > 1:
@@ -3944,30 +4070,139 @@ class Index:
                     and not hasattr(attr, "original_default")
                 ):
                     attr.default = None
+        include = self.include
+        if include is not None:
+            include_attrs = []
+            for attr in include:
+                if isinstance(attr, str):
+                    try:
+                        attr = getattr(entity, attr)
+                    except AttributeError:
+                        throw(
+                            AttributeError,
+                            "Entity %s does not have attribute %s"
+                            % (entity.__name__, attr),
+                        )
+                if not isinstance(attr, Attribute):
+                    throw(
+                        TypeError,
+                        "Index include option arguments must be attributes. Got: %r"
+                        % attr,
+                    )
+                if attr in attrs:
+                    throw(
+                        TypeError,
+                        "Attribute %s cannot be part of both key and include columns of index"
+                        % attr,
+                    )
+                if not issubclass(entity, attr.entity):
+                    throw(
+                        ERDiagramError,
+                        "Invalid use of attribute %s in entity %s"
+                        % (attr, entity.__name__),
+                    )
+                if attr.is_collection:
+                    throw(
+                        TypeError,
+                        "Collection attribute %s cannot be used in include option" % attr,
+                    )
+                include_attrs.append(attr)
+            self.include = tuple(include_attrs)
 
 
-def _define_index(func_name, attrs, is_unique=False, name=None):
-    if len(attrs) < 2:
+def _define_index(
+    func_name,
+    attrs,
+    is_unique=False,
+    name=None,
+    using=None,
+    where=None,
+    include=None,
+    nulls_not_distinct=False,
+):
+    if nulls_not_distinct and not is_unique:
+        throw(
+            TypeError,
+            "'nulls_not_distinct' option is allowed only for unique() and composite_key()",
+        )
+    unwrapped = [a.attr if isinstance(a, DescWrapper) else a for a in attrs]
+    raw_sql_count = sum(isinstance(a, RawSQL) for a in unwrapped)
+    if raw_sql_count > 1:
+        throw(TypeError, "Only one RawSQL expression is allowed per index")
+    if raw_sql_count and name is None:
+        throw(
+            TypeError,
+            "Index name is required when a RawSQL expression is used",
+        )
+    if len(attrs) < 2 and not (len(attrs) == 1 and raw_sql_count):
         throw(
             TypeError,
             "%s() must receive at least two attributes as arguments" % func_name,
         )
     cls_dict = sys._getframe(2).f_locals
     indexes = cls_dict.setdefault("_indexes_", [])
-    indexes.append(Index(*attrs, name=name, is_pk=False, is_unique=is_unique))
+    indexes.append(
+        Index(
+            *attrs,
+            name=name,
+            using=using,
+            where=where,
+            include=include,
+            nulls_not_distinct=nulls_not_distinct,
+            is_pk=False,
+            is_unique=is_unique,
+        )
+    )
 
 
-def composite_index(*attrs, name=None):
-    _define_index("composite_index", attrs, name=name)
+def composite_index(
+    *attrs,
+    name=None,
+    using=None,
+    where=None,
+    include=None,
+    nulls_not_distinct=False,
+):
+    _define_index(
+        "composite_index",
+        attrs,
+        name=name,
+        using=using,
+        where=where,
+        include=include,
+        nulls_not_distinct=nulls_not_distinct,
+    )
 
 
-def unique(*attrs, name=None):
-    _define_index("unique", attrs, is_unique=True, name=name)
+def unique(
+    *attrs, name=None, using=None, where=None, include=None, nulls_not_distinct=False
+):
+    _define_index(
+        "unique",
+        attrs,
+        is_unique=True,
+        name=name,
+        using=using,
+        where=where,
+        include=include,
+        nulls_not_distinct=nulls_not_distinct,
+    )
 
 
-def composite_key(*attrs, name=None):
+def composite_key(
+    *attrs, name=None, using=None, where=None, include=None, nulls_not_distinct=False
+):
     # Deprecated alias of unique(); kept for backward compatibility
-    _define_index("composite_key", attrs, is_unique=True, name=name)
+    _define_index(
+        "composite_key",
+        attrs,
+        is_unique=True,
+        name=name,
+        using=using,
+        where=where,
+        include=include,
+        nulls_not_distinct=nulls_not_distinct,
+    )
 
 
 class PrimaryKey(Required):
@@ -5599,10 +5834,16 @@ class EntityMeta(type):
         indexes = cls._indexes_ = cls.__dict__.get("_indexes_", [])
         for attr in new_attrs:
             if attr.is_unique:
-                is_unique = attr.is_unique
-                name = is_unique if isinstance(is_unique, str) else None
+                unique_value = attr.is_unique
+                name = unique_value if isinstance(unique_value, str) else None
                 indexes.append(
-                    Index(attr, name=name, is_pk=isinstance(attr, PrimaryKey))
+                    Index(
+                        attr,
+                        name=name,
+                        using=attr.using,
+                        where=attr.where,
+                        is_pk=isinstance(attr, PrimaryKey),
+                    )
                 )
         for index in indexes:
             index._init_(cls)

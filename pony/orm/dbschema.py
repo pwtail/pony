@@ -181,6 +181,7 @@ class Table(DBObject):
             if not index.is_pk
             and index.is_unique
             and (len(index.columns) > 1 or index.is_named)
+            and not index.renders_standalone
         ]
         for index in indexes:
             assert index.name is not None
@@ -228,9 +229,7 @@ class Table(DBObject):
         created_tables.add(self)
         result = [self]
         indexes = [
-            index
-            for index in self.indexes.values()
-            if not index.is_pk and not index.is_unique
+            index for index in self.indexes.values() if index.renders_standalone
         ]
         for index in indexes:
             assert index.name is not None
@@ -262,7 +261,19 @@ class Table(DBObject):
             column_name, self, sql_type, converter, is_not_null, sql_default
         )
 
-    def add_index(self, index_name, columns, is_pk=False, is_unique=None, m2m=False):
+    def add_index(
+        self,
+        index_name,
+        columns,
+        is_pk=False,
+        is_unique=None,
+        m2m=False,
+        using=None,
+        where=None,
+        include=None,
+        nulls_not_distinct=False,
+        key_spec=None,
+    ):
         assert index_name is not False
         is_named = isinstance(index_name, str)
         if index_name is True:
@@ -282,10 +293,25 @@ class Table(DBObject):
             and index.name == index_name
             and index.is_pk == is_pk
             and index.is_unique == is_unique
+            and index.using == using
+            and index.where == where
+            and index.include == include
+            and index.nulls_not_distinct == nulls_not_distinct
+            and index.key_spec == key_spec
         ):
             return index
         return self.schema.index_class(
-            index_name, self, columns, is_pk, is_unique, is_named
+            index_name,
+            self,
+            columns,
+            is_pk,
+            is_unique,
+            is_named,
+            using,
+            where,
+            include,
+            nulls_not_distinct,
+            key_spec,
         )
 
     def add_foreign_key(
@@ -372,7 +398,9 @@ class Column:
                 append(case("PRIMARY KEY"))
             else:
                 index = table.indexes.get((self,))
-                if self.is_unique and not (index and index.is_named):
+                if self.is_unique and not (
+                    index and (index.is_named or index.renders_standalone)
+                ):
                     append(case("UNIQUE"))
                 if self.is_not_null:
                     append(case("NOT NULL"))
@@ -403,8 +431,24 @@ class Constraint(DBObject):
 class DBIndex(Constraint):
     typename = "Index"
 
-    def __init__(self, name, table, columns, is_pk=False, is_unique=None, is_named=False):
-        assert len(columns) > 0
+    def __init__(
+        self,
+        name,
+        table,
+        columns,
+        is_pk=False,
+        is_unique=None,
+        is_named=False,
+        using=None,
+        where=None,
+        include=None,
+        nulls_not_distinct=False,
+        key_spec=None,
+    ):
+        has_expressions = key_spec is not None and any(
+            expr for _, _, expr in key_spec
+        )
+        assert len(columns) > 0 or has_expressions
         for column in columns:
             if column.table is not table:
                 throw(
@@ -448,6 +492,35 @@ class DBIndex(Constraint):
             )
         Constraint.__init__(self, name, schema)
         self.is_named = is_named
+        self.using = using
+        self.where = where
+        self.include = include
+        self.nulls_not_distinct = nulls_not_distinct
+        self.key_spec = key_spec
+        has_special_keys = key_spec is not None and any(
+            order or expr for _, order, expr in key_spec
+        )
+        if (
+            schema.provider.dialect != "PostgreSQL"
+            and (
+                using
+                or where is not None
+                or include
+                or nulls_not_distinct
+                or has_expressions
+                or has_special_keys
+            )
+        ):
+            throw(
+                TypeError,
+                "Index options 'using', 'where', 'include', 'nulls_not_distinct', "
+                "column order and RawSQL expressions are supported only in PostgreSQL",
+            )
+        if nulls_not_distinct and not is_unique:
+            throw(
+                TypeError,
+                "'nulls_not_distinct' option is allowed only for unique indexes",
+            )
         for column in columns:
             column.is_pk = column.is_pk or (len(columns) == 1 and is_pk)
             column.is_pk_part = column.is_pk_part or bool(is_pk)
@@ -463,11 +536,41 @@ class DBIndex(Constraint):
             connection, self.table.name, self.name, case_sensitive
         )
 
+    @property
+    def renders_standalone(self):
+        if self.is_pk:
+            return False
+        return (
+            not self.is_unique
+            or self.using
+            or self.where is not None
+            or self.include
+            or self.key_spec is not None
+            and any(order or expr for _, order, expr in self.key_spec)
+        )
+
     def get_sql(self):
         return self._get_create_sql(inside_table=True)
 
     def get_create_command(self):
         return self._get_create_sql(inside_table=False)
+
+    def _get_key_list_sql(self):
+        schema = self.schema
+        case = schema.case
+        quote_name = schema.provider.quote_name
+        if self.key_spec is None:
+            return schema.column_list(self.columns)
+        items = []
+        for col, order, expr in self.key_spec:
+            if expr is not None:
+                items.append("(%s)" % expr)
+            else:
+                item = quote_name(col.name)
+                if order:
+                    item += " " + case(order)
+                items.append(item)
+        return "(" + ", ".join(items) + ")"
 
     def _get_create_sql(self, inside_table):
         schema = self.schema
@@ -490,12 +593,25 @@ class DBIndex(Constraint):
             append(quote_name(self.name))
             append(case("ON"))
             append(quote_name(self.table.name))
-            converter = self.columns[0].converter
-            if (
-                isinstance(converter.py_type, core.Array)
-                and converter.provider.dialect == "PostgreSQL"
-            ):
-                append(case("USING GIN"))
+            if self.using:
+                append(case("USING"))
+                append(case(self.using))
+            elif self.columns:
+                converter = self.columns[0].converter
+                if (
+                    isinstance(converter.py_type, core.Array)
+                    and converter.provider.dialect == "PostgreSQL"
+                ):
+                    append(case("USING GIN"))
+            append(self._get_key_list_sql())
+            if self.include:
+                append(case("INCLUDE"))
+                append(schema.column_list(self.include))
+            if self.where:
+                append(case("WHERE"))
+                append(self.where)
+            if self.nulls_not_distinct:
+                append(case("NULLS NOT DISTINCT"))
         else:
             if self.name:
                 append(case("CONSTRAINT"))
@@ -506,7 +622,9 @@ class DBIndex(Constraint):
                 append(case("UNIQUE"))
             else:
                 append(case("INDEX"))
-        append(schema.column_list(self.columns))
+            if self.nulls_not_distinct:
+                append(case("NULLS NOT DISTINCT"))
+            append(self._get_key_list_sql())
         return " ".join(cmd)
 
 
