@@ -244,10 +244,10 @@ class Table(DBObject):
                 DBComment(self.schema, self.name, None, self.comment)
             )
         for column in self.column_list:
-            if column.doc:
+            if column.comment:
                 result.append(
                     DBComment(
-                        self.schema, self.name, column.name, column.doc
+                        self.schema, self.name, column.name, column.comment
                     )
                 )
         schema = self.schema
@@ -276,10 +276,10 @@ class Table(DBObject):
         converter,
         is_not_null=None,
         sql_default=None,
-        doc=None,
+        comment=None,
     ):
         return self.schema.column_class(
-            column_name, self, sql_type, converter, is_not_null, sql_default, doc
+            column_name, self, sql_type, converter, is_not_null, sql_default, comment
         )
 
     def add_index(
@@ -385,7 +385,7 @@ class Column:
         converter,
         is_not_null=None,
         sql_default=None,
-        doc=None,
+        comment=None,
     ):
         if name in table.column_dict:
             throw(
@@ -400,7 +400,7 @@ class Column:
         self.converter = converter
         self.is_not_null = is_not_null
         self.sql_default = sql_default
-        self.doc = doc
+        self.comment = comment
         self.is_pk = False
         self.is_pk_part = False
         self.is_unique = False

@@ -45,18 +45,18 @@ class TestCommentsOption(unittest.TestCase):
         class Person(db.Entity):
             """A comment."""
 
-            name = Required(str, doc="Full name")
+            name = Required(str, comment="Full name")
 
         db.generate_mapping(create_tables=True)
         script = db.schema.generate_create_script()
         self.assertNotIn("COMMENT", script)
 
-    def test_invalid_doc(self):
+    def test_invalid_comment(self):
         db = self.db
 
         with self.assertRaises(TypeError):
             class Bad(db.Entity):
-                name = Required(str, doc=123)
+                name = Required(str, comment=123)
 
 
 @only_for("PostgreSQL")
@@ -90,7 +90,7 @@ class TestIdentityAndCommentsPostgreSQL(unittest.TestCase):
         class Person(db.Entity):
             """People and their profiles."""
 
-            name = Required(str, doc="Full name")
+            name = Required(str, comment="Full name")
 
         db.generate_mapping(create_tables=True)
         script = db.schema.generate_create_script()

@@ -1597,7 +1597,7 @@ class Database:
                             converter,
                             not attr.nullable,
                             attr.sql_default,
-                            attr.doc if emit_comments else None,
+                            attr.comment if emit_comments else None,
                         )
                     elif columns:
                         if attr.sql_type is not None:
@@ -3028,7 +3028,7 @@ class Attribute:
         "reverse_index",
         "using",
         "where",
-        "doc",
+        "comment",
         "original_default",
         "sql_default",
         "py_check",
@@ -3150,9 +3150,12 @@ class Attribute:
         self.reverse_index = kwargs.pop("reverse_index", None)
         self.using = kwargs.pop("using", None)
         self.where = kwargs.pop("where", None)
-        self.doc = kwargs.pop("doc", None)
-        if self.doc is not None and not isinstance(self.doc, str):
-            throw(TypeError, "'doc' option must be a string. Got: %r" % self.doc)
+        self.comment = kwargs.pop("comment", None)
+        if self.comment is not None and not isinstance(self.comment, str):
+            throw(
+                TypeError,
+                "'comment' option must be a string. Got: %r" % self.comment,
+            )
         self.fk_name = kwargs.pop("fk_name", None)
         if self.using is not None:
             if self.using not in ("btree", "hash", "gin", "gist", "brin"):
