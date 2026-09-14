@@ -146,6 +146,7 @@ __all__ = [
     "composite_key",
     "concat",
     "count",
+    "constraint",
     "db_session",
     "delete",
     "desc",
@@ -1764,6 +1765,28 @@ class Database:
                             where=attr.where,
                         )
             entity._initialize_bits_()
+
+        check_names = {}
+        for entity in entities:
+            table = schema.tables[entity._table_]
+            for method_name, func, check_name in entity._constraints_:
+                if check_name is None:
+                    check_name = "chk_%s__%s" % (
+                        provider.base_name(entity._table_),
+                        method_name,
+                    )
+                prev_func = check_names.get(check_name)
+                if prev_func is func:
+                    continue
+                if prev_func is not None:
+                    throw(
+                        TypeError,
+                        "Duplicate constraint name %r used by methods %s and %s"
+                        % (check_name, prev_func.__name__, method_name),
+                    )
+                check_names[check_name] = func
+                sql = _translate_constraint_check(entity, func)
+                table.add_check(check_name, sql)
 
         if create_tables:
             self.create_tables(check_tables)
@@ -4205,6 +4228,155 @@ def composite_key(
     )
 
 
+class _ConstraintCheckDecorator:
+    def __call__(self, func=None, *, name=None):
+        if func is None:
+            return lambda f: self._register(f, name)
+        return self._register(func, name)
+
+    @staticmethod
+    def _register(func, name):
+        if not isinstance(func, types.FunctionType):
+            throw(
+                TypeError,
+                "constraint.check decorator can be applied to methods only",
+            )
+        if name is not None and not isinstance(name, str):
+            throw(TypeError, "Constraint name must be a string. Got: %r" % name)
+        if hasattr(func, "_constraint_check_name_"):
+            throw(
+                TypeError,
+                "Method %s is already registered as a constraint" % func.__name__,
+            )
+        func._constraint_check_name_ = name
+        return func
+
+
+class _ConstraintNamespace:
+    def __init__(self):
+        self.check = _ConstraintCheckDecorator()
+
+
+constraint = _ConstraintNamespace()
+
+
+def _inline_constraint_constants(ast_node, vars):
+    if isinstance(ast_node, list):
+        if ast_node and ast_node[0] == "PARAM":
+            paramkey = ast_node[1]
+            varkey, i, j = paramkey
+            value = vars[varkey]
+            if i is not None:
+                t = type(value)
+                if t is tuple:
+                    value = value[i]
+                elif t is RawSQL:
+                    value = value.values[i]
+                elif hasattr(value, "_get_items"):
+                    value = value._get_items()[i]
+                else:
+                    assert False, t
+            if j is not None:
+                value = value._get_raw_pkval_()[j]
+            return ["VALUE", value]
+        return [_inline_constraint_constants(x, vars) for x in ast_node]
+    return ast_node
+
+
+def _strip_constraint_aliases(ast_node):
+    if isinstance(ast_node, list):
+        if ast_node and ast_node[0] == "COLUMN":
+            return ["COLUMN", None, ast_node[2]]
+        return [_strip_constraint_aliases(x) for x in ast_node]
+    return ast_node
+
+
+def _validate_constraint_ast(ast_node, func_name):
+    if isinstance(ast_node, list):
+        symbol = ast_node[0]
+        if symbol in ("SELECT", "COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT"):
+            throw(
+                TypeError,
+                "Constraint method %s cannot use aggregates or subqueries" % func_name,
+            )
+        for x in ast_node:
+            _validate_constraint_ast(x, func_name)
+    return ast_node
+
+
+def _translate_constraint_check(entity, func):
+    database = entity._database_
+    provider = database.provider
+    func_name = "%s.%s" % (entity.__name__, func.__name__)
+    names = get_lambda_args(func)
+    if len(names) != 1:
+        throw(
+            TypeError,
+            "Constraint method %s must have exactly one parameter (self)" % func_name,
+        )
+    name = names[0]
+    try:
+        cond_expr, external_names, cells = decompile(func)
+    except Exception as cause:
+        throw(
+            TypeError,
+            "Constraint method %s cannot be translated: %s" % (func_name, cause),
+        )
+    if not isinstance(cond_expr, ast.expr):
+        throw(
+            TypeError,
+            "Constraint method %s must consist of a single boolean expression" % func_name,
+        )
+    locals_dict = {".0": entity}
+    for ext_name in external_names:
+        if ext_name == name:
+            continue
+        if hasattr(entity, ext_name):
+            locals_dict[ext_name] = getattr(entity, ext_name)
+    for_expr = ast.comprehension(
+        target=ast.Name(name, ast.Store()),
+        iter=ast.Name(".0", ast.Load()),
+        ifs=[cond_expr],
+        is_async=False,
+    )
+    inner_expr = ast.GeneratorExp(
+        elt=ast.Name(name, ast.Load()), generators=[for_expr]
+    )
+    code_key = ("constraint_check", id(func.__code__))
+    try:
+        query = Query(code_key, inner_expr, func.__globals__, locals_dict, cells)
+    except (TranslationError, ExprEvalError) as cause:
+        throw(
+            TypeError,
+            "Constraint method %s cannot be translated: %s" % (func_name, cause),
+        )
+    translator = query._translator
+    conditions = list(translator.conditions)
+    discr_attr = entity._discriminator_attr_
+    if discr_attr is not None:
+        conditions = [
+            cond
+            for cond in conditions
+            if not (
+                isinstance(cond, list)
+                and cond[0] == "IN"
+                and cond[1][0] == "COLUMN"
+                and cond[1][2] == discr_attr.column
+            )
+        ]
+    if len(conditions) != 1:
+        throw(
+            TypeError,
+            "Constraint method %s must consist of a single boolean expression" % func_name,
+        )
+    cond_ast = _validate_constraint_ast(conditions[0], func_name)
+    cond_ast = _strip_constraint_aliases(cond_ast)
+    cond_ast = _inline_constraint_constants(cond_ast, query._vars)
+    sql, adapter = provider.ast2sql(cond_ast)
+    database._translator_cache.pop(query._key, None)
+    return sql
+
+
 class PrimaryKey(Required):
     __slots__ = []
 
@@ -5896,6 +6068,21 @@ class EntityMeta(type):
         ]
         cls._simple_keys_ = [key[0] for key in cls._keys_ if len(key) == 1]
         cls._composite_keys_ = [key for key in cls._keys_ if len(key) > 1]
+
+        constraints = []
+        for name, obj in cls.__dict__.items():
+            if isinstance(obj, types.FunctionType) and hasattr(
+                obj, "_constraint_check_name_"
+            ):
+                constraints.append((name, obj, obj._constraint_check_name_))
+        if direct_bases:
+            base_constraints = []
+            for base in direct_bases:
+                for constraint_tup in base._constraints_:
+                    if constraint_tup not in base_constraints:
+                        base_constraints.append(constraint_tup)
+            constraints[:0] = base_constraints
+        cls._constraints_ = constraints
 
         cls._new_attrs_ = new_attrs
         cls._attrs_ = base_attrs + new_attrs

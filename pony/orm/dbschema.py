@@ -132,6 +132,7 @@ class Table(DBObject):
         self.column_dict = {}
         self.indexes = {}
         self.pk_index = None
+        self.checks = []
         self.foreign_keys = {}
         self.parent_tables = set()
         self.child_tables = set()
@@ -188,6 +189,8 @@ class Table(DBObject):
         indexes.sort(key=attrgetter("name"))
         for index in indexes:
             cmd.append(schema.indent + index.get_sql() + ",")
+        for check in sorted(self.checks, key=attrgetter("name")):
+            cmd.append(schema.indent + check.get_sql() + ",")
         if not schema.named_foreign_keys:
             for foreign_key in sorted(
                 self.foreign_keys.values(), key=lambda fk: fk.name
@@ -313,6 +316,16 @@ class Table(DBObject):
             nulls_not_distinct,
             key_spec,
         )
+
+    def add_check(self, name, sql):
+        assert name is not None
+        if name in self.schema.constraints:
+            throw(
+                DBSchemaError, "Constraint with name %r already exists" % name
+            )
+        check = self.schema.check_class(name, self, sql)
+        self.checks.append(check)
+        return check
 
     def add_foreign_key(
         self,
@@ -628,6 +641,26 @@ class DBIndex(Constraint):
         return " ".join(cmd)
 
 
+class DBCheck(Constraint):
+    typename = "Check"
+
+    def __init__(self, name, table, sql):
+        assert name is not None and sql
+        Constraint.__init__(self, name, table.schema)
+        self.table = table
+        self.sql = sql
+
+    def get_sql(self):
+        schema = self.schema
+        case = schema.case
+        return "%s %s %s (%s)" % (
+            case("CONSTRAINT"),
+            schema.provider.quote_name(self.name),
+            case("CHECK"),
+            self.sql,
+        )
+
+
 class ForeignKey(Constraint):
     typename = "Foreign key"
 
@@ -744,4 +777,5 @@ class ForeignKey(Constraint):
 DBSchema.table_class = Table
 DBSchema.column_class = Column
 DBSchema.index_class = DBIndex
+DBSchema.check_class = DBCheck
 DBSchema.fk_class = ForeignKey
