@@ -1432,6 +1432,7 @@ class Database:
             throw(NotImplementedError)
         schema = self.schema = provider.dbschema_cls(provider)
         entities = list(sorted(self.entities.values(), key=attrgetter("_id_")))
+        emit_comments = provider.dialect == "PostgreSQL"
         for entity in entities:
             entity._resolve_attr_types_()
         for entity in entities:
@@ -1468,6 +1469,8 @@ class Database:
                 table = schema.add_table(table_name, entity)
             else:
                 table.add_entity(entity)
+            if emit_comments and entity._root_ is entity:
+                table.comment = entity._doc_
 
             for attr in entity._new_attrs_:
                 if attr.is_collection:
@@ -1594,6 +1597,7 @@ class Database:
                             converter,
                             not attr.nullable,
                             attr.sql_default,
+                            attr.doc if emit_comments else None,
                         )
                     elif columns:
                         if attr.sql_type is not None:
@@ -1618,7 +1622,8 @@ class Database:
             ]
             if not table.pk_index:
                 if len(entity._pk_columns_) == 1 and entity._pk_attrs_[0].auto:
-                    is_pk = "auto"
+                    auto = entity._pk_attrs_[0].auto
+                    is_pk = "identity" if auto == "identity" else "auto"
                 else:
                     is_pk = True
                 pk_index = next(index for index in entity._indexes_ if index.is_pk)
@@ -3023,6 +3028,7 @@ class Attribute:
         "reverse_index",
         "using",
         "where",
+        "doc",
         "original_default",
         "sql_default",
         "py_check",
@@ -3087,6 +3093,11 @@ class Attribute:
         self.entity = self.name = None
         self.args = args
         self.auto = kwargs.pop("auto", False)
+        if self.auto not in (False, True, "identity"):
+            throw(
+                TypeError,
+                "'auto' option must be bool or 'identity'. Got: %r" % self.auto,
+            )
         self.cascade_delete = kwargs.pop("cascade_delete", None)
 
         self.reverse = kwargs.pop("reverse", None)
@@ -3139,6 +3150,9 @@ class Attribute:
         self.reverse_index = kwargs.pop("reverse_index", None)
         self.using = kwargs.pop("using", None)
         self.where = kwargs.pop("where", None)
+        self.doc = kwargs.pop("doc", None)
+        if self.doc is not None and not isinstance(self.doc, str):
+            throw(TypeError, "'doc' option must be a string. Got: %r" % self.doc)
         self.fk_name = kwargs.pop("fk_name", None)
         if self.using is not None:
             if self.using not in ("btree", "hash", "gin", "gist", "brin"):
@@ -6127,6 +6141,9 @@ class EntityMeta(type):
 
         database.entities[cls.__name__] = cls
         setattr(database, cls.__name__, cls)
+
+        doc = cls.__dict__.get("__doc__")
+        cls._doc_ = doc.strip() if doc else None
 
         cls._cached_max_id_sql_ = None
         cls._find_sql_cache_ = {}

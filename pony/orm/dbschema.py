@@ -133,6 +133,7 @@ class Table(DBObject):
         self.indexes = {}
         self.pk_index = None
         self.checks = []
+        self.comment = None
         self.foreign_keys = {}
         self.parent_tables = set()
         self.child_tables = set()
@@ -238,6 +239,17 @@ class Table(DBObject):
             assert index.name is not None
         indexes.sort(key=attrgetter("name"))
         result.extend(indexes)
+        if self.comment:
+            result.append(
+                DBComment(self.schema, self.name, None, self.comment)
+            )
+        for column in self.column_list:
+            if column.doc:
+                result.append(
+                    DBComment(
+                        self.schema, self.name, column.name, column.doc
+                    )
+                )
         schema = self.schema
         if schema.named_foreign_keys:
             for foreign_key in sorted(
@@ -258,10 +270,16 @@ class Table(DBObject):
         return result
 
     def add_column(
-        self, column_name, sql_type, converter, is_not_null=None, sql_default=None
+        self,
+        column_name,
+        sql_type,
+        converter,
+        is_not_null=None,
+        sql_default=None,
+        doc=None,
     ):
         return self.schema.column_class(
-            column_name, self, sql_type, converter, is_not_null, sql_default
+            column_name, self, sql_type, converter, is_not_null, sql_default, doc
         )
 
     def add_index(
@@ -357,9 +375,17 @@ class Table(DBObject):
 
 class Column:
     auto_template = "%(type)s PRIMARY KEY AUTOINCREMENT"
+    identity_template = None
 
     def __init__(
-        self, name, table, sql_type, converter, is_not_null=None, sql_default=None
+        self,
+        name,
+        table,
+        sql_type,
+        converter,
+        is_not_null=None,
+        sql_default=None,
+        doc=None,
     ):
         if name in table.column_dict:
             throw(
@@ -374,6 +400,7 @@ class Column:
         self.converter = converter
         self.is_not_null = is_not_null
         self.sql_default = sql_default
+        self.doc = doc
         self.is_pk = False
         self.is_pk_part = False
         self.is_unique = False
@@ -396,11 +423,16 @@ class Column:
                 append(self.sql_default)
 
         if (
-            self.is_pk == "auto"
+            self.is_pk in ("auto", "identity")
             and self.auto_template
             and self.converter.py_type in int_types
         ):
-            append(case(self.auto_template % dict(type=self.sql_type)))
+            template = (
+                self.identity_template
+                if self.is_pk == "identity" and self.identity_template
+                else self.auto_template
+            )
+            append(case(template % dict(type=self.sql_type)))
             add_default()
         else:
             append(case(self.sql_type))
@@ -534,6 +566,11 @@ class DBIndex(Constraint):
                 TypeError,
                 "'nulls_not_distinct' option is allowed only for unique indexes",
             )
+        if is_pk == "identity" and schema.provider.dialect != "PostgreSQL":
+            throw(
+                TypeError,
+                "'auto=\"identity\"' is supported only in PostgreSQL",
+            )
         for column in columns:
             column.is_pk = column.is_pk or (len(columns) == 1 and is_pk)
             column.is_pk_part = column.is_pk_part or bool(is_pk)
@@ -658,6 +695,34 @@ class DBCheck(Constraint):
             schema.provider.quote_name(self.name),
             case("CHECK"),
             self.sql,
+        )
+
+
+class DBComment(DBObject):
+    def __init__(self, schema, table_name, column_name, text):
+        self.schema = schema
+        self.table_name = table_name
+        self.column_name = column_name
+        self.text = text
+
+    def get_create_command(self):
+        schema = self.schema
+        case = schema.case
+        quote_name = schema.provider.quote_name
+        if self.column_name is None:
+            kind = case("TABLE")
+            target = quote_name(self.table_name)
+        else:
+            kind = case("COLUMN")
+            target = "%s.%s" % (
+                quote_name(self.table_name),
+                quote_name(self.column_name),
+            )
+        return "%s %s %s IS '%s'" % (
+            case("COMMENT ON"),
+            kind,
+            target,
+            self.text.replace("'", "''"),
         )
 
 
