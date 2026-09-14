@@ -178,7 +178,9 @@ class Table(DBObject):
         indexes = [
             index
             for index in self.indexes.values()
-            if not index.is_pk and index.is_unique and len(index.columns) > 1
+            if not index.is_pk
+            and index.is_unique
+            and (len(index.columns) > 1 or index.is_named)
         ]
         for index in indexes:
             assert index.name is not None
@@ -262,6 +264,7 @@ class Table(DBObject):
 
     def add_index(self, index_name, columns, is_pk=False, is_unique=None, m2m=False):
         assert index_name is not False
+        is_named = isinstance(index_name, str)
         if index_name is True:
             index_name = None
         if index_name is None and not is_pk:
@@ -281,7 +284,9 @@ class Table(DBObject):
             and index.is_unique == is_unique
         ):
             return index
-        return self.schema.index_class(index_name, self, columns, is_pk, is_unique)
+        return self.schema.index_class(
+            index_name, self, columns, is_pk, is_unique, is_named
+        )
 
     def add_foreign_key(
         self,
@@ -366,7 +371,8 @@ class Column:
                     append(case("NOT NULL"))
                 append(case("PRIMARY KEY"))
             else:
-                if self.is_unique:
+                index = table.indexes.get((self,))
+                if self.is_unique and not (index and index.is_named):
                     append(case("UNIQUE"))
                 if self.is_not_null:
                     append(case("NOT NULL"))
@@ -397,7 +403,7 @@ class Constraint(DBObject):
 class DBIndex(Constraint):
     typename = "Index"
 
-    def __init__(self, name, table, columns, is_pk=False, is_unique=None):
+    def __init__(self, name, table, columns, is_pk=False, is_unique=None, is_named=False):
         assert len(columns) > 0
         for column in columns:
             if column.table is not table:
@@ -441,6 +447,7 @@ class DBIndex(Constraint):
                 "Index %s cannot be created, name is already in use" % name,
             )
         Constraint.__init__(self, name, schema)
+        self.is_named = is_named
         for column in columns:
             column.is_pk = column.is_pk or (len(columns) == 1 and is_pk)
             column.is_pk_part = column.is_pk_part or bool(is_pk)

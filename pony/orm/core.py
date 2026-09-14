@@ -176,6 +176,7 @@ __all__ = [
     "sql_debugging",
     "sum",
     "unicode",
+    "unique",
     "user_groups_getter",
     "user_roles_getter",
     "with_transaction",
@@ -1619,7 +1620,12 @@ class Database:
                     is_pk = "auto"
                 else:
                     is_pk = True
-                table.add_index(None, get_columns(table, entity._pk_columns_), is_pk)
+                pk_index = next(index for index in entity._indexes_ if index.is_pk)
+                table.add_index(
+                    pk_index.name,
+                    get_columns(table, entity._pk_columns_),
+                    is_pk,
+                )
             for index in entity._indexes_:
                 if index.is_pk:
                     continue
@@ -1627,7 +1633,9 @@ class Database:
                 attrs = index.attrs
                 for attr in attrs:
                     column_names.extend(attr.columns)
-                index_name = attrs[0].index if len(attrs) == 1 else None
+                index_name = index.name
+                if index_name is None and len(attrs) == 1:
+                    index_name = attrs[0].index
                 table.add_index(
                     index_name,
                     get_columns(table, column_names),
@@ -1702,7 +1710,7 @@ class Database:
                         on_delete,
                         interleave=attr.interleave,
                     )
-                elif attr.index and attr.columns:
+                elif attr.index and not attr.is_unique and attr.columns:
                     if (
                         isinstance(attr.py_type, Array)
                         and provider.dialect != "PostgreSQL"
@@ -2975,6 +2983,14 @@ class Attribute:
                     TypeError, "'unique' option cannot be set for PrimaryKey attribute "
                 )
             self.is_unique = True
+        if self.is_unique is not None and not (
+            isinstance(self.is_unique, bool) or isinstance(self.is_unique, str)
+        ):
+            throw(
+                TypeError,
+                "'unique' option must be a bool or a string (index name). Got: %r"
+                % self.is_unique,
+            )
         self.nullable = kwargs.pop("nullable", None)
         self.is_part_of_unique_index = self.is_unique  # Also can be set to True later
         self.is_pk = isinstance(self, PrimaryKey)
@@ -3838,11 +3854,14 @@ class Discriminator(Required):
 
 
 class Index:
-    __slots__ = "attrs", "entity", "is_pk", "is_unique"
+    __slots__ = "attrs", "entity", "is_pk", "is_unique", "name"
 
     def __init__(self, *attrs, **options):
         self.entity = None
         self.attrs = list(attrs)
+        self.name = options.pop("name", None)
+        if self.name is not None and not isinstance(self.name, str):
+            throw(TypeError, "Index name must be a string. Got: %r" % self.name)
         self.is_pk = options.pop("is_pk", False)
         self.is_unique = options.pop("is_unique", True)
         assert not options
@@ -3927,7 +3946,7 @@ class Index:
                     attr.default = None
 
 
-def _define_index(func_name, attrs, is_unique=False):
+def _define_index(func_name, attrs, is_unique=False, name=None):
     if len(attrs) < 2:
         throw(
             TypeError,
@@ -3935,15 +3954,20 @@ def _define_index(func_name, attrs, is_unique=False):
         )
     cls_dict = sys._getframe(2).f_locals
     indexes = cls_dict.setdefault("_indexes_", [])
-    indexes.append(Index(*attrs, is_pk=False, is_unique=is_unique))
+    indexes.append(Index(*attrs, name=name, is_pk=False, is_unique=is_unique))
 
 
-def composite_index(*attrs):
-    _define_index("composite_index", attrs)
+def composite_index(*attrs, name=None):
+    _define_index("composite_index", attrs, name=name)
 
 
-def composite_key(*attrs):
-    _define_index("composite_key", attrs, is_unique=True)
+def unique(*attrs, name=None):
+    _define_index("unique", attrs, is_unique=True, name=name)
+
+
+def composite_key(*attrs, name=None):
+    # Deprecated alias of unique(); kept for backward compatibility
+    _define_index("composite_key", attrs, is_unique=True, name=name)
 
 
 class PrimaryKey(Required):
@@ -3952,16 +3976,29 @@ class PrimaryKey(Required):
     def __new__(cls, *args, **kwargs):
         if not args:
             throw(TypeError, "PrimaryKey must receive at least one positional argument")
+        name = kwargs.pop("name", None)
+        if name is not None and not isinstance(name, str):
+            throw(TypeError, "PrimaryKey name must be a string. Got: %r" % name)
         cls_dict = sys._getframe(1).f_locals
         attrs = tuple(a for a in args if isinstance(a, Attribute))
         non_attrs = [a for a in args if not isinstance(a, Attribute)]
         cls_dict = sys._getframe(1).f_locals
 
         if not attrs:
+            if name is not None:
+                throw(
+                    TypeError,
+                    "PrimaryKey name option requires composite primary key",
+                )
             return Required.__new__(cls)
         elif non_attrs or kwargs:
             throw(TypeError, "PrimaryKey got invalid arguments: %r %r" % (args, kwargs))
         elif len(attrs) == 1:
+            if name is not None:
+                throw(
+                    TypeError,
+                    "PrimaryKey name option requires composite primary key",
+                )
             attr = attrs[0]
             attr_name = "something"
             for key, val in cls_dict.items():
@@ -3980,7 +4017,7 @@ class PrimaryKey(Required):
             attr.is_part_of_unique_index = True
             attr.composite_keys.append((attrs, i))
         indexes = cls_dict.setdefault("_indexes_", [])
-        indexes.append(Index(*attrs, is_pk=True))
+        indexes.append(Index(*attrs, name=name, is_pk=True))
         return None
 
 
@@ -5562,7 +5599,11 @@ class EntityMeta(type):
         indexes = cls._indexes_ = cls.__dict__.get("_indexes_", [])
         for attr in new_attrs:
             if attr.is_unique:
-                indexes.append(Index(attr, is_pk=isinstance(attr, PrimaryKey)))
+                is_unique = attr.is_unique
+                name = is_unique if isinstance(is_unique, str) else None
+                indexes.append(
+                    Index(attr, name=name, is_pk=isinstance(attr, PrimaryKey))
+                )
         for index in indexes:
             index._init_(cls)
         primary_keys = {index.attrs for index in indexes if index.is_pk}

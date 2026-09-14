@@ -138,6 +138,161 @@ class TestIndexes(unittest.TestCase):
             p1.set(name="John", age=19)
             p1.delete()
 
+    def test_5(self):  # named composite_index
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_index(a, b, name="idx_ab")
+
+        db.generate_mapping(create_tables=True)
+
+        i1, i2 = Person._indexes_
+        self.assertEqual(i2.name, "idx_ab")
+        table = db.schema.tables[Person._table_]
+        db_index = table.indexes[table.column_dict["a"], table.column_dict["b"]]
+        self.assertEqual(db_index.name, "idx_ab")
+        self.assertEqual(db_index.is_named, True)
+        self.assertEqual(db_index.is_unique, False)
+
+        script = db.schema.generate_create_script()
+        dialect = db.provider.dialect
+        if dialect == "MySQL" or dialect == "SQLite":
+            index_sql = "CREATE INDEX `idx_ab` ON `%s` (`a`, `b`)" % Person._table_
+        elif dialect == "PostgreSQL":
+            index_sql = 'CREATE INDEX "idx_ab" ON "%s" ("a", "b")' % Person._table_
+        elif dialect == "Oracle":
+            index_sql = 'CREATE INDEX "IDX_AB" ON "%s" ("A", "B")' % Person._table_.upper()
+        else:
+            raise NotImplementedError
+        self.assertIn(index_sql, script)
+
+    def test_6(self):  # named unique()
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            unique(a, b, name="unq_ab")
+
+        db.generate_mapping(create_tables=True)
+
+        i1, i2 = Person._indexes_
+        self.assertEqual(i2.name, "unq_ab")
+        self.assertEqual(i2.is_unique, True)
+        table = db.schema.tables[Person._table_]
+        db_index = table.indexes[table.column_dict["a"], table.column_dict["b"]]
+        self.assertEqual(db_index.name, "unq_ab")
+        self.assertEqual(db_index.is_named, True)
+        self.assertEqual(db_index.is_unique, True)
+
+        script = db.schema.generate_create_script()
+        dialect = db.provider.dialect
+        if dialect == "MySQL" or dialect == "SQLite":
+            constraint_sql = (
+                "CONSTRAINT `unq_ab` UNIQUE (`a`, `b`)" if dialect == "MySQL"
+                else 'CONSTRAINT "unq_ab" UNIQUE ("a", "b")'
+            )
+        elif dialect == "PostgreSQL":
+            constraint_sql = 'CONSTRAINT "unq_ab" UNIQUE ("a", "b")'
+        elif dialect == "Oracle":
+            constraint_sql = 'CONSTRAINT "UNQ_AB" UNIQUE ("A", "B")'
+        else:
+            raise NotImplementedError
+        self.assertIn(constraint_sql, script)
+
+    def test_7(self):  # composite_key alias with name
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_key(a, b, name="unq_ab")
+
+        db.generate_mapping(create_tables=True)
+
+        i1, i2 = Person._indexes_
+        self.assertEqual(i2.name, "unq_ab")
+        self.assertEqual(i2.is_unique, True)
+        table = db.schema.tables[Person._table_]
+        db_index = table.indexes[table.column_dict["a"], table.column_dict["b"]]
+        self.assertEqual(db_index.name, "unq_ab")
+        self.assertEqual(db_index.is_unique, True)
+
+    def test_8(self):  # unique="name" for a single column
+        db = self.db
+
+        class User(db.Entity):
+            email = Required(str, unique="unq_email")
+
+        db.generate_mapping(create_tables=True)
+
+        table = db.schema.tables[User._table_]
+        column = table.column_dict["email"]
+        db_index = table.indexes[column,]
+        self.assertEqual(db_index.name, "unq_email")
+        self.assertEqual(db_index.is_named, True)
+        self.assertEqual(db_index.is_unique, True)
+
+        script = db.schema.generate_create_script()
+        dialect = db.provider.dialect
+        if dialect == "MySQL":
+            constraint_sql = "CONSTRAINT `unq_email` UNIQUE (`email`)"
+        elif dialect == "SQLite" or dialect == "PostgreSQL":
+            constraint_sql = 'CONSTRAINT "unq_email" UNIQUE ("email")'
+        elif dialect == "Oracle":
+            constraint_sql = 'CONSTRAINT "UNQ_EMAIL" UNIQUE ("EMAIL")'
+        else:
+            raise NotImplementedError
+        self.assertIn(constraint_sql, script)
+
+    def test_9(self):  # named composite PrimaryKey
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            PrimaryKey(a, b, name="pk_ab")
+
+        db.generate_mapping(create_tables=True)
+
+        i1 = Person._indexes_[0]
+        self.assertEqual(i1.name, "pk_ab")
+        self.assertEqual(i1.is_pk, True)
+        table = db.schema.tables[Person._table_]
+        self.assertEqual(table.pk_index.name, "pk_ab")
+
+        script = db.schema.generate_create_script()
+        dialect = db.provider.dialect
+        if dialect == "MySQL":
+            constraint_sql = "CONSTRAINT `pk_ab` PRIMARY KEY (`a`, `b`)"
+        elif dialect == "SQLite" or dialect == "PostgreSQL":
+            constraint_sql = 'CONSTRAINT "pk_ab" PRIMARY KEY ("a", "b")'
+        elif dialect == "Oracle":
+            constraint_sql = 'CONSTRAINT "PK_AB" PRIMARY KEY ("A", "B")'
+        else:
+            raise NotImplementedError
+        self.assertIn(constraint_sql, script)
+
+    def test_10(self):  # error cases
+        db = self.db
+
+        with self.assertRaises(TypeError):
+            class Bad1(db.Entity):
+                p = Required(str)
+                PrimaryKey(p, name="pk_single")
+
+        with self.assertRaises(TypeError):
+            class Bad2(db.Entity):
+                a = Required(str)
+                b = Required(int)
+                unique(a, b, name=123)
+
+        with self.assertRaises(TypeError):
+            class Bad3(db.Entity):
+                a = Required(str, unique=123)
+
     def test_5(self):
         db = self.db
 
