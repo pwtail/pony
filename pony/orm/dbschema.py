@@ -699,11 +699,19 @@ class DBCheck(Constraint):
 
 
 class DBComment(DBObject):
+    typename = "Comment"
+
     def __init__(self, schema, table_name, column_name, text):
         self.schema = schema
         self.table_name = table_name
         self.column_name = column_name
         self.text = text
+        self.name = (
+            (table_name, column_name) if column_name is not None else table_name
+        )
+
+    def exists(self, provider, connection, case_sensitive=True):
+        return None  # COMMENT ON is idempotent: always re-apply
 
     def get_create_command(self):
         schema = self.schema

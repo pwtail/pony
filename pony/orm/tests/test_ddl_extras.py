@@ -1,6 +1,7 @@
 import unittest
 
 from pony.orm import *
+from pony.orm.dbschema import DBComment
 from pony.orm.tests import db_params, only_for, teardown_database
 from pony.orm.tests.testutils import *
 
@@ -57,6 +58,30 @@ class TestCommentsOption(unittest.TestCase):
         with self.assertRaises(TypeError):
             class Bad(db.Entity):
                 name = Required(str, comment=123)
+
+    def test_comment_object_contract(self):
+        # create_tables requires every object from get_objects_to_create()
+        # to expose name, typename and exists() — DBComment must comply
+        db = self.db
+        db.provider.dialect = "PostgreSQL"
+
+        class Note(db.Entity):
+            """A note."""
+
+            body = Optional(str, comment="Body text")
+
+        db.generate_mapping(check_tables=False, create_tables=False)
+        table = db.schema.tables[Note._table_]
+        comments = [
+            obj
+            for obj in table.get_objects_to_create()
+            if isinstance(obj, DBComment)
+        ]
+        self.assertEqual(len(comments), 2)
+        for comment in comments:
+            self.assertTrue(db.provider.base_name(comment.name))
+            self.assertIsNone(comment.exists(db.provider, None))
+            self.assertIn("COMMENT ON", comment.get_create_command())
 
 
 @only_for("PostgreSQL")
