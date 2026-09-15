@@ -1170,7 +1170,7 @@ class Database:
             if provider == "pygresql":
                 throw(
                     TypeError,
-                    "Pony no longer supports PyGreSQL module. Please use psycopg2 instead.",
+                    "Pony no longer supports PyGreSQL module. Please use psycopg (psycopg3) instead.",
                 )
             self.provider_name = provider
             provider_module = import_module("pony.orm.dbproviders." + provider)

@@ -1,3 +1,10 @@
+# PonyORM unreleased
+
+## Breaking changes
+
+* PostgreSQL and CockroachDB providers now use psycopg (psycopg3) instead of psycopg2 / psycopg2cffi; installing `psycopg` is required to use them
+
+
 # PonyORM release 0.7.20 (2026-08-09)
 
 ## Features

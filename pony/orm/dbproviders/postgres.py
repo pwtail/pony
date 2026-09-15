@@ -5,24 +5,15 @@ from uuid import UUID
 from pony.py23compat import buffer, int_types
 
 try:
-    import psycopg2
+    import psycopg
 except ImportError:
-    try:
-        from psycopg2cffi import compat
-    except ImportError:
-        raise ImportError(
-            "In order to use PonyORM with PostgreSQL please install psycopg2 or psycopg2cffi"
-        )
-    else:
-        compat.register()
+    raise ImportError(
+        "In order to use PonyORM with PostgreSQL please install psycopg (psycopg3)"
+    )
 
+import psycopg.types.json
 
-import psycopg2.extras
-
-psycopg2.extras.register_uuid()
-
-psycopg2.extras.register_default_json(loads=lambda x: x)
-psycopg2.extras.register_default_jsonb(loads=lambda x: x)
+psycopg.types.json.set_json_loads(lambda x: x.decode() if isinstance(x, bytes) else x)
 
 from pony.orm import core, dbapiprovider, dbschema, ormtypes
 from pony.orm.core import log_orm
@@ -252,9 +243,11 @@ class PGArrayConverter(dbapiprovider.ArrayConverter):
 
 class PGPool(Pool):
     def _connect(self):
-        self.con = self.dbapi_module.connect(*self.args, **self.kwargs)
-        if "client_encoding" not in self.kwargs:
-            self.con.set_client_encoding("UTF8")
+        kwargs = self.kwargs
+        if "database" in kwargs and "dbname" not in kwargs:
+            kwargs["dbname"] = kwargs.pop("database")
+        kwargs.setdefault("client_encoding", "UTF8")
+        self.con = self.dbapi_module.connect(*self.args, **kwargs)
 
     def release(self, con):
         assert con is self.con
@@ -262,7 +255,10 @@ class PGPool(Pool):
             con.rollback()
             con.autocommit = True
             cursor = con.cursor()
-            cursor.execute("DISCARD ALL")
+            cursor.execute("DISCARD ALL", prepare=False)
+            prepared = getattr(con, "prepared", None) or getattr(con, "_prepared", None)
+            if prepared is not None:
+                prepared.clear()
             con.autocommit = False
         except:
             self.drop(con)
@@ -279,7 +275,7 @@ class PGProvider(DBAPIProvider):
     max_params_count = 10000
     index_if_not_exists_syntax = False
 
-    dbapi_module = psycopg2
+    dbapi_module = psycopg
     dbschema_cls = PGSchema
     translator_cls = PGTranslator
     sqlbuilder_cls = PGSQLBuilder
@@ -294,11 +290,11 @@ class PGProvider(DBAPIProvider):
 
     @wrap_dbapi_exceptions
     def inspect_connection(self, connection):
-        self.server_version = connection.server_version
+        self.server_version = connection.info.server_version
         self.table_if_not_exists_syntax = self.server_version >= 90100
 
     def should_reconnect(self, exc):
-        return isinstance(exc, psycopg2.OperationalError) and exc.pgcode in (
+        return isinstance(exc, psycopg.errors.OperationalError) and exc.sqlstate in (
             None,
             ADMIN_SHUTDOWN,
         )
