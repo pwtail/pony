@@ -84,7 +84,7 @@ class TestCommentsOption(unittest.TestCase):
             self.assertIn("COMMENT ON", comment.get_create_command())
 
 
-@only_for("PostgreSQL")
+@only_for("postgres")
 class TestIdentityAndCommentsPostgreSQL(unittest.TestCase):
     def setUp(self):
         self.db = Database(**db_params)
@@ -105,7 +105,8 @@ class TestIdentityAndCommentsPostgreSQL(unittest.TestCase):
         )
         with db_session:
             p = Person()
-            self.assertIsNotNone(p.id)
+        self.assertIsNotNone(p.id)
+        with db_session:
             p2 = Person(id=42)
             self.assertEqual(p2.id, 42)
 

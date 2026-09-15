@@ -154,7 +154,7 @@ class TestConstraintCheck(unittest.TestCase):
         teardown_database(db5)
 
 
-@only_for("PostgreSQL")
+@only_for("postgres")
 class TestConstraintCheckPostgreSQL(unittest.TestCase):
     def setUp(self):
         self.db = Database(**db_params)
@@ -166,7 +166,7 @@ class TestConstraintCheckPostgreSQL(unittest.TestCase):
         db = self.db
 
         class Event(db.Entity):
-            created = Required(datetime)
+            created = Required(datetime.datetime)
             status = Required(str)
 
             @constraint.check

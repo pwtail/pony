@@ -396,7 +396,7 @@ class TestIndexes(unittest.TestCase):
             Table2.exists(height=2, length=1)
 
 
-@only_for("PostgreSQL")
+@only_for("postgres")
 class TestIndexOptionsPostgreSQL(unittest.TestCase):
     def setUp(self):
         self.db = Database(**db_params)
@@ -410,12 +410,24 @@ class TestIndexOptionsPostgreSQL(unittest.TestCase):
         class Person(db.Entity):
             a = Required(str)
             b = Required(int)
-            composite_index(a, b, name="ix_ab", using="gin")
+            composite_index(a, b, name="ix_ab", using="btree")
 
         db.generate_mapping(create_tables=True)
         script = db.schema.generate_create_script()
         self.assertIn(
-            'CREATE INDEX "ix_ab" ON "person" USING GIN ("a", "b")', script
+            'CREATE INDEX "ix_ab" ON "person" USING BTREE ("a", "b")', script
+        )
+
+    def test_using_gin(self):
+        db = self.db
+
+        class Person(db.Entity):
+            tags = Required(IntArray, index="ix_tags", using="gin")
+
+        db.generate_mapping(create_tables=True)
+        script = db.schema.generate_create_script()
+        self.assertIn(
+            'CREATE INDEX "ix_tags" ON "person" USING GIN ("tags")', script
         )
 
     def test_where(self):
