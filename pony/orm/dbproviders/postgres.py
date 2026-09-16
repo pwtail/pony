@@ -243,11 +243,15 @@ class PGArrayConverter(dbapiprovider.ArrayConverter):
 
 class PGPool(Pool):
     def _connect(self):
-        kwargs = self.kwargs
+        kwargs = dict(self.kwargs)
         if "database" in kwargs and "dbname" not in kwargs:
             kwargs["dbname"] = kwargs.pop("database")
         kwargs.setdefault("client_encoding", "UTF8")
-        self.con = self.dbapi_module.connect(*self.args, **kwargs)
+        conninfo = kwargs.pop("dsn", None)
+        if conninfo is not None:
+            self.con = self.dbapi_module.connect(conninfo, **kwargs)
+        else:
+            self.con = self.dbapi_module.connect(*self.args, **kwargs)
 
     def release(self, con):
         assert con is self.con

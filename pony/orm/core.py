@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import builtins
 import datetime
 import inspect
@@ -10,7 +11,7 @@ import sys
 import types
 import warnings
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ContextDecorator, contextmanager
 from decimal import Decimal
 from functools import wraps
 from hashlib import md5
@@ -68,7 +69,7 @@ from pony.utils import (
     get_lambda_args,
     import_module,
     is_ident,
-    localbase,
+    ContextLocal,
     parse_expr,
     pickle_ast,
     reraise,
@@ -102,6 +103,7 @@ __all__ = [
     "IntArray",
     "IntegrityError",
     "InterfaceError",
+    "IOForbiddenError",
     "InternalError",
     "IsolationError",
     "Json",
@@ -111,6 +113,7 @@ __all__ = [
     "MultipleObjectsFoundError",
     "MultipleRowsFound",
     "NotSupportedError",
+    "NotLoadedError",
     "ObjectNotFound",
     "OperationWithDeletedObjectError",
     "OperationalError",
@@ -358,6 +361,14 @@ class DatabaseSessionIsOver(TransactionError):
     pass
 
 
+class IOForbiddenError(OrmError):
+    pass
+
+
+class NotLoadedError(OrmError):
+    pass
+
+
 TransactionRolledBack = DatabaseSessionIsOver
 
 
@@ -531,13 +542,15 @@ class PrefetchContext:
         return result
 
 
-class Local(localbase):
-    def __init__(self):
+class Local(ContextLocal):
+    def _init_context(self):
         self.debug = False
         self.show_values = None
         self.debug_stack = []
         self.db2cache = {}
         self.db_context_counter = 0
+        self.io_counter = 0
+        self.async_db_context = 0
         self.db_session = None
         self.prefetch_context_stack = []
         self.current_user = None
@@ -564,6 +577,20 @@ class Local(localbase):
 local = Local()
 
 
+class _IO(ContextDecorator):
+    # Temporary explicit-I/O scope; removed once async support lands.
+    # Usable both as `with io:` and as a function decorator `@io`.
+    def __enter__(self):
+        local.io_counter += 1
+
+    def __exit__(self, *exc):
+        local.io_counter -= 1
+
+
+io = _IO()
+io_bypass = _IO()  # internal: transaction machinery (flush/commit/rollback) is exempt from the guard
+
+
 def _get_caches():
     return list(
         sorted(
@@ -575,8 +602,14 @@ def _get_caches():
 
 
 @cut_traceback
+@io_bypass
 def flush():
     for cache in _get_caches():
+        if cache.is_async:
+            throw(
+                TransactionError,
+                "async session is active; use 'await flush()'",
+            )
         cache.flush()
 
 
@@ -602,6 +635,7 @@ def rollback_and_reraise(exc_info):
 
 
 @cut_traceback
+@io_bypass
 def commit():
     caches = _get_caches()
     if not caches:
@@ -609,6 +643,11 @@ def commit():
 
     try:
         for cache in caches:
+            if cache.is_async:
+                throw(
+                    TransactionError,
+                    "async session is active; use 'await commit()'",
+                )
             cache.flush()
     except BaseException:
         rollback_and_reraise(sys.exc_info())
@@ -639,7 +678,14 @@ def commit():
 
 
 @cut_traceback
+@io_bypass
 def rollback():
+    for cache in _get_caches():
+        if cache.is_async:
+            throw(
+                TransactionError,
+                "async session is active; use 'await rollback()'",
+            )
     exceptions = []
     try:
         for cache in _get_caches():
@@ -655,6 +701,29 @@ def rollback():
 
 
 select_re = re.compile(r"\s*select\b", re.IGNORECASE)
+
+
+def _running_in_user_coroutine():
+    """True, если текущий код исполняется внутри пользовательской корутины.
+
+    Jupyter/ipykernel исполняет даже sync-ячейки внутри своей внутренней
+    задачи — такие встраивания сами блокируют свой event loop, и защищать
+    от них не нужно (иначе sync-код в ноутбуках работать не сможет).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    task = asyncio.current_task()
+    if task is None:
+        return False
+    coro = task.get_coro()
+    if coro is None or coro.cr_code is None:
+        return False
+    filename = coro.cr_code.co_filename
+    if "ipykernel" in filename or "jupyter" in filename:
+        return False
+    return True
 
 
 class DBSessionContextManager:
@@ -750,7 +819,73 @@ class DBSessionContextManager:
                 TypeError,
                 "@db_session can accept 'retry' parameter only when used as decorator and not as context manager",
             )
+        if _running_in_user_coroutine():
+            throw(
+                TransactionError,
+                "sync db_session cannot be used inside a coroutine; "
+                "use 'async with db_session:'",
+            )
         self._enter()
+
+    async def __aenter__(self):
+        if self.retry != 0:
+            throw(
+                TypeError,
+                "@db_session can accept 'retry' parameter only when used as decorator and not as context manager",
+            )
+        local.async_db_context += 1
+        try:
+            self._enter()
+        except BaseException:
+            local.async_db_context -= 1
+            raise
+        return self
+
+    async def __aexit__(self, exc_type=None, exc=None, tb=None):
+        local.db_context_counter -= 1
+        try:
+            if not local.db_context_counter:
+                assert local.db_session is self
+                await self._async_commit_or_rollback(exc_type, exc, tb)
+        finally:
+            local.async_db_context -= 1
+            if self.sql_debug is not None:
+                local.pop_debug_state()
+
+    async def _async_commit_or_rollback(self, exc_type, exc, tb):
+        from pony.orm.async_core import async_commit, async_rollback
+
+        try:
+            if exc_type is None:
+                can_commit = True
+            elif not callable(self.allowed_exceptions):
+                can_commit = issubclass(exc_type, tuple(self.allowed_exceptions))
+            else:
+                assert (
+                    exc is not None
+                )  # exc can be None in Python 2.6 even if exc_type is not None
+                try:
+                    can_commit = self.allowed_exceptions(exc)
+                except BaseException:
+                    rollback_and_reraise(sys.exc_info())
+            if can_commit:
+                await async_commit()
+                from pony.orm.async_core import _get_async_caches
+
+                for cache in _get_async_caches():
+                    await cache.release()
+                assert not local.db2cache
+            else:
+                try:
+                    await async_rollback()
+                except BaseException:
+                    if exc_type is None:
+                        raise  # if exc_type is not None it will be reraised outside of __exit__
+        finally:
+            del exc, tb
+            local.db_session = None
+            local.user_groups_cache.clear()
+            local.user_roles_cache.clear()
 
     def _enter(self):
         if local.db_session is None:
@@ -780,6 +915,7 @@ class DBSessionContextManager:
             if self.sql_debug is not None:
                 local.pop_debug_state()
 
+    @io_bypass
     def _commit_or_rollback(self, exc_type, exc, tb):
         try:
             if exc_type is None:
@@ -1069,7 +1205,7 @@ def db_decorator(func, *args, **kwargs):
         raise
 
 
-known_providers = ("sqlite", "postgres", "mysql", "oracle")
+known_providers = ("sqlite", "postgres", "postgres_async", "mysql", "oracle")
 
 
 class OnConnectDecorator:
@@ -1265,23 +1401,56 @@ class Database:
                 TransactionError,
                 "db_session is required when working with the database",
             )
-        cache = local.db2cache[self] = SessionCache(self)
+        if local.async_db_context:
+            if not hasattr(self.provider, "async_pool"):
+                throw(
+                    NotImplementedError,
+                    "async db_session requires an async-capable provider; "
+                    "bind the database as Database(%s, ...)" % "'postgres_async'",
+                )
+            from pony.orm.async_session_cache import AsyncSessionCache
+
+            cache = local.db2cache[self] = AsyncSessionCache(self)
+        else:
+            if _running_in_user_coroutine():
+                throw(
+                    TransactionError,
+                    "sync database access cannot be used inside a coroutine; "
+                    "use 'async with db_session:'",
+                )
+            cache = local.db2cache[self] = SessionCache(self)
         return cache
 
     @cut_traceback
     def flush(self):
-        self._get_cache().flush()
+        cache = self._get_cache()
+        if cache.is_async:
+            throw(
+                TransactionError,
+                "async session is active; use 'await flush()'",
+            )
+        cache.flush()
 
     @cut_traceback
     def commit(self):
         cache = local.db2cache.get(self)
         if cache is not None:
+            if cache.is_async:
+                throw(
+                    TransactionError,
+                    "async session is active; use 'await commit()'",
+                )
             cache.flush_and_commit()
 
     @cut_traceback
     def rollback(self):
         cache = local.db2cache.get(self)
         if cache is not None:
+            if cache.is_async:
+                throw(
+                    TransactionError,
+                    "async session is active; use 'await rollback()'",
+                )
             try:
                 cache.rollback()
             except BaseException:
@@ -1397,31 +1566,20 @@ class Database:
         self, sql, arguments=None, returning_id=False, start_transaction=False
     ):
         cache = self._get_cache()
-        if start_transaction:
-            cache.immediate = True
-        connection = cache.prepare_connection_for_query_execution()
-        cursor = connection.cursor()
-        if local.debug:
-            log_sql(sql, arguments)
-        provider = self.provider
-        t = time()
-        try:
-            new_id = provider.execute(cursor, sql, arguments, returning_id)
-        except Exception as e:
-            connection = cache.reconnect(e)
-            cursor = connection.cursor()
-            if local.debug:
-                log_sql(sql, arguments)
-            t = time()
-            new_id = provider.execute(cursor, sql, arguments, returning_id)
-        if cache.immediate:
-            cache.in_transaction = True
-        self._update_local_stat(sql, t)
-        if not returning_id:
-            return cursor
-        return new_id
+        if cache.is_async:
+            throw(
+                TransactionError,
+                "sync SQL execution in an async session; use the async API",
+            )
+        from pony.orm.async_core import exec_sql_gen
+        from pony.orm.gen_core import drive
+
+        return drive(
+            exec_sql_gen(self, sql, arguments, returning_id, start_transaction)
+        )
 
     @cut_traceback
+    @io_bypass
     def generate_mapping(self, filename=None, check_tables=True, create_tables=False):
         provider = self.provider
         if provider is None:
@@ -2543,8 +2701,8 @@ def obj_labels_getter(cls=None):
     return decorator
 
 
-class DbLocal(localbase):
-    def __init__(self):
+class DbLocal(ContextLocal):
+    def _init_context(self):
         self.stats = {None: QueryStat(None)}
         self.last_sql = None
 
@@ -2600,355 +2758,7 @@ class QueryStat:
 num_counter = itertools.count()
 
 
-class SessionCache:
-    def __init__(self, database):
-        self.is_alive = True
-        self.num = next(num_counter)
-        self.database = database
-        self.objects = set()
-        self.indexes = defaultdict(dict)
-        self.seeds = defaultdict(set)
-        self.max_id_cache = {}
-        self.collection_statistics = {}
-        self.for_update = set()
-        self.noflush_counter = 0
-        self.modified_collections = defaultdict(set)
-        self.objects_to_save = []
-        self.saved_objects = []
-        self.query_results = {}
-        self.dbvals_deduplication_cache = defaultdict(dict)
-        self.modified = False
-        self.db_session = db_session = local.db_session
-        self.immediate = db_session is not None and db_session.immediate
-        self.connection = None
-        self.in_transaction = False
-        self.saved_fk_state = None
-        self.perm_cache = defaultdict(
-            lambda: defaultdict(dict)
-        )  # user -> perm -> cls_or_attr_or_obj -> bool
-        self.user_roles_cache = defaultdict(dict)  # user -> obj -> roles
-        self.obj_labels_cache = {}  # obj -> labels
-
-    def connect(self):
-        assert self.connection is None
-        if self.in_transaction:
-            throw(
-                ConnectionClosedError,
-                "Transaction cannot be continued because database connection failed",
-            )
-        database = self.database
-        provider = database.provider
-        connection, is_new_connection = provider.connect()
-        if is_new_connection:
-            database.call_on_connect(connection)
-        try:
-            provider.set_transaction_mode(
-                connection, self
-            )  # can set cache.in_transaction
-        except:
-            provider.drop(connection, self)
-            raise
-
-        self.connection = connection
-        return connection
-
-    def reconnect(self, exc):
-        provider = self.database.provider
-        if exc is not None:
-            exc = getattr(exc, "original_exc", exc)
-            if not provider.should_reconnect(exc):
-                reraise(*sys.exc_info())
-            if local.debug:
-                log_orm("CONNECTION FAILED: %s" % exc)
-            connection = self.connection
-            assert connection is not None
-            self.connection = None
-            provider.drop(connection, self)
-        else:
-            assert self.connection is None
-        return self.connect()
-
-    def prepare_connection_for_query_execution(self):
-        db_session = local.db_session
-        if db_session is not None and self.db_session is None:
-            # This situation can arise when a transaction was started
-            # in the interactive mode, outside of the db_session
-            if self.in_transaction or self.modified:
-                local.db_session = None
-                try:
-                    self.flush_and_commit()
-                finally:
-                    local.db_session = db_session
-            self.db_session = db_session
-            self.immediate = self.immediate or db_session.immediate
-        else:
-            assert self.db_session is db_session, (self.db_session, db_session)
-        connection = self.connection
-        if connection is None:
-            connection = self.connect()
-        elif self.immediate and not self.in_transaction:
-            provider = self.database.provider
-            try:
-                provider.set_transaction_mode(
-                    connection, self
-                )  # can set cache.in_transaction
-            except Exception as e:
-                connection = self.reconnect(e)
-        if not self.noflush_counter and self.modified:
-            self.flush()
-        return connection
-
-    def flush_and_commit(self):
-        try:
-            self.flush()
-        except:
-            self.rollback()
-            raise
-        try:
-            self.commit()
-        except BaseException:
-            transact_reraise(CommitException, [sys.exc_info()])
-
-    def commit(self):
-        assert self.is_alive
-        try:
-            if self.modified:
-                self.flush()
-            if self.in_transaction:
-                assert self.connection is not None
-                self.database.provider.commit(self.connection, self)
-            self.for_update.clear()
-            self.query_results.clear()
-            self.max_id_cache.clear()
-            self.immediate = True
-        except:
-            self.rollback()
-            raise
-
-    def rollback(self):
-        self.close(rollback=True)
-
-    def release(self):
-        self.close(rollback=False)
-
-    def close(self, rollback=True):
-        assert self.is_alive
-        if not rollback:
-            assert not self.in_transaction
-        database = self.database
-        x = local.db2cache.pop(database)
-        assert x is self
-        self.is_alive = False
-        provider = database.provider
-        connection = self.connection
-        if connection is None:
-            return
-        self.connection = None
-
-        try:
-            if rollback:
-                try:
-                    provider.rollback(connection, self)
-                except:
-                    provider.drop(connection, self)
-                    raise
-            provider.release(connection, self)
-        finally:
-            db_session = self.db_session or local.db_session
-            if db_session and db_session.strict:
-                for obj in self.objects:
-                    obj._vals_ = obj._dbvals_ = obj._session_cache_ = None
-                self.perm_cache = self.user_roles_cache = self.obj_labels_cache = None
-            else:
-                for obj in self.objects:
-                    obj._dbvals_ = obj._session_cache_ = None
-                    for attr, setdata in obj._vals_.items():
-                        if attr.is_collection:
-                            if not setdata.is_fully_loaded:
-                                obj._vals_[attr] = None
-
-            self.objects = self.objects_to_save = self.saved_objects = (
-                self.query_results
-            ) = self.indexes = self.seeds = self.for_update = self.max_id_cache = (
-                self.modified_collections
-            ) = self.collection_statistics = self.dbvals_deduplication_cache = None
-
-    @contextmanager
-    def flush_disabled(self):
-        self.noflush_counter += 1
-        try:
-            yield
-        finally:
-            self.noflush_counter -= 1
-
-    def flush(self):
-        if self.noflush_counter:
-            return
-        assert self.is_alive
-        assert not self.saved_objects
-        prev_immediate = self.immediate
-        self.immediate = True
-        try:
-            for _i in range(50):
-                if not self.modified:
-                    return
-
-                with self.flush_disabled():
-                    for obj in self.objects_to_save:  # can grow during iteration
-                        if obj is not None:
-                            obj._before_save_()
-
-                    self.query_results.clear()
-                    modified_m2m = self._calc_modified_m2m()
-                    for attr, (_added, removed) in modified_m2m.items():
-                        if not removed:
-                            continue
-                        attr.remove_m2m(removed)
-                    for obj in self.objects_to_save:
-                        if obj is not None:
-                            obj._save_()
-                    for attr, (added, _removed) in modified_m2m.items():
-                        if not added:
-                            continue
-                        attr.add_m2m(added)
-
-                self.max_id_cache.clear()
-                self.modified_collections.clear()
-                self.objects_to_save[:] = ()
-                self.modified = False
-
-                self.call_after_save_hooks()
-            else:
-                if self.modified:
-                    throw(
-                        TransactionError,
-                        "Recursion depth limit reached in obj._after_save_() call",
-                    )
-        finally:
-            if not self.in_transaction:
-                self.immediate = prev_immediate
-
-    def call_after_save_hooks(self):
-        saved_objects = self.saved_objects
-        self.saved_objects = []
-        for obj, status in saved_objects:
-            obj._after_save_(status)
-
-    def _calc_modified_m2m(self):
-        modified_m2m = {}
-        for attr, objects in sorted(
-            self.modified_collections.items(),
-            key=lambda pair: (pair[0].entity.__name__, pair[0].name),
-        ):
-            if not isinstance(attr, Set):
-                throw(NotImplementedError)
-            reverse = attr.reverse
-            if not reverse.is_collection:
-                for obj in objects:
-                    setdata = obj._vals_[attr]
-                    setdata.added = setdata.removed = setdata.absent = None
-                continue
-
-            if not isinstance(reverse, Set):
-                throw(NotImplementedError)
-            if reverse in modified_m2m:
-                continue
-            added, removed = modified_m2m.setdefault(attr, (set(), set()))
-            for obj in objects:
-                setdata = obj._vals_[attr]
-                if setdata.added:
-                    for obj2 in setdata.added:
-                        added.add((obj, obj2))
-                if setdata.removed:
-                    for obj2 in setdata.removed:
-                        removed.add((obj, obj2))
-                if obj._status_ == "marked_to_delete":
-                    del obj._vals_[attr]
-                else:
-                    setdata.added = setdata.removed = setdata.absent = None
-        self.modified_collections.clear()
-        return modified_m2m
-
-    def update_simple_index(self, obj, attr, old_val, new_val, undo):
-        if old_val == new_val:
-            return
-        cache_index = self.indexes[attr]
-        if new_val is not None:
-            obj2 = cache_index.setdefault(new_val, obj)
-            if obj2 is not obj:
-                throw(
-                    CacheIndexError,
-                    "Cannot update %s.%s: %s with key %s already exists"
-                    % (obj.__class__.__name__, attr.name, obj2, new_val),
-                )
-        if old_val is NOT_LOADED:
-            old_val = None
-        if old_val is not None:
-            del cache_index[old_val]
-        undo.append((cache_index, old_val, new_val))
-
-    def db_update_simple_index(self, obj, attr, old_dbval, new_dbval):
-        if old_dbval == new_dbval:
-            return
-        cache_index = self.indexes[attr]
-        if new_dbval is not None:
-            obj2 = cache_index.setdefault(new_dbval, obj)
-            if obj2 is not obj:
-                throw(
-                    TransactionIntegrityError,
-                    "%s with unique index %s.%s already exists: %s"
-                    % (
-                        obj2.__class__.__name__,
-                        obj.__class__.__name__,
-                        attr.name,
-                        new_dbval,
-                    ),
-                )
-                # attribute which was created or updated lately clashes with one stored in database
-        cache_index.pop(old_dbval, None)
-
-    def update_composite_index(self, obj, attrs, prev_vals, new_vals, undo):
-        if None in prev_vals:
-            prev_vals = None
-        if None in new_vals:
-            new_vals = None
-        if prev_vals is None and new_vals is None:
-            return
-        if prev_vals == new_vals:
-            return
-        cache_index = self.indexes[attrs]
-        if new_vals is not None:
-            obj2 = cache_index.setdefault(new_vals, obj)
-            if obj2 is not obj:
-                attr_names = ", ".join(attr.name for attr in attrs)
-                throw(
-                    CacheIndexError,
-                    "Cannot update %r: composite key (%s) with value %s already exists for %r"
-                    % (obj, attr_names, new_vals, obj2),
-                )
-        if prev_vals is not None:
-            del cache_index[prev_vals]
-        undo.append((cache_index, prev_vals, new_vals))
-
-    def db_update_composite_index(self, obj, attrs, prev_vals, new_vals):
-        if prev_vals == new_vals:
-            return
-        cache_index = self.indexes[attrs]
-        if None not in new_vals:
-            obj2 = cache_index.setdefault(new_vals, obj)
-            if obj2 is not obj:
-                key_str = ", ".join(repr(item) for item in new_vals)
-                throw(
-                    TransactionIntegrityError,
-                    "%s with unique index (%s) already exists: %s"
-                    % (
-                        obj2.__class__.__name__,
-                        ", ".join(attr.name for attr in attrs),
-                        key_str,
-                    ),
-                )
-        cache_index.pop(prev_vals, None)
-
+from pony.orm.session_cache import SessionCache
 
 class NotLoadedValueType:
     def __repr__(self):
@@ -3437,6 +3247,12 @@ class Attribute:
         cache = obj._session_cache_
         if cache is None or not cache.is_alive:
             throw_db_session_is_over("load attribute", obj, self)
+        if cache.is_async:
+            throw(
+                NotLoadedError,
+                "Attribute %s.%s is not loaded; use 'await obj.load(%r)'"
+                % (obj.__class__.__name__, self.name, self.name),
+            )
         if not self.columns:
             reverse = self.reverse
             assert reverse is not None and reverse.columns
@@ -3446,43 +3262,11 @@ class Attribute:
             else:
                 assert obj._vals_[self] == dbval
             return dbval
+        from pony.orm.async_core import load_attr_gen
+        from pony.orm.gen_core import drive
 
-        if self.lazy:
-            entity = self.entity
-            database = entity._database_
-            if not self.lazy_sql_cache:
-                select_list = ["ALL"] + [
-                    ["COLUMN", None, column] for column in self.columns
-                ]
-                from_list = ["FROM", [None, "TABLE", entity._table_]]
-                pk_columns = entity._pk_columns_
-                pk_converters = entity._pk_converters_
-                criteria_list = [
-                    [
-                        converter.EQ,
-                        ["COLUMN", None, column],
-                        ["PARAM", (i, None, None), converter],
-                    ]
-                    for i, (column, converter) in enumerate(
-                        zip(pk_columns, pk_converters)
-                    )
-                ]
-                sql_ast = ["SELECT", select_list, from_list, ["WHERE"] + criteria_list]
-                sql, adapter = database._ast2sql(sql_ast)
-                offsets = tuple(range(len(self.columns)))
-                self.lazy_sql_cache = sql, adapter, offsets
-            else:
-                sql, adapter, offsets = self.lazy_sql_cache
-            arguments = adapter(obj._get_raw_pkval_())
-            cursor = database._exec_sql(sql, arguments)
-            row = cursor.fetchone()
-            dbval = self.parse_value(row, offsets, cache.dbvals_deduplication_cache)
-            self.db_set(obj, dbval)
-        else:
-            obj._load_()
-        return obj._vals_[self]
+        return drive(load_attr_gen(obj, self))
 
-    @cut_traceback
     def __get__(self, obj, cls=None):
         if obj is None:
             return self
@@ -3501,7 +3285,17 @@ class Attribute:
         vals = obj._vals_
         if vals is None:
             throw_db_session_is_over("read value of", obj, self)
-        val = vals[self] if self in vals else self.load(obj)
+        if self in vals:
+            val = vals[self]
+        else:
+            cache = obj._session_cache_
+            if cache is not None and cache.is_async:
+                throw(
+                    NotLoadedError,
+                    "Attribute %s.%s is not loaded; use 'await obj.load(%r)'"
+                    % (obj.__class__.__name__, self.name, self.name),
+                )
+            val = self.load(obj)
         if (
             val is not None
             and self.reverse
@@ -3509,6 +3303,12 @@ class Attribute:
             and val._status_ not in ("deleted", "cancelled")
         ):
             cache = obj._session_cache_
+            if cache is not None and cache.is_async and val in cache.seeds[val._pk_attrs_]:
+                throw(
+                    NotLoadedError,
+                    "Attribute %s.%s is not loaded; use 'await obj.load(%r)'"
+                    % (obj.__class__.__name__, self.name, self.name),
+                )
             if cache is not None and val in cache.seeds[val._pk_attrs_]:
                 val._load_()
         return val
@@ -3535,6 +3335,12 @@ class Attribute:
         with cache.flush_disabled():
             old_val = obj._vals_.get(self, NOT_LOADED)
             if old_val is NOT_LOADED and reverse and not reverse.is_collection:
+                if cache.is_async:
+                    throw(
+                        NotLoadedError,
+                        "Attribute %s.%s is not loaded; use 'await obj.load(%r)' before assignment"
+                        % (obj.__class__.__name__, self.name, self.name),
+                    )
                 old_val = self.load(obj)
             status = obj._status_
             wbits = obj._wbits_
@@ -4765,133 +4571,16 @@ class Set(Collection):
         cache = obj._session_cache_
         if cache is None or not cache.is_alive:
             throw_db_session_is_over("load collection", obj, self)
-        assert obj._status_ not in del_statuses
-        setdata = obj._vals_.get(self)
-        if setdata is None:
-            setdata = obj._vals_[self] = SetData()
-        elif setdata.is_fully_loaded and not self.is_volatile:
-            return setdata
-        entity = self.entity
-        reverse = self.reverse
-        rentity = reverse.entity
-        database = obj._database_
-        if cache is not database._get_cache():
+        if cache.is_async:
             throw(
-                TransactionError, "Transaction of object %s belongs to different thread"
+                NotLoadedError,
+                "Collection %s.%s is not loaded; use 'await obj.%s'"
+                % (obj.__class__.__name__, self.name, self.name),
             )
+        from pony.orm.async_core import load_collection_gen
+        from pony.orm.gen_core import drive
 
-        if items:
-            if not reverse.is_collection:
-                items = {item for item in items if reverse not in item._vals_}
-            else:
-                items = set(items)
-                items -= setdata
-                if setdata.removed:
-                    items -= setdata.removed
-            if not items:
-                return setdata
-
-        if items and (self.lazy or not setdata):
-            items = list(items)
-            if not reverse.is_collection:
-                sql, adapter, attr_offsets = rentity._construct_batchload_sql_(
-                    len(items)
-                )
-                arguments = adapter(items)
-                cursor = database._exec_sql(sql, arguments)
-                items = rentity._fetch_objects(cursor, attr_offsets)
-                return setdata
-
-            sql, adapter = self.construct_sql_m2m(1, len(items))
-            items.append(obj)
-            arguments = adapter(items)
-            cursor = database._exec_sql(sql, arguments)
-            loaded_items = {
-                rentity._get_by_raw_pkval_(row) for row in cursor.fetchall()
-            }
-            setdata |= loaded_items
-            reverse.db_reverse_add(loaded_items, obj)
-            return setdata
-
-        counter = cache.collection_statistics.setdefault(self, 0)
-        nplus1_threshold = self.nplus1_threshold
-        prefetching = (
-            not self.lazy
-            and nplus1_threshold is not None
-            and counter >= nplus1_threshold
-        )
-
-        objects = [obj]
-        setdata_list = [setdata]
-        if prefetching:
-            pk_index = cache.indexes[entity._pk_attrs_]
-            max_batch_size = database.provider.max_params_count // len(
-                entity._pk_columns_
-            )
-            for obj2 in pk_index.values():
-                if obj2 is obj:
-                    continue
-                if obj2._status_ in created_or_deleted_statuses:
-                    continue
-                setdata2 = obj2._vals_.get(self)
-                if setdata2 is None:
-                    setdata2 = obj2._vals_[self] = SetData()
-                elif setdata2.is_fully_loaded:
-                    continue
-                objects.append(obj2)
-                setdata_list.append(setdata2)
-                if len(objects) >= max_batch_size:
-                    break
-
-        if not reverse.is_collection:
-            sql, adapter, attr_offsets = rentity._construct_batchload_sql_(
-                len(objects), reverse
-            )
-            arguments = adapter(objects)
-            cursor = database._exec_sql(sql, arguments)
-            items = rentity._fetch_objects(cursor, attr_offsets)
-        else:
-            sql, adapter = self.construct_sql_m2m(len(objects))
-            arguments = adapter(objects)
-            cursor = database._exec_sql(sql, arguments)
-            pk_len = len(entity._pk_columns_)
-            d = {}
-            if len(objects) > 1:
-                for row in cursor.fetchall():
-                    obj2 = entity._get_by_raw_pkval_(row[:pk_len])
-                    item = rentity._get_by_raw_pkval_(row[pk_len:])
-                    items = d.get(obj2)
-                    if items is None:
-                        items = d[obj2] = set()
-                    items.add(item)
-            else:
-                d[obj] = {rentity._get_by_raw_pkval_(row) for row in cursor.fetchall()}
-            for obj2, items in d.items():
-                setdata2 = obj2._vals_.get(self)
-                if setdata2 is None:
-                    setdata2 = obj2._vals_[self] = SetData()
-                else:
-                    phantoms = setdata2 - items
-                    if setdata2.added:
-                        phantoms -= setdata2.added
-                    if phantoms and not self.is_volatile:
-                        throw(
-                            UnrepeatableReadError,
-                            "Phantom object %s disappeared from collection %s.%s"
-                            % (safe_repr(phantoms.pop()), safe_repr(obj2), self.name),
-                        )
-                items -= setdata2
-                if setdata2.removed:
-                    items -= setdata2.removed
-                setdata2 |= items
-                reverse.db_reverse_add(items, obj2)
-
-        for setdata2 in setdata_list:
-            setdata2.is_fully_loaded = True
-            setdata2.absent = None
-            setdata2.count = len(setdata2)
-        cache.collection_statistics[self] = counter + 1
-        return setdata
+        return drive(load_collection_gen(obj, self, items))
 
     def construct_sql_m2m(self, batch_size=1, items_count=0):
         if items_count:
@@ -5320,6 +5009,20 @@ class SetInstance:
 
     def __reduce__(self):
         return unpickle_setwrapper, (self._obj_, self._attr_.name, self.copy())
+
+    def __await__(self):
+        """`await obj.related_set` loads the collection."""
+        from pony.orm.async_core import load_collection_gen
+
+        return load_collection_gen(self._obj_, self._attr_).__await__()
+
+    async def __aiter__(self):
+        """`async for rel in obj.related_set` loads the collection and iterates."""
+        from pony.orm.async_core import load_collection_gen
+
+        setdata = await load_collection_gen(self._obj_, self._attr_)
+        for item in setdata:
+            yield item
 
     @cut_traceback
     def copy(self):
@@ -6840,41 +6543,14 @@ class EntityMeta(type):
         for_update=False,
         used_attrs=(),
     ):
-        if max_fetch_count is None:
-            max_fetch_count = options.MAX_FETCH_COUNT
-        if max_fetch_count is not None:
-            rows = cursor.fetchmany(max_fetch_count + 1)
-            if len(rows) == max_fetch_count + 1:
-                if max_fetch_count == 1:
-                    throw(
-                        MultipleObjectsFoundError,
-                        "Multiple objects were found. Use %s.select(...) to retrieve them"
-                        % cls.__name__,
-                    )
-                throw(
-                    TooManyObjectsFoundError,
-                    "Found more then pony.options.MAX_FETCH_COUNT=%d objects"
-                    % options.MAX_FETCH_COUNT,
-                )
-        else:
-            rows = cursor.fetchall()
-        objects = []
-        if attr_offsets is None:
-            objects = [cls._get_by_raw_pkval_(row, for_update) for row in rows]
-            cls._load_many_(objects)
-        else:
-            for row in rows:
-                real_entity_subclass, pkval, avdict = cls._parse_row_(row, attr_offsets)
-                obj = real_entity_subclass._get_from_identity_map_(
-                    pkval, "loaded", for_update
-                )
-                if obj._status_ in del_statuses:
-                    continue
-                obj._db_set_(avdict)
-                objects.append(obj)
-        if used_attrs:
-            cls._set_rbits(objects, used_attrs)
-        return objects
+        from pony.orm.async_core import fetch_objects_gen
+        from pony.orm.gen_core import drive
+
+        return drive(
+            fetch_objects_gen(
+                cls, cursor, attr_offsets, max_fetch_count, for_update, used_attrs
+            )
+        )
 
     def _set_rbits(cls, objects, attrs):
         rbits_dict = {}
@@ -6928,28 +6604,10 @@ class EntityMeta(type):
         return real_entity_subclass, pkval, avdict
 
     def _load_many_(cls, objects):
-        database = cls._database_
-        cache = database._get_cache()
-        seeds = cache.seeds[cls._pk_attrs_]
-        if not seeds:
-            return
-        objects = {obj for obj in objects if obj in seeds}
-        objects = sorted(objects, key=attrgetter("_pkval_"))
-        max_batch_size = database.provider.max_params_count // len(cls._pk_columns_)
-        while objects:
-            batch = objects[:max_batch_size]
-            objects = objects[max_batch_size:]
-            sql, adapter, attr_offsets = cls._construct_batchload_sql_(len(batch))
-            arguments = adapter(batch)
-            cursor = database._exec_sql(sql, arguments)
-            result = cls._fetch_objects(cursor, attr_offsets)
-            if len(result) < len(batch):
-                for obj in result:
-                    if obj not in batch:
-                        throw(
-                            UnrepeatableReadError,
-                            "Phantom object %s disappeared" % safe_repr(obj),
-                        )
+        from pony.orm.async_core import load_many_gen
+        from pony.orm.gen_core import drive
+
+        return drive(load_many_gen(cls, objects))
 
     def _select_all(cls):
         return Query(cls._default_iter_name_, cls._default_genexpr_, {}, {".0": cls})
@@ -7596,6 +7254,12 @@ class Entity(metaclass=EntityMeta):
         cache = self._session_cache_
         if cache is None or not cache.is_alive:
             throw_db_session_is_over("load object", self)
+        if cache.is_async:
+            throw(
+                NotLoadedError,
+                "Object %s is not fully loaded; use 'await obj.load()'"
+                % safe_repr(self),
+            )
         entity = self.__class__
         database = entity._database_
         if cache is not database._get_cache():
@@ -7603,28 +7267,53 @@ class Entity(metaclass=EntityMeta):
                 TransactionError,
                 "Object %s doesn't belong to current transaction" % safe_repr(self),
             )
-        seeds = cache.seeds[entity._pk_attrs_]
-        max_batch_size = database.provider.max_params_count // len(entity._pk_columns_)
-        objects = [self]
-        for seed in seeds:
-            if len(objects) >= max_batch_size:
-                break
-            if seed is not self:
-                objects.append(seed)
-        sql, adapter, attr_offsets = entity._construct_batchload_sql_(len(objects))
-        arguments = adapter(objects)
-        cursor = database._exec_sql(sql, arguments)
-        objects = entity._fetch_objects(cursor, attr_offsets)
-        if self not in objects:
-            throw(
-                UnrepeatableReadError, "Phantom object %s disappeared" % safe_repr(self)
-            )
+        from pony.orm.async_core import load_obj_gen
+        from pony.orm.gen_core import drive
+
+        return drive(load_obj_gen(self))
 
     @cut_traceback
+    async def _async_load(self, attrs):
+        """Async branch of load(): `await obj.load()` or `await obj.load('attr')`."""
+        from pony.orm.async_core import load_attr_gen, load_obj_gen
+
+        if not attrs:
+            await load_obj_gen(self)
+        else:
+            for arg in attrs:
+                if isinstance(arg, str):
+                    attr = self._adict_.get(arg)
+                    if attr is None:
+                        if not is_ident(arg):
+                            throw(ValueError, "Invalid attribute name: %r" % arg)
+                        throw(
+                            AttributeError,
+                            "Object %s does not have attribute %r" % (self, arg),
+                        )
+                elif isinstance(arg, Attribute):
+                    attr = arg
+                    if not isinstance(self, attr.entity):
+                        throw(
+                            AttributeError,
+                            "Attribute %s does not belong to object %s" % (attr, self),
+                        )
+                else:
+                    throw(TypeError, "Invalid argument type: %r" % arg)
+                if attr.is_collection:
+                    throw(
+                        NotImplementedError,
+                        "The load() method does not support collection attributes yet. Got: %s"
+                        % attr.name,
+                    )
+                await load_attr_gen(self, attr)
+        return self
+
     def load(self, *attrs):
         cache = self._session_cache_
         if cache is None or not cache.is_alive:
             throw_db_session_is_over("load object", self)
+        if cache.is_async:
+            return self._async_load(attrs)
         entity = self.__class__
         database = entity._database_
         if cache is not database._get_cache():
@@ -8168,205 +7857,10 @@ class Entity(metaclass=EntityMeta):
             dbvals.pop(attr, None)
 
     def _save_created_(self):
-        auto_pk = self._pkval_ is None
-        attrs = []
-        values = []
-        new_dbvals = {}
-        for attr in self._attrs_with_columns_:
-            if auto_pk and attr.is_pk:
-                continue
-            val = self._vals_[attr]
-            if val is not None:
-                attrs.append(attr)
-                if not attr.reverse:
-                    assert len(attr.converters) == 1
-                    dbval = attr.converters[0].val2dbval(val, self)
-                    new_dbvals[attr] = dbval
-                    values.append(dbval)
-                else:
-                    new_dbvals[attr] = val
-                    values.extend(attr.get_raw_values(val))
-        attrs = tuple(attrs)
+        from pony.orm.async_core import save_created_gen
+        from pony.orm.gen_core import drive
 
-        database = self._database_
-        cached_sql = self._insert_sql_cache_.get(attrs)
-        if cached_sql is None:
-            columns = []
-            converters = []
-            for attr in attrs:
-                columns.extend(attr.columns)
-                converters.extend(attr.converters)
-            assert len(columns) == len(converters)
-            params = [
-                ["PARAM", (i, None, None), converter]
-                for i, converter in enumerate(converters)
-            ]
-            entity = self.__class__
-            if not columns and database.provider.dialect == "Oracle":
-                sql_ast = [
-                    "INSERT",
-                    entity._table_,
-                    self._pk_columns_,
-                    [["DEFAULT"] for column in self._pk_columns_],
-                ]
-            else:
-                sql_ast = ["INSERT", entity._table_, columns, params]
-            if auto_pk:
-                sql_ast.append(entity._pk_columns_[0])
-            sql, adapter = database._ast2sql(sql_ast)
-            entity._insert_sql_cache_[attrs] = sql, adapter
-        else:
-            sql, adapter = cached_sql
-
-        arguments = adapter(values)
-        try:
-            if auto_pk:
-                new_id = database._exec_sql(
-                    sql, arguments, returning_id=True, start_transaction=True
-                )
-            else:
-                database._exec_sql(sql, arguments, start_transaction=True)
-        except IntegrityError as e:
-            msg = " ".join(tostring(arg) for arg in e.args)
-            throw(
-                TransactionIntegrityError,
-                "Object %r cannot be stored in the database. %s: %s"
-                % (self, e.__class__.__name__, msg),
-                e,
-            )
-        except DatabaseError as e:
-            msg = " ".join(tostring(arg) for arg in e.args)
-            throw(
-                UnexpectedError,
-                "Object %r cannot be stored in the database. %s: %s"
-                % (self, e.__class__.__name__, msg),
-                e,
-            )
-
-        if auto_pk:
-            pk_attrs = self._pk_attrs_
-            cache_index = self._session_cache_.indexes[pk_attrs]
-            obj2 = cache_index.setdefault(new_id, self)
-            if obj2 is not self:
-                throw(
-                    TransactionIntegrityError,
-                    "Newly auto-generated id value %s was already used in transaction cache for another object"
-                    % new_id,
-                )
-            self._pkval_ = self._vals_[pk_attrs[0]] = new_id
-            self._newid_ = None
-
-        self._status_ = "inserted"
-        self._rbits_ = self._all_bits_except_volatile_
-        self._wbits_ = 0
-        self._update_dbvals_(True, new_dbvals)
-
-    def _save_updated_(self):
-        update_columns = []
-        values = []
-        new_dbvals = {}
-        for attr in self._attrs_with_bit_(self._attrs_with_columns_, self._wbits_):
-            update_columns.extend(attr.columns)
-            val = self._vals_[attr]
-            if not attr.reverse:
-                assert len(attr.converters) == 1
-                dbval = attr.converters[0].val2dbval(val, self)
-                new_dbvals[attr] = dbval
-                values.append(dbval)
-            else:
-                new_dbvals[attr] = val
-                values.extend(attr.get_raw_values(val))
-        if update_columns:
-            for attr in self._pk_attrs_:
-                val = self._vals_[attr]
-                values.extend(attr.get_raw_values(val))
-            cache = self._session_cache_
-            optimistic_session = cache.db_session is None or cache.db_session.optimistic
-            if optimistic_session and self not in cache.for_update:
-                (
-                    optimistic_ops,
-                    optimistic_columns,
-                    optimistic_converters,
-                    optimistic_values,
-                ) = self._construct_optimistic_criteria_()
-                values.extend(optimistic_values)
-            else:
-                optimistic_columns = optimistic_converters = optimistic_ops = ()
-            query_key = (
-                tuple(update_columns),
-                tuple(optimistic_columns),
-                tuple(optimistic_ops),
-            )
-            database = self._database_
-            cached_sql = self._update_sql_cache_.get(query_key)
-            if cached_sql is None:
-                update_converters = []
-                for attr in self._attrs_with_bit_(
-                    self._attrs_with_columns_, self._wbits_
-                ):
-                    update_converters.extend(attr.converters)
-                assert len(update_columns) == len(update_converters)
-                update_params = [
-                    ["PARAM", (i, None, None), converter]
-                    for i, converter in enumerate(update_converters)
-                ]
-                params_count = len(update_params)
-                where_list = ["WHERE"]
-                pk_columns = self._pk_columns_
-                pk_converters = self._pk_converters_
-                params_count = populate_criteria_list(
-                    where_list, pk_columns, pk_converters, repeat("EQ"), params_count
-                )
-                if optimistic_columns:
-                    populate_criteria_list(
-                        where_list,
-                        optimistic_columns,
-                        optimistic_converters,
-                        optimistic_ops,
-                        params_count,
-                        optimistic=True,
-                    )
-                sql_ast = [
-                    "UPDATE",
-                    self._table_,
-                    list(zip(update_columns, update_params)),
-                    where_list,
-                ]
-                sql, adapter = database._ast2sql(sql_ast)
-                self._update_sql_cache_[query_key] = sql, adapter
-            else:
-                sql, adapter = cached_sql
-            arguments = adapter(values)
-            cursor = database._exec_sql(sql, arguments, start_transaction=True)
-            if cursor.rowcount == 0 and cache.db_session.optimistic:
-                throw(OptimisticCheckError, self.find_updated_attributes())
-        self._status_ = "updated"
-        self._rbits_ |= self._wbits_ & self._all_bits_except_volatile_
-        self._wbits_ = 0
-        self._update_dbvals_(False, new_dbvals)
-
-    def _save_deleted_(self):
-        values = []
-        values.extend(self._get_raw_pkval_())
-        cache = self._session_cache_
-        query_key = ()
-        database = self._database_
-        cached_sql = self._delete_sql_cache_.get(query_key)
-        if cached_sql is None:
-            where_list = ["WHERE"]
-            populate_criteria_list(
-                where_list, self._pk_columns_, self._pk_converters_, repeat("EQ")
-            )
-            from_ast = ["FROM", [None, "TABLE", self._table_]]
-            sql_ast = ["DELETE", None, from_ast, where_list]
-            sql, adapter = database._ast2sql(sql_ast)
-            self.__class__._delete_sql_cache_[query_key] = sql, adapter
-        else:
-            sql, adapter = cached_sql
-        arguments = adapter(values)
-        database._exec_sql(sql, arguments, start_transaction=True)
-        self._status_ = "deleted"
-        cache.indexes[self._pk_attrs_].pop(self._pkval_)
+        return drive(save_created_gen(self))
 
     def find_updated_attributes(self):
         entity = self.__class__
@@ -8432,33 +7926,10 @@ class Entity(metaclass=EntityMeta):
         )
 
     def _save_(self, dependent_objects=None):
-        status = self._status_
-        if status in ("created", "modified"):
-            self._save_principal_objects_(dependent_objects)
+        from pony.orm.async_core import save_gen
+        from pony.orm.gen_core import drive
 
-        if status == "created":
-            self._save_created_()
-        elif status == "modified":
-            self._save_updated_()
-        elif status == "marked_to_delete":
-            self._save_deleted_()
-        else:
-            assert False, "_save_() called for object %r with incorrect status %s" % (
-                self,
-                status,
-            )  # pragma: no cover
-
-        assert self._status_ in saved_statuses
-        cache = self._session_cache_
-        assert cache is not None and cache.is_alive
-        cache.saved_objects.append((self, self._status_))
-        objects_to_save = cache.objects_to_save
-        save_pos = self._save_pos_
-        if save_pos == len(objects_to_save) - 1:
-            objects_to_save.pop()
-        else:
-            objects_to_save[save_pos] = None
-        self._save_pos_ = None
+        return drive(save_gen(self, dependent_objects))
 
     def flush(self):
         if self._status_ not in ("created", "modified", "marked_to_delete"):
@@ -9015,56 +8486,35 @@ class Query:
         sql, arguments, attr_offsets, query_key = self._construct_sql_and_arguments()
         return sql
 
-    def _actual_fetch(self, limit=None, offset=None):
-        translator = self._translator
-        with self._prefetch_context:
-            sql, arguments, attr_offsets, query_key = self._construct_sql_and_arguments(
-                limit, offset
-            )
-            database = self._database
-            cache = database._get_cache()
-            if self._for_update:
-                cache.immediate = True
-            cache.prepare_connection_for_query_execution()  # may clear cache.query_results
-            items = cache.query_results.get(query_key)
-            if items is None:
-                cursor = database._exec_sql(sql, arguments)
-                if isinstance(translator.expr_type, EntityMeta):
-                    entity = translator.expr_type
-                    items = entity._fetch_objects(
-                        cursor,
-                        attr_offsets,
-                        for_update=self._for_update,
-                        used_attrs=translator.get_used_attrs(),
-                    )
-                elif len(translator.row_layout) == 1:
-                    func, slice_or_offset, src = translator.row_layout[0]
-                    items = list(starmap(func, cursor.fetchall()))
-                else:
-                    items = [
-                        tuple(
-                            func(sql_row[slice_or_offset])
-                            for func, slice_or_offset, src in translator.row_layout
-                        )
-                        for sql_row in cursor.fetchall()
-                    ]
-                    for i, t in enumerate(translator.expr_type):
-                        if isinstance(t, EntityMeta) and t._subclasses_:
-                            t._load_many_(row[i] for row in items)
-                if query_key is not None:
-                    cache.query_results[query_key] = items
-            else:
-                stats = database._dblocal.stats
-                stat = stats.get(sql)
-                if stat is not None:
-                    stat.cache_count += 1
-                else:
-                    stats[sql] = QueryStat(sql)
-            if self._prefetch:
-                self._do_prefetch(items)
-        return items
+    def __await__(self):
+        """`await select(...)` returns the list of query results."""
+        from pony.orm.async_core import query_fetch_gen
 
-    @cut_traceback
+        return query_fetch_gen(self).__await__()
+
+    async def __aiter__(self):
+        """`async for obj in select(...)` fetches and iterates the query."""
+        from pony.orm.async_core import query_fetch_gen
+
+        for item in await query_fetch_gen(self):
+            yield item
+
+    def _actual_fetch(self, limit=None, offset=None):
+        from pony.orm.async_core import query_fetch_gen
+        from pony.orm.gen_core import drive
+
+        if self._prefetch:
+            saved = self._prefetch
+            self._prefetch = False
+            try:
+                with self._prefetch_context:
+                    items = drive(query_fetch_gen(self, limit, offset))
+                    self._do_prefetch(items)
+            finally:
+                self._prefetch = saved
+            return items
+        return drive(query_fetch_gen(self, limit, offset))
+
     def prefetch(self, *args):
         self = self._clone(_prefetch_context=self._prefetch_context.copy())
         self._prefetch = True

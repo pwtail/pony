@@ -1,0 +1,41 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install psycopg psycopg_pool
+      - name: Create async test database
+        run: |
+          python -c "
+          import psycopg
+          conn = psycopg.connect('dbname=postgres user=postgres password=postgres host=localhost')
+          conn.autocommit = True
+          conn.cursor().execute('CREATE DATABASE pony_async_test')
+          conn.close()"
+      - name: Run test suites
+        env:
+          PONY_ASYNC_DSN: "dbname=pony_async_test user=postgres password=postgres host=localhost"
+        run: |
+          python -m unittest discover -s pony/orm/tests -p 'test_*.py'
+          python -m unittest discover -s pony/utils/tests -p 'test_*.py'

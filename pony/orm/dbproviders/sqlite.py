@@ -24,7 +24,7 @@ from pony.utils import (
     absolutize_path,
     cut_traceback_depth,
     datetime2timestamp,
-    localbase,
+    ContextLocal,
     reraise,
     throw,
     timestamp2datetime,
@@ -441,8 +441,8 @@ class SQLiteArrayConverter(dbapiprovider.ArrayConverter):
         return dumps(val)
 
 
-class LocalExceptions(localbase):
-    def __init__(self):
+class LocalExceptions(ContextLocal):
+    def _init_context(self):
         self.exc_info = None
         self.keep_traceback = False
 
@@ -858,9 +858,8 @@ def py_string_slice(s, start, end):
 
 
 class SQLitePool(Pool):
-    def __init__(
-        self, is_shared_memory_db, filename, create_db, **kwargs
-    ):  # called separately in each thread
+    def _init_context(self, is_shared_memory_db, filename, create_db, **kwargs):
+        # called separately in each context (thread/task)
         self.is_shared_memory_db = is_shared_memory_db
         self.filename = filename
         self.create_db = create_db

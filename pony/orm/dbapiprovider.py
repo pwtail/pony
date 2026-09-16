@@ -17,8 +17,9 @@ from pony.orm.ormtypes import (
     TrackedArray,
     TrackedValue,
 )
+from pony.orm.gen_core import SyncOps
 from pony.py23compat import buffer, int_types
-from pony.utils import decorator, deprecated, localbase, throw
+from pony.utils import decorator, deprecated, ContextLocal, throw
 
 
 class DBException(Exception):
@@ -189,6 +190,7 @@ class DBAPIProvider:
 
     def __init__(self, _database, *args, **kwargs):
         self.database = _database
+        self.ops = SyncOps(self)
         pool_mockup = kwargs.pop("pony_pool_mockup", None)
         call_on_connect = kwargs.pop("pony_call_on_connect", None)
         if pool_mockup:
@@ -196,10 +198,15 @@ class DBAPIProvider:
         else:
             self.pool = self.get_pool(*args, **kwargs)
         connection, is_new_connection = self.connect()
-        if call_on_connect:
-            call_on_connect(connection)
-        self.inspect_connection(connection)
-        self.release(connection)
+        core = pony.orm.core
+        core.local.io_counter += 1  # internal bypass: connection setup at bind time
+        try:
+            if call_on_connect:
+                call_on_connect(connection)
+            self.inspect_connection(connection)
+            self.release(connection)
+        finally:
+            core.local.io_counter -= 1
 
     @wrap_dbapi_exceptions
     def inspect_connection(self, connection):
@@ -438,12 +445,69 @@ class DBAPIProvider:
         cursor.execute(sql)
 
 
-class Pool(localbase):
+def check_io_allowed():
+    import pony.options
+    import pony.orm.core as orm_core
+
+    if pony.options.IO_GUARD and not orm_core.local.io_counter:
+        throw(
+            orm_core.IOForbiddenError,
+            "Database access is not allowed here. "
+            "Wrap the operation in a 'with io:' block inside 'db_session'",
+        )
+
+
+class PoolConnectionWrapper:
+    # Guards every statement at the dbapi boundary; removed with async support.
+    def __init__(self, con, check_io_allowed):
+        object.__setattr__(self, "_con", con)
+        object.__setattr__(self, "_check_io_allowed", check_io_allowed)
+
+    def cursor(self):
+        self._check_io_allowed()
+        return PoolCursorWrapper(self._con.cursor(), self._check_io_allowed)
+
+    def commit(self):
+        return self._con.commit()
+
+    def rollback(self):
+        return self._con.rollback()
+
+    def close(self):
+        return self._con.close()
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._con, name, value)
+
+
+class PoolCursorWrapper:
+    def __init__(self, cursor, check_io_allowed):
+        object.__setattr__(self, "_cursor", cursor)
+        object.__setattr__(self, "_check_io_allowed", check_io_allowed)
+
+    def execute(self, *args, **kwargs):
+        self._check_io_allowed()
+        return self._cursor.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        self._check_io_allowed()
+        return self._cursor.executemany(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._cursor, name, value)
+
+
+class Pool(ContextLocal):
     forked_connections = []
 
-    def __init__(
-        self, dbapi_module, *args, **kwargs
-    ):  # called separately in each thread
+    def _init_context(self, dbapi_module, *args, **kwargs):
+        # called separately in each context (thread/task)
         self.dbapi_module = dbapi_module
         self.args = args
         self.kwargs = kwargs
@@ -461,6 +525,7 @@ class Pool(localbase):
                 core.log_orm("GET NEW CONNECTION")
             is_new_connection = True
             self._connect()
+            self.con = PoolConnectionWrapper(self.con, check_io_allowed)
             self.pid = pid
         elif core.local.debug:
             core.log_orm("GET CONNECTION FROM THE LOCAL POOL")

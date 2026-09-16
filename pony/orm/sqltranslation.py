@@ -57,7 +57,7 @@ from pony.utils import (
     concat,
     copy_ast,
     is_ident,
-    localbase,
+    ContextLocal,
     reraise,
     throw,
 )
@@ -137,8 +137,8 @@ def type2str(t):
         return str(t)
 
 
-class Local(localbase):
-    def __init__(self):
+class Local(ContextLocal):
+    def _init_context(self):
         self.translators = []
 
     @property

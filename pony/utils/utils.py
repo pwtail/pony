@@ -1,10 +1,12 @@
 import ast
+import asyncio
 import inspect
 import io
 import os.path
 import pickle
 import re
 import sys
+import threading
 import types
 import warnings
 from collections import defaultdict
@@ -20,10 +22,77 @@ import pony
 from pony import options
 from pony.thirdparty.decorator import decorator as _decorator
 
+from contextvars import ContextVar as _ContextVar
+
 if pony.MODE.startswith("GAE-"):
     localbase = object
 else:
     from threading import local as localbase  # noqa: F401
+
+
+class ContextLocal:
+    """Replacement for threading.local on contextvars.
+
+    Mirrors threading.local semantics: the initializer re-runs in each
+    execution unit (thread / asyncio task) on first access, so mutable
+    defaults are fresh per unit. ContextVars alone are not enough: an
+    asyncio task inherits the parent context, so values set at import
+    time would leak into every task. Instead each stored value is keyed
+    by (thread, task); a mismatch on read re-runs the initializer.
+    """
+
+    def __init__(self, *args, **kwargs):
+        object.__setattr__(self, "_vars", {})
+        object.__setattr__(self, "_args", (args, kwargs))
+        self._init_context(*args, **kwargs)
+
+    def _init_context(self, *args, **kwargs):
+        raise NotImplementedError
+
+    @staticmethod
+    def _execution_unit():
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return (threading.get_ident(), task)
+
+    def __getattr__(self, name):
+        if name in ("_vars", "_args"):
+            # safety net: subclass set attributes before ContextLocal.__init__ ran
+            object.__setattr__(self, "_vars", {})
+            object.__setattr__(self, "_args", ((), {}))
+            return getattr(self, name)
+        var = self._vars.get(name)
+        if var is None:
+            raise AttributeError(name)
+        try:
+            key, value = var.get()
+        except LookupError:
+            self._init_context(*self._args[0], **self._args[1])
+            key, value = var.get()
+        else:
+            if key != self._execution_unit():
+                self._init_context(*self._args[0], **self._args[1])
+                key, value = var.get()
+        return value
+
+    def __setattr__(self, name, value):
+        if name in ("_vars", "_args"):
+            object.__setattr__(self, name, value)
+            return
+        if "_vars" not in self.__dict__:
+            # safety net: subclass set attributes before ContextLocal.__init__ ran
+            object.__setattr__(self, "_vars", {})
+            object.__setattr__(self, "_args", ((), {}))
+        var = self._vars.get(name)
+        if var is None:
+            var = _ContextVar(
+                "%s.%s.%s.%s"
+                % (type(self).__module__, type(self).__name__, name, id(self))
+            )
+            self._vars[name] = var
+        var.set((self._execution_unit(), value))
 
 
 class PonyDeprecationWarning(DeprecationWarning):
