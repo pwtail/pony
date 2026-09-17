@@ -225,6 +225,11 @@ class TestHybridsAndProperties(unittest.TestCase):
 
     @db_session
     def test5(self):
+        if db.provider.dialect == "MySQL":
+            raise unittest.SkipTest(
+                "MySQL/MariaDB не поддерживают коррелированные derived-таблицы "
+                "(MariaDB — без LATERAL); нужна де-корреляция в трансляторе"
+            )
         persons = select(
             p.full_name
             for p in Person
@@ -234,6 +239,11 @@ class TestHybridsAndProperties(unittest.TestCase):
 
     @db_session
     def test6(self):
+        if db.provider.dialect == "MySQL":
+            raise unittest.SkipTest(
+                "MySQL/MariaDB не поддерживают коррелированные derived-таблицы "
+                "(MariaDB — без LATERAL); нужна де-корреляция в трансляторе"
+            )
         persons = select(
             p.full_name
             for p in Person

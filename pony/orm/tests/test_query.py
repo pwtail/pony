@@ -80,12 +80,17 @@ class TestQuery(unittest.TestCase):
     def test4(self):
         select(a for s in Student)
 
-    @raises_exception(
-        TypeError, "Incomparable types 'str' and 'StrArray' in expression: s.name == x"
-    )
     def test5(self):
         x = ["A"]
-        select(s for s in Student if s.name == x)
+        # без поддержки массивов (MySQL/MariaDB) список остаётся list
+        array_type = "list" if db.provider.dialect == "MySQL" else "StrArray"
+        with self.assertRaises(TypeError) as cm:
+            select(s for s in Student if s.name == x)
+        self.assertIn(
+            "Incomparable types 'str' and '%s' in expression: s.name == x"
+            % array_type,
+            str(cm.exception),
+        )
 
     def test6(self):
         def f1(x):

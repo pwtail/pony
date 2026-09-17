@@ -202,7 +202,7 @@ class TestFuncMonad(unittest.TestCase):
         result = set(
             select(concat(s.name, ":", s.dob.year, ":", s.scholarship) for s in Student)
         )
-        if db.provider.dialect == "PostgreSQL":
+        if db.provider.dialect in ("PostgreSQL", "MySQL"):
             self.assertEqual(
                 result,
                 {

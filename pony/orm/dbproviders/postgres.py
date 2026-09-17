@@ -15,6 +15,35 @@ import psycopg.types.json
 
 psycopg.types.json.set_json_loads(lambda x: x.decode() if isinstance(x, bytes) else x)
 
+from psycopg.types.array import ListBinaryDumper, ListDumper
+from psycopg.types.numeric import Int4
+
+
+class _PonyListDumperMixin:
+    """Массивы pony — int[]/text[]/double precision[]; psycopg3 же по умолчанию
+    выбирает для списка целых наименьший подходящий тип (smallint[] для малых
+    значений), что не совпадает с типом колонки и ломает операторы
+    (`smallint[] = integer[]`). Для int-списков в диапазоне int4 всегда
+    выбираем integer[], как у колонок pony."""
+
+    def _find_list_element(self, L, format):
+        item = super()._find_list_element(L, format)
+        if type(item) is int and -(2**31) <= item < 2**31:
+            return Int4(0)  # тип-маркер для выбора integer[], данные не меняются
+        return item
+
+
+class PonyListDumper(_PonyListDumperMixin, ListDumper):
+    pass
+
+
+class PonyListBinaryDumper(_PonyListDumperMixin, ListBinaryDumper):
+    pass
+
+
+psycopg.adapters.register_dumper(list, PonyListBinaryDumper)
+psycopg.adapters.register_dumper(list, PonyListDumper)
+
 from pony.orm import core, dbapiprovider, dbschema, ormtypes
 from pony.orm.core import log_orm
 from pony.orm.dbapiprovider import DBAPIProvider, Pool, wrap_dbapi_exceptions

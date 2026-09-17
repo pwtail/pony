@@ -109,7 +109,11 @@ class TestDiag(unittest.TestCase):
         db.bind(**db_params)
         db.generate_mapping()
 
-    @raises_exception(MappingError, 'Table name "Table1" is already in use')
+    @raises_exception(
+        MappingError,
+        "Table name %s is already in use"
+        % ("`Table1`" if db_params["provider"] in ("mysql", "mariadb") else '"Table1"'),
+    )
     def test_diagram7(self):
         db = Database()
 

@@ -12,6 +12,13 @@ db = Database("postgres_async", dsn="dbname=mydb user=...")
 # "postgres_async" даёт и sync-сессии (как обычный "postgres"), и async-сессии.
 ```
 
+MariaDB — аналогично, коннектор `mariadb` 2.0RC (`pip install --pre mariadb[pool]`):
+
+```python
+db = Database("mariadb", user="...", password="...", host="...", database="...")        # sync
+adb = Database("mariadb_async", user="...", password="...", host="...", database="...")  # sync + async
+```
+
 ## Сессии и запросы
 
 ```python
@@ -63,7 +70,7 @@ async with db_session:
 
 ## Ограничения (текущее состояние)
 
-- Только PostgreSQL (psycopg3); остальные диалекты — sync.
+- PostgreSQL (psycopg3) и MariaDB (коннектор `mariadb` 2.0RC); остальные диалекты — sync.
 - `prefetch()` в async-режиме — `NotImplementedError` (используйте явный `load()`).
 - `await Entity[pk]` не реализован: `Entity[pk]` — синхронная операция,
   в async-сессии запрещена; выборка по pk — через `select(...)`.

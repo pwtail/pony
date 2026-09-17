@@ -1,7 +1,7 @@
 import unittest
 
 from pony import orm
-from pony.orm.tests import setup_database, teardown_database
+from pony.orm.tests import db_params, setup_database, teardown_database
 
 db = orm.Database()
 
@@ -26,6 +26,11 @@ buf = orm.buffer(b"123")
 class Test(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if db_params.get("provider") in ("mysql", "mariadb"):
+            raise unittest.SkipTest(
+                "MySQL/MariaDB требуют длину ключа для BLOB/TEXT; pony не генерирует "
+                "префиксные ключи, так как это меняет семантику уникальности"
+            )
         setup_database(db)
         with orm.db_session:
             Foo(id=1, b=buf)

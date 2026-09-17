@@ -1357,7 +1357,7 @@ class ArrayConverter(Converter):
         return TrackedArray(obj, self.attr, dbval)
 
     def val2dbval(self, val, obj=None):
-        if self.attr.nullable and val is None:
+        if val is None and (self.attr is None or self.attr.nullable):
             return val
         return list(val)
 

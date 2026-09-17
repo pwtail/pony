@@ -146,6 +146,11 @@ class TestOrderbyLimit(unittest.TestCase):
         last_sql = db.last_sql
         if db.provider.dialect == "PostgreSQL":
             self.assertTrue("LIMIT null OFFSET 2" in last_sql)
+        elif db.provider.dialect == "MySQL":
+            # MySQL не принимает отрицательный LIMIT — используется максимум BIGINT
+            self.assertTrue(
+                "LIMIT 18446744073709551615 OFFSET 2" in last_sql
+            )
         else:
             self.assertTrue("LIMIT -1 OFFSET 2" in last_sql)
 

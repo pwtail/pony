@@ -24,14 +24,18 @@ except ImportError:
     try:
         import pymysql as mysql_module
     except ImportError:
-        raise ImportError(
-            "In order to use PonyORM with MySQL please install MySQLdb or pymysql"
-        )
-    import pymysql.converters as mysql_converters
-    from pymysql.constants import CLIENT, FIELD_TYPE, FLAG
-    from pymysql.converters import escape_str as string_literal
+        # MySQLdb/pymysql не установлены: модуль остаётся импортируемым
+        # (диалектные классы нужны провайдеру mariadb), но сам
+        # mysql-провайдер при использовании сообщит об отсутствии драйвера.
+        mysql_module = mysql_converters = string_literal = None
+        mysql_module_name = None
+        CLIENT = FIELD_TYPE = FLAG = None
+    else:
+        import pymysql.converters as mysql_converters
+        from pymysql.constants import CLIENT, FIELD_TYPE, FLAG
+        from pymysql.converters import escape_str as string_literal
 
-    mysql_module_name = "pymysql"
+        mysql_module_name = "pymysql"
 
 from pony.converting import str2timedelta, timedelta2str
 from pony.orm import core, dbapiprovider, dbschema, ormtypes
@@ -42,7 +46,7 @@ from pony.orm.dbapiprovider import (
     get_version_tuple,
     wrap_dbapi_exceptions,
 )
-from pony.orm.sqlbuilding import Param, SQLBuilder, Value, join
+from pony.orm.sqlbuilding import Param, SQLBuilder, Value, join, make_binary_op
 from pony.orm.sqltranslation import SQLTranslator, TranslationError
 from pony.utils import throw
 
@@ -74,9 +78,107 @@ class MySQLValue(Value):
         return Value.__str__(self)
 
 
+def _timedelta_param(node):
+    if isinstance(node, list) and node and node[0] == "PARAM":
+        for item in reversed(node):
+            if getattr(item, "py_type", None) is timedelta:
+                return True
+    return False
+
+
+def _diff_and_timedelta(expr1, expr2):
+    """DATE_DIFF/DATETIME_DIFF против timedelta-константы → (diff_node, delta)."""
+    for diff_node, value_node in ((expr1, expr2), (expr2, expr1)):
+        if (
+            isinstance(diff_node, list)
+            and diff_node
+            and diff_node[0] in ("DATE_DIFF", "DATETIME_DIFF")
+            and isinstance(value_node, list)
+            and value_node
+            and value_node[0] == "VALUE"
+            and isinstance(value_node[1], timedelta)
+        ):
+            return diff_node, value_node[1]
+    return None
+
+
+def _make_temporal_cmp(symbol, default):
+    """Сравнение diff с timedelta: MySQL не умеет INTERVAL в сравнении —
+    приводим обе стороны к секундам через timestampdiff."""
+
+    def cmp_method(self, expr1, expr2, parentheses=None):
+        pair = _diff_and_timedelta(expr1, expr2)
+        if pair is not None:
+            diff_node, delta = pair
+            return (
+                "timestampdiff(second, ",
+                self(diff_node[2]),
+                ", ",
+                self(diff_node[1]),
+                ")",
+                symbol,
+                str(int(delta.total_seconds())),
+            )
+        return default(self, expr1, expr2, parentheses)
+
+    return cmp_method
+
+
+def _ast_has_limit(ast):
+    if isinstance(ast, (list, tuple)):
+        if ast and ast[0] == "LIMIT":
+            return True
+        return any(_ast_has_limit(item) for item in ast)
+    return False
+
+
 class MySQLBuilder(SQLBuilder):
     dialect = "MySQL"
     value_class = MySQLValue
+
+    # SQLBuilder.__init__ рендерит AST внутри себя, поэтому счётчик — атрибут класса
+    # (первый += создаёт instance-атрибут)
+    _derived_alias_counter = 0
+
+    def _wrap_limit_subquery(self, template_begin, expr1, x, template_end):
+        """MySQL/MariaDB не поддерживают LIMIT внутри IN-подзапроса —
+        оборачиваем такой подзапрос в производную таблицу (derived table)."""
+        if (
+            isinstance(x, (list, tuple))
+            and x
+            and x[0] == "SELECT"
+            and _ast_has_limit(x)
+        ):
+            self._derived_alias_counter += 1
+            alias = "_t%d" % self._derived_alias_counter
+            return (
+                self(expr1),
+                template_begin,
+                self(x),
+                ") AS ",
+                self.quote_name(alias),
+                ")",
+            )
+        return template_end
+
+    def IN(self, expr1, x):
+        result = self._wrap_limit_subquery(" IN (SELECT * FROM (", expr1, x, None)
+        if result is not None:
+            return result
+        return SQLBuilder.IN(self, expr1, x)
+
+    def NOT_IN(self, expr1, x):
+        result = self._wrap_limit_subquery(" NOT IN (SELECT * FROM (", expr1, x, None)
+        if result is not None:
+            return result
+        return SQLBuilder.NOT_IN(self, expr1, x)
+
+    EQ = _make_temporal_cmp(" = ", make_binary_op(" = "))
+    NE = _make_temporal_cmp(" <> ", make_binary_op(" <> "))
+    LT = _make_temporal_cmp(" < ", make_binary_op(" < "))
+    LE = _make_temporal_cmp(" <= ", make_binary_op(" <= "))
+    GT = _make_temporal_cmp(" > ", make_binary_op(" > "))
+    GE = _make_temporal_cmp(" >= ", make_binary_op(" >= "))
 
     def CONCAT(self, *args):
         return "concat(", join(", ", map(self, args)), ")"
@@ -95,6 +197,20 @@ class MySQLBuilder(SQLBuilder):
         if chars is None:
             return "rtrim(", self(expr), ")"
         return "trim(trailing ", self(chars), " from ", self(expr), ")"
+
+    def LIKE(self, expr, template, escape=None):
+        # LIKE в MySQL/MariaDB по умолчанию регистронезависим (коллация),
+        # а семантика pony (как в Python) — регистрозависимая
+        result = self(expr), " LIKE BINARY ", self(template)
+        if escape:
+            result = result + (" ESCAPE ", self(escape))
+        return result
+
+    def NOT_LIKE(self, expr, template, escape=None):
+        result = self(expr), " NOT LIKE BINARY ", self(template)
+        if escape:
+            result = result + (" ESCAPE ", self(escape))
+        return result
 
     def TO_INT(self, expr):
         return "CAST(", self(expr), " AS SIGNED)"
@@ -123,14 +239,41 @@ class MySQLBuilder(SQLBuilder):
     def SECOND(self, expr):
         return "second(", self(expr), ")"
 
+    def EXISTS(self, *sections):
+        """MySQL: DELETE/UPDATE по таблице, которую читает подзапрос, — ошибка 1093.
+        Обёртка в производную таблицу; только для настоящего MySQL (MariaDB
+        справляется сама, а коррелированные производные таблицы ей недоступны)."""
+        provider = self.provider
+        if (
+            not getattr(provider, "is_mariadb", False)
+            and isinstance(self.ast, (list, tuple))
+            and self.ast
+            and self.ast[0] in ("DELETE", "UPDATE")
+        ):
+            result = self._subquery(*sections)
+            self._derived_alias_counter += 1
+            alias = "_t%d" % self._derived_alias_counter
+            return (
+                "EXISTS (SELECT * FROM (SELECT 1\n",
+                result,
+                ") AS ",
+                self.quote_name(alias),
+                ")",
+            )
+        return SQLBuilder.EXISTS(self, *sections)
+
     def DATE_ADD(self, expr, delta):
         if delta[0] == "VALUE" and isinstance(delta[1], time):
             return "ADDTIME(", self(expr), ", ", self(delta), ")"
+        if _timedelta_param(delta):
+            return "ADDDATE(", self(expr), ", INTERVAL ", self(delta), " HOUR_SECOND)"
         return "ADDDATE(", self(expr), ", ", self(delta), ")"
 
     def DATE_SUB(self, expr, delta):
         if delta[0] == "VALUE" and isinstance(delta[1], time):
             return "SUBTIME(", self(expr), ", ", self(delta), ")"
+        if _timedelta_param(delta):
+            return "SUBDATE(", self(expr), ", INTERVAL ", self(delta), " HOUR_SECOND)"
         return "SUBDATE(", self(expr), ", ", self(delta), ")"
 
     def DATE_DIFF(self, expr1, expr2):
@@ -252,6 +395,11 @@ class MySQLTimeConverter(dbapiprovider.TimeConverter):
 class MySQLTimedeltaConverter(dbapiprovider.TimedeltaConverter):
     sql_type_name = "TIME"
 
+    def val2dbval(self, val, obj=None):
+        # MySQL/MariaDB принимает длительности строкой 'H:M:S' в date-арифметике
+        # (аналогично encode_timedelta в get_pool для MySQLdb)
+        return timedelta2str(val)
+
 
 class MySQLUuidConverter(dbapiprovider.UuidConverter):
     def sql_type(self):
@@ -312,12 +460,40 @@ class MySQLProvider(DBAPIProvider):
         cursor.execute("select version()")
         row = cursor.fetchone()
         assert row is not None
+        self.server_version_string = str(row[0])
         self.server_version = get_version_tuple(row[0])
+        if "mariadb" in self.server_version_string.lower():
+            # провайдер mysql обслуживает и MariaDB-сервер: у MariaDB другой JSON-синтаксис
+            # (и она сама справляется с DELETE/UPDATE по читаемой таблице)
+            self.is_mariadb = True
+            from pony.orm.dbproviders.mariadb import MariaDBBuilder
+
+            if self.sqlbuilder_cls is not MariaDBBuilder:
+                self.sqlbuilder_cls = MariaDBBuilder
         if self.server_version >= (5, 6, 4):
             self.max_time_precision = 6
         cursor.execute("select database()")
         self.default_schema_name = cursor.fetchone()[0]
         cursor.execute("set session group_concat_max_len = 4294967295")
+
+    def execute(self, cursor, sql, arguments=None, returning_id=False):
+        try:
+            return DBAPIProvider.execute(self, cursor, sql, arguments, returning_id)
+        except dbapiprovider.DatabaseError as e:
+            # MySQL 8 отдаёт нарушение CHECK как DatabaseError (errno 3819),
+            # MariaDB — как IntegrityError (4025); pony ожидает IntegrityError
+            original = getattr(e, "original_exc", e)
+            errno = getattr(original, "errno", None)
+            if errno is None and getattr(original, "args", None):
+                first = original.args[0]
+                if isinstance(first, int):
+                    errno = first
+            if (
+                not isinstance(e, dbapiprovider.IntegrityError)
+                and errno in (3819, 4025)
+            ):
+                raise dbapiprovider.IntegrityError(e)
+            raise
 
     def should_reconnect(self, exc):
         return isinstance(exc, mysql_module.OperationalError) and exc.args[0] in (
@@ -326,6 +502,10 @@ class MySQLProvider(DBAPIProvider):
         )
 
     def get_pool(self, *args, **kwargs):
+        if mysql_module is None:
+            raise ImportError(
+                "In order to use PonyORM with MySQL please install MySQLdb or pymysql"
+            )
         if "conv" not in kwargs:
             conv = mysql_converters.conversions.copy()
             if mysql_module_name == "MySQLdb":

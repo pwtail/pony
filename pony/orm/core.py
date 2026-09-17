@@ -1063,7 +1063,10 @@ class DBSessionContextManager:
                         assert not local.db2cache
                         raise e
                     for cache in _get_caches():
-                        if cache.modified or cache.in_transaction:
+                        # приостановка допустима при открытой read-транзакции
+                        # (ковариант для MySQL/MariaDB с immediate-режимом);
+                        # незакоммиченные изменения — нет
+                        if cache.modified:
                             throw(
                                 TransactionError,
                                 "You need to manually commit() changes before suspending the generator",
@@ -1205,7 +1208,7 @@ def db_decorator(func, *args, **kwargs):
         raise
 
 
-known_providers = ("sqlite", "postgres", "postgres_async", "mysql", "oracle")
+known_providers = ("sqlite", "postgres", "postgres_async", "mysql", "mariadb", "mariadb_async", "oracle")
 
 
 class OnConnectDecorator:

@@ -639,6 +639,10 @@ class SQLBuilder:
                 return ["COUNT(*)"]
             if self.dialect == "PostgreSQL":
                 return "COUNT(", self.ROW(*expr_list), ")"
+            elif self.dialect == "MySQL":
+                # COUNT(a, b) не поддерживается; строковое значение из pk-колонок
+                # всегда не NULL, поэтому COUNT(*) эквивалентен
+                return ["COUNT(*)"]
             else:
                 return "COUNT(", join(", ", map(self, expr_list)), ")"
         if not expr_list:
@@ -720,7 +724,7 @@ class SQLBuilder:
 
         if start[0] == "VALUE":
             start_value = start[1]
-            if self.dialect == "PostgreSQL" and start_value < 0:
+            if start_value < 0 and self.dialect in ("PostgreSQL", "MySQL"):
                 index_sql = ["LENGTH", expr]
                 if start_value < -1:
                     index_sql = ["SUB", index_sql, ["VALUE", -(start_value + 1)]]
@@ -733,10 +737,15 @@ class SQLBuilder:
             then = ["ADD", inner_sql, ["VALUE", 1]]
             else_ = (
                 ["ADD", ["LENGTH", expr], then]
-                if self.dialect == "PostgreSQL"
+                if self.dialect in ("PostgreSQL", "MySQL")
                 else inner_sql
             )
             index_sql = ["IF", ["GE", inner_sql, ["VALUE", 0]], then, else_]
+
+        if self.dialect == "MySQL":
+            # MySQL трактует позицию <= 0 в substr как «с конца»; приводим
+            # к 1-based абсолютной позиции с клампом (как в Python)
+            index_sql = ["MAX", False, index_sql, ["VALUE", 1]]
 
         if stop is None:
             len_sql = None
@@ -771,7 +780,16 @@ class SQLBuilder:
                         ["LENGTH", expr],
                         ["ADD", start_sql, ["VALUE", -stop_value]],
                     ]
-                    start_negative = ["SUB", stop, start_sql]
+                    if self.dialect == "MySQL":
+                        # start может быть кламплен к позиции 1: длина от абсолютной
+                        # позиции index_sql (0-based — index_sql - 1) до stop
+                        start_negative = [
+                            "ADD",
+                            ["SUB", ["LENGTH", expr], index_sql],
+                            ["VALUE", stop_value + 1],
+                        ]
+                    else:
+                        start_negative = ["SUB", stop, start_sql]
                 len_sql = [
                     "IF",
                     ["GE", start_sql, ["VALUE", 0]],
@@ -804,8 +822,23 @@ class SQLBuilder:
             else:
                 start_sql = ["COALESCE", start, ["VALUE", 0]]
                 both_positive = ["SUB", stop_sql, start_sql]
-                both_negative = both_positive
-                start_positive = ["SUB", ["LENGTH", expr], ["SUB", start_sql, stop_sql]]
+                if self.dialect == "MySQL":
+                    # с клампом позиций приводим обе стороны к абсолютным:
+                    # эффективный stop = max(length + stop_sql, 0),
+                    # эффективный start = index_sql - 1
+                    both_negative = [
+                        "SUB",
+                        ["MAX", False, ["ADD", ["LENGTH", expr], stop_sql], ["VALUE", 0]],
+                        ["SUB", index_sql, ["VALUE", 1]],
+                    ]
+                    start_positive = [
+                        "SUB",
+                        ["MAX", False, ["ADD", ["LENGTH", expr], stop_sql], ["VALUE", 0]],
+                        start_sql,
+                    ]
+                else:
+                    both_negative = both_positive
+                    start_positive = ["SUB", ["LENGTH", expr], ["SUB", start_sql, stop_sql]]
                 stop_positive = ["SUB", ["ADD", stop_sql, ["VALUE", 1]], index_sql]
                 len_sql = [
                     "CASE",

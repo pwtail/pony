@@ -39,6 +39,10 @@ Homepage = "https://ponyorm.com"
 Documentation = "https://docs.ponyorm.org"
 Source = "https://github.com/ponyorm/pony"
 
+[project.optional-dependencies]
+postgres = ["psycopg>=3.3", "psycopg-pool>=3.3"]
+mariadb = ["mariadb>=2.0.0rc2", "mariadb-pool>=2.0.0rc2"]  # RC: ставятся с --pre
+
 [tool.setuptools]
 include-package-data = false
 packages = [
@@ -101,7 +105,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "pony/orm/dbproviders/mysql.py" = ["E402"]
+"pony/orm/dbproviders/mariadb.py" = ["E402"]
+"pony/orm/dbproviders/mariadb_async.py" = ["E402"]
 "pony/orm/dbproviders/postgres.py" = ["E402"]
+"pony/orm/dbproviders/postgres_async.py" = ["E402"]
 "pony/orm/__init__.py" = ["F403"]
 "pony/orm/examples/*.py" = ["F841"]
 "pony/orm/examples/inheritance1.py" = ["E402"]

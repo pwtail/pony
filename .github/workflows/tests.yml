@@ -24,7 +24,21 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install psycopg psycopg_pool
+        run: pip install --pre psycopg psycopg_pool mariadb mariadb-pool
+      - name: Start MariaDB (case-insensitive tables, ANSI_QUOTES)
+        run: |
+          docker run -d --name mariadb -p 3306:3306 \
+            -e MARIADB_ROOT_PASSWORD=root \
+            -e MARIADB_DATABASE=pony_mariadb_test \
+            -e MARIADB_USER=ponytest \
+            -e MARIADB_PASSWORD=ponytest \
+            mariadb:11 \
+            --lower-case-table-names=1 \
+            --sql-mode=STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,ANSI_QUOTES
+          for i in $(seq 1 60); do
+            docker exec mariadb mariadb -uroot -proot -e "SELECT 1" >/dev/null 2>&1 && break
+            sleep 2
+          done
       - name: Create async test database
         run: |
           python -c "
@@ -36,6 +50,11 @@ jobs:
       - name: Run test suites
         env:
           PONY_ASYNC_DSN: "dbname=pony_async_test user=postgres password=postgres host=localhost"
+          PONY_MARIADB_HOST: "127.0.0.1"
+          PONY_MARIADB_PORT: "3306"
+          PONY_MARIADB_USER: "ponytest"
+          PONY_MARIADB_PASSWORD: "ponytest"
+          PONY_MARIADB_DB: "pony_mariadb_test"
         run: |
           python -m unittest discover -s pony/orm/tests -p 'test_*.py'
           python -m unittest discover -s pony/utils/tests -p 'test_*.py'

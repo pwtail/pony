@@ -77,23 +77,14 @@ class TestIndexes(unittest.TestCase):
         create_script = db.schema.generate_create_script()
 
         dialect = self.db.provider.dialect
-        if pony.__version__ < "0.9":
-            if dialect == "SQLite":
-                index_sql = (
-                    'CREATE INDEX "idx_person__name_age" ON "Person" ("name", "age")'
-                )
-            else:
-                index_sql = (
-                    'CREATE INDEX "idx_person__name_age" ON "person" ("name", "age")'
-                )
-        elif dialect == "MySQL" or dialect == "SQLite":
+        if dialect == "MySQL":
             index_sql = (
-                "CREATE INDEX `idx_person__name__age` ON `person` (`name`, `age`)"
+                "CREATE INDEX `idx_person__name_age` ON `person` (`name`, `age`)"
             )
+        elif dialect == "SQLite":
+            index_sql = 'CREATE INDEX "idx_person__name_age" ON "Person" ("name", "age")'
         elif dialect == "PostgreSQL":
-            index_sql = (
-                'CREATE INDEX "idx_person__name__age" ON "person" ("name", "age")'
-            )
+            index_sql = 'CREATE INDEX "idx_person__name_age" ON "person" ("name", "age")'
         elif dialect == "Oracle":
             index_sql = (
                 'CREATE INDEX "IDX_PERSON__NAME__AGE" ON "PERSON" ("NAME", "AGE")'
