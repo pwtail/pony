@@ -1,15 +1,23 @@
 """Session cache: per-session identity map, connection and transaction state.
 
-SessionCacheGen is the single implementation, written in async style; every
-I/O point goes through the ProviderOps adapter (provider.sync_ops). Two thin
-facades drive it:
+Классов три:
 
-- SessionCache      — sync: methods are DriveGen descriptors, no loop.
-- AsyncSessionCache — async: awaited normally (same module, below).
+    AbstractSessionCache  общая часть: состояние сессии + sync-хелперы,
+                          создаёт SessionCacheGen(self) — логику;
+    SyncSessionCache      sync-режим (is_async = False): session-методы —
+                          однострочные обёртки `drive(self._gen.<метод>())`;
+    AsyncSessionCache     async-режим (is_async = True): session-методы —
+                          `Delegate('_gen')`, корутину ожидает вызывающий.
+
+    cache = SyncSessionCache(database) / AsyncSessionCache(database)
+    cache._gen                          # SessionCacheGen(cache) — логика
+
+Gen-код написан один раз в async стиле; единственное место, где режимы
+расходятся физически — ProviderOps (provider.sync_ops / provider.async_ops).
 
 Names owned by core (core.num_counter, core.local, exceptions, ...) are
 resolved lazily: core.py imports this module, so module-level attribute
-access at import time would be circular.
+access at import time save_updated_gen would be circular.
 """
 
 import sys
@@ -17,18 +25,18 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 import pony.orm.core as core
-from pony.orm.drive import DriveGen
+from pony.orm.drive import Delegate, drive
 from pony.utils import throw
 
 
-class SessionCacheGen:
-    is_async = False
+class AbstractSessionCache:
+    """Общая часть кэша сессии: состояние и sync-хелперы.
 
-    def _ops(self):
-        provider = self.database.provider
-        if self.is_async:
-            return provider.async_ops
-        return provider.sync_ops
+    Режим и session-методы определяют наследники: SyncSessionCache (sync,
+    session-методы протягиваются драйвером drive) и AsyncSessionCache
+    (async, session-методы делегируются в Gen). Логика вынесена в
+    SessionCacheGen (self._gen).
+    """
 
     def __init__(self, database):
         self.is_alive = True
@@ -57,193 +65,7 @@ class SessionCacheGen:
         )  # user -> perm -> cls_or_attr_or_obj -> bool
         self.user_roles_cache = defaultdict(dict)  # user -> obj -> roles
         self.obj_labels_cache = {}  # obj -> labels
-
-    async def connect(self):
-        assert self.connection is None
-        if self.in_transaction:
-            core.throw(
-                core.ConnectionClosedError,
-                "Transaction cannot be continued because database connection failed",
-            )
-        database = self.database
-        provider = database.provider
-        connection = await self._ops().connect(database, self)
-        try:
-            await self._ops().set_transaction_mode(connection, self)
-        except:
-            await self._ops().drop(connection, self)
-            raise
-
-        self.connection = connection
-        return connection
-
-    async def reconnect(self, exc):
-        provider = self.database.provider
-        if exc is not None:
-            exc = getattr(exc, "original_exc", exc)
-            if not provider.should_reconnect(exc):
-                core.reraise(*sys.exc_info())
-            if core.local.debug:
-                core.log_orm("CONNECTION FAILED: %s" % exc)
-            connection = self.connection
-            assert connection is not None
-            self.connection = None
-            await self._ops().drop(connection, self)
-        else:
-            assert self.connection is None
-        return await SessionCacheGen.connect(self)
-
-    async def prepare_connection_for_query_execution(self):
-        db_session = core.local.db_session
-        if db_session is not None and self.db_session is None:
-            # This situation can arise when a transaction was started
-            # in the interactive mode, outside of the db_session
-            if self.in_transaction or self.modified:
-                core.local.db_session = None
-                try:
-                    await SessionCacheGen.flush_and_commit(self)
-                finally:
-                    core.local.db_session = db_session
-            self.db_session = db_session
-            self.immediate = self.immediate or db_session.immediate
-        else:
-            assert self.db_session is db_session, (self.db_session, db_session)
-        connection = self.connection
-        if connection is None:
-            connection = await SessionCacheGen.connect(self)
-        elif self.immediate and not self.in_transaction:
-            provider = self.database.provider
-            try:
-                await self._ops().set_transaction_mode(connection, self)
-            except Exception as e:
-                connection = await SessionCacheGen.reconnect(self, e)
-        if not self.noflush_counter and self.modified:
-            await SessionCacheGen.flush(self)
-        return connection
-
-    async def flush_and_commit(self):
-        try:
-            await SessionCacheGen.flush(self)
-        except:
-            await SessionCacheGen.rollback(self)
-            raise
-        try:
-            await SessionCacheGen.commit(self)
-        except BaseException:
-            core.transact_reraise(core.CommitException, [sys.exc_info()])
-
-    async def commit(self):
-        assert self.is_alive
-        try:
-            if self.modified:
-                await SessionCacheGen.flush(self)
-            if self.in_transaction:
-                assert self.connection is not None
-                await self._ops().commit(self.connection, self)
-            self.for_update.clear()
-            self.query_results.clear()
-            self.max_id_cache.clear()
-            self.immediate = True
-        except:
-            await SessionCacheGen.rollback(self)
-            raise
-
-    async def rollback(self):
-        await SessionCacheGen.close(self, rollback=True)
-
-    async def release(self):
-        await SessionCacheGen.close(self, rollback=False)
-
-    async def close(self, rollback=True):
-        assert self.is_alive
-        if not rollback:
-            assert not self.in_transaction
-        database = self.database
-        x = core.local.db2cache.pop(database)
-        assert x is self
-        self.is_alive = False
-        provider = database.provider
-        connection = self.connection
-        if connection is None:
-            return
-        self.connection = None
-
-        try:
-            if rollback:
-                try:
-                    await self._ops().rollback(connection, self)
-                except:
-                    await self._ops().drop(connection, self)
-                    raise
-            await self._ops().release(connection, self)
-        finally:
-            db_session = self.db_session or core.local.db_session
-            if db_session and db_session.strict:
-                for obj in self.objects:
-                    obj._vals_ = obj._dbvals_ = obj._session_cache_ = None
-                self.perm_cache = self.user_roles_cache = self.obj_labels_cache = None
-            else:
-                for obj in self.objects:
-                    obj._dbvals_ = obj._session_cache_ = None
-                    for attr, setdata in obj._vals_.items():
-                        if attr.is_collection:
-                            if not setdata.is_fully_loaded:
-                                obj._vals_[attr] = None
-
-            self.objects = self.objects_to_save = self.saved_objects = (
-                self.query_results
-            ) = self.indexes = self.seeds = self.for_update = self.max_id_cache = (
-                self.modified_collections
-            ) = self.collection_statistics = self.dbvals_deduplication_cache = None
-
-    async def flush(self):
-        from pony.orm.core_gen import save_gen  # lazy: core_gen imports pony.orm
-
-        if self.noflush_counter:
-            return
-        assert self.is_alive
-        assert not self.saved_objects
-        prev_immediate = self.immediate
-        self.immediate = True
-        try:
-            for _i in range(50):
-                if not self.modified:
-                    return
-
-                with self.flush_disabled():
-                    for obj in self.objects_to_save:  # can grow during iteration
-                        if obj is not None:
-                            obj._before_save_()
-
-                    self.query_results.clear()
-                    modified_m2m = self._calc_modified_m2m()
-                    for attr, (_added, removed) in modified_m2m.items():
-                        if not removed:
-                            continue
-                        attr.remove_m2m(removed)
-                    for obj in self.objects_to_save:
-                        if obj is not None:
-                            await save_gen(obj)
-                    for attr, (added, _removed) in modified_m2m.items():
-                        if not added:
-                            continue
-                        attr.add_m2m(added)
-
-                self.max_id_cache.clear()
-                self.modified_collections.clear()
-                self.objects_to_save[:] = ()
-                self.modified = False
-
-                self.call_after_save_hooks()
-            else:
-                if self.modified:
-                    core.throw(
-                        core.TransactionError,
-                        "Recursion depth limit reached in obj._after_save_() call",
-                    )
-        finally:
-            if not self.in_transaction:
-                self.immediate = prev_immediate
+        self._gen = SessionCacheGen(self)
 
     @contextmanager
     def flush_disabled(self):
@@ -258,41 +80,6 @@ class SessionCacheGen:
         self.saved_objects = []
         for obj, status in saved_objects:
             obj._after_save_(status)
-
-    def _calc_modified_m2m(self):
-        modified_m2m = {}
-        for attr, objects in sorted(
-            self.modified_collections.items(),
-            key=lambda pair: (pair[0].entity.__name__, pair[0].name),
-        ):
-            if not isinstance(attr, core.Set):
-                core.throw(NotImplementedError)
-            reverse = attr.reverse
-            if not reverse.is_collection:
-                for obj in objects:
-                    setdata = obj._vals_[attr]
-                    setdata.added = setdata.removed = setdata.absent = None
-                continue
-
-            if not isinstance(reverse, core.Set):
-                core.throw(NotImplementedError)
-            if reverse in modified_m2m:
-                continue
-            added, removed = modified_m2m.setdefault(attr, (set(), set()))
-            for obj in objects:
-                setdata = obj._vals_[attr]
-                if setdata.added:
-                    for obj2 in setdata.added:
-                        added.add((obj, obj2))
-                if setdata.removed:
-                    for obj2 in setdata.removed:
-                        removed.add((obj, obj2))
-                if obj._status_ == "marked_to_delete":
-                    del obj._vals_[attr]
-                else:
-                    setdata.added = setdata.removed = setdata.absent = None
-        self.modified_collections.clear()
-        return modified_m2m
 
     def update_simple_index(self, obj, attr, old_val, new_val, undo):
         if old_val == new_val:
@@ -375,28 +162,303 @@ class SessionCacheGen:
         cache_index.pop(prev_vals, None)
 
 
-class SessionCache(SessionCacheGen):
-    """Sync-фасад SessionCacheGen: те же методы, исполняются драйвером drive()."""
-
-    connect = DriveGen()
-    reconnect = DriveGen()
-    prepare_connection_for_query_execution = DriveGen()
-    flush_and_commit = DriveGen()
-    commit = DriveGen()
-    rollback = DriveGen()
-    release = DriveGen()
-    close = DriveGen()
-    flush = DriveGen()
 
 
-# ---------------------------------------------------------------------------
-# async facade and session globals (asyncio)
-# ---------------------------------------------------------------------------
+class SessionCacheGen:
+    """Логика сессии в async стиле; состояние читает через self.cache."""
+
+    def __init__(self, cache):
+        self.cache = cache
+
+    def _ops(self):
+        provider = self.cache.database.provider
+        if self.cache.is_async:
+            return provider.async_ops
+        return provider.sync_ops
+
+    async def connect(self):
+        assert self.cache.connection is None
+        if self.cache.in_transaction:
+            core.throw(
+                core.ConnectionClosedError,
+                "Transaction cannot be continued because database connection failed",
+            )
+        database = self.cache.database
+        provider = database.provider
+        connection = await self._ops().connect(database, self.cache)
+        try:
+            await self._ops().set_transaction_mode(connection, self.cache)
+        except:
+            await self._ops().drop(connection, self.cache)
+            raise
+
+        self.cache.connection = connection
+        return connection
+
+    async def reconnect(self, exc):
+        provider = self.cache.database.provider
+        if exc is not None:
+            exc = getattr(exc, "original_exc", exc)
+            if not provider.should_reconnect(exc):
+                core.reraise(*sys.exc_info())
+            if core.local.debug:
+                core.log_orm("CONNECTION FAILED: %s" % exc)
+            connection = self.cache.connection
+            assert connection is not None
+            self.cache.connection = None
+            await self._ops().drop(connection, self.cache)
+        else:
+            assert self.cache.connection is None
+        return await self.connect()
+
+    async def prepare_connection_for_query_execution(self):
+        db_session = core.local.db_session
+        if db_session is not None and self.cache.db_session is None:
+            # This situation can arise when a transaction was started
+            # in the interactive mode, outside of the db_session
+            if self.cache.in_transaction or self.cache.modified:
+                core.local.db_session = None
+                try:
+                    await self.flush_and_commit()
+                finally:
+                    core.local.db_session = db_session
+            self.cache.db_session = db_session
+            self.cache.immediate = self.cache.immediate or db_session.immediate
+        else:
+            assert self.cache.db_session is db_session, (self.cache.db_session, db_session)
+        connection = self.cache.connection
+        if connection is None:
+            connection = await self.connect()
+        elif self.cache.immediate and not self.cache.in_transaction:
+            provider = self.cache.database.provider
+            try:
+                await self._ops().set_transaction_mode(connection, self.cache)
+            except Exception as e:
+                connection = await self.reconnect(e)
+        if not self.cache.noflush_counter and self.cache.modified:
+            await self.flush()
+        return connection
+
+    async def flush_and_commit(self):
+        try:
+            await self.flush()
+        except:
+            await self.rollback()
+            raise
+        try:
+            await self.commit()
+        except BaseException:
+            core.transact_reraise(core.CommitException, [sys.exc_info()])
+
+    async def commit(self):
+        assert self.cache.is_alive
+        try:
+            if self.cache.modified:
+                await self.flush()
+            if self.cache.in_transaction:
+                assert self.cache.connection is not None
+                await self._ops().commit(self.cache.connection, self.cache)
+            self.cache.for_update.clear()
+            self.cache.query_results.clear()
+            self.cache.max_id_cache.clear()
+            self.cache.immediate = True
+        except:
+            await self.rollback()
+            raise
+
+    async def rollback(self):
+        await self.close(rollback=True)
+
+    async def release(self):
+        await self.close(rollback=False)
+
+    async def close(self, rollback=True):
+        assert self.cache.is_alive
+        if not rollback:
+            assert not self.cache.in_transaction
+        database = self.cache.database
+        x = core.local.db2cache.pop(database)
+        assert x is self.cache
+        self.cache.is_alive = False
+        provider = database.provider
+        connection = self.cache.connection
+        if connection is None:
+            return
+        self.cache.connection = None
+
+        try:
+            if rollback:
+                try:
+                    await self._ops().rollback(connection, self.cache)
+                except:
+                    await self._ops().drop(connection, self.cache)
+                    raise
+            await self._ops().release(connection, self.cache)
+        finally:
+            db_session = self.cache.db_session or core.local.db_session
+            if db_session and db_session.strict:
+                for obj in self.cache.objects:
+                    obj._vals_ = obj._dbvals_ = obj._session_cache_ = None
+                self.cache.perm_cache = self.cache.user_roles_cache = (
+                    self.cache.obj_labels_cache
+                ) = None
+            else:
+                for obj in self.cache.objects:
+                    obj._dbvals_ = obj._session_cache_ = None
+                    for attr, setdata in obj._vals_.items():
+                        if attr.is_collection:
+                            if not setdata.is_fully_loaded:
+                                obj._vals_[attr] = None
+
+            self.cache.objects = self.cache.objects_to_save = (
+                self.cache.saved_objects
+            ) = self.cache.query_results = self.cache.indexes = (
+                self.cache.seeds
+            ) = self.cache.for_update = self.cache.max_id_cache = (
+                self.cache.modified_collections
+            ) = self.cache.collection_statistics = (
+                self.cache.dbvals_deduplication_cache
+            ) = None
+
+    async def flush(self):
+        if self.cache.noflush_counter:
+            return
+        assert self.cache.is_alive
+        assert not self.cache.saved_objects
+        prev_immediate = self.cache.immediate
+        self.cache.immediate = True
+        try:
+            for _i in range(50):
+                if not self.cache.modified:
+                    return
+
+                with self.cache.flush_disabled():
+                    for obj in self.cache.objects_to_save:  # can grow during iteration
+                        if obj is not None:
+                            obj._before_save_()
+
+                    self.cache.query_results.clear()
+                    modified_m2m = self._calc_modified_m2m()
+                    for attr, (_added, removed) in modified_m2m.items():
+                        if not removed:
+                            continue
+                        attr.remove_m2m(removed)
+                    for obj in self.cache.objects_to_save:
+                        if obj is not None:
+                            # save_gen живёт в core_gen; берём его через core:
+                            # модульный импорт core -> core_gen дал бы цикл
+                            await core.save_gen(obj)
+                    for attr, (added, _removed) in modified_m2m.items():
+                        if not added:
+                            continue
+                        attr.add_m2m(added)
+
+                self.cache.max_id_cache.clear()
+                self.cache.modified_collections.clear()
+                self.cache.objects_to_save[:] = ()
+                self.cache.modified = False
+
+                self.cache.call_after_save_hooks()
+            else:
+                if self.cache.modified:
+                    core.throw(
+                        core.TransactionError,
+                        "Recursion depth limit reached in obj._after_save_() call",
+                    )
+        finally:
+            if not self.cache.in_transaction:
+                self.cache.immediate = prev_immediate
 
 
-class AsyncSessionCache(SessionCacheGen):
+    def _calc_modified_m2m(self):
+        modified_m2m = {}
+        for attr, objects in sorted(
+            self.cache.modified_collections.items(),
+            key=lambda pair: (pair[0].entity.__name__, pair[0].name),
+        ):
+            if not isinstance(attr, core.Set):
+                core.throw(NotImplementedError)
+            reverse = attr.reverse
+            if not reverse.is_collection:
+                for obj in objects:
+                    setdata = obj._vals_[attr]
+                    setdata.added = setdata.removed = setdata.absent = None
+                continue
+
+            if not isinstance(reverse, core.Set):
+                core.throw(NotImplementedError)
+            if reverse in modified_m2m:
+                continue
+            added, removed = modified_m2m.setdefault(attr, (set(), set()))
+            for obj in objects:
+                setdata = obj._vals_[attr]
+                if setdata.added:
+                    for obj2 in setdata.added:
+                        added.add((obj, obj2))
+                if setdata.removed:
+                    for obj2 in setdata.removed:
+                        removed.add((obj, obj2))
+                if obj._status_ == "marked_to_delete":
+                    del obj._vals_[attr]
+                else:
+                    setdata.added = setdata.removed = setdata.absent = None
+        self.cache.modified_collections.clear()
+        return modified_m2m
+
+
+class SyncSessionCache(AbstractSessionCache):
+    """Синхронный кэш сессии: session-методы исполняются драйвером drive()."""
+
+    is_async = False
+
+    def connect(self):
+        return drive(self._gen.connect())
+
+    def reconnect(self, exc):
+        return drive(self._gen.reconnect(exc))
+
+    def prepare_connection_for_query_execution(self):
+        return drive(self._gen.prepare_connection_for_query_execution())
+
+    def flush_and_commit(self):
+        return drive(self._gen.flush_and_commit())
+
+    def commit(self):
+        return drive(self._gen.commit())
+
+    def rollback(self):
+        return drive(self._gen.rollback())
+
+    def release(self):
+        return drive(self._gen.release())
+
+    def close(self, rollback=True):
+        return drive(self._gen.close(rollback))
+
+    def flush(self):
+        return drive(self._gen.flush())
+
+
+
+class AsyncSessionCache(AbstractSessionCache):
+    """Асинхронный кэш сессии: то же состояние, session-методы — корутины Gen.
+
+    Наследует состояние и sync-хелперы AbstractSessionCache; методы соединения и
+    транзакций делегируются в Gen через Delegate и ожидаются вызывающим:
+    `await cache.connect()`, `await cache.commit()`.
+    """
+
     is_async = True
 
+    connect = Delegate('_gen')
+    reconnect = Delegate('_gen')
+    prepare_connection_for_query_execution = Delegate('_gen')
+    flush_and_commit = Delegate('_gen')
+    commit = Delegate('_gen')
+    rollback = Delegate('_gen')
+    release = Delegate('_gen')
+    close = Delegate('_gen')
+    flush = Delegate('_gen')
 
 # ---------------------------------------------------------------------------
 # async session globals (mirror core.flush / core.commit / core.rollback)

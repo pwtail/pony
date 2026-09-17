@@ -4,23 +4,27 @@ from operator import attrgetter
 
 from pony.orm import core
 from pony.orm.ops import ops_for
-from pony.orm.session_cache import SessionCacheGen
+from pony.orm.session_cache import AbstractSessionCache
+from pony.utils import throw
 
-throw = core.throw
+# ВАЖНО: при импорте core_gen обращается только к объекту модуля core (не к его
+# атрибутам) — core импортирует core_gen, и обращение к ещё не определённому
+# имени сломало бы импорт. throw берём напрямую из pony.utils (тот же объект,
+# что core.throw), остальные core.<имя> читаются во время вызова.
 
 
 async def exec_sql_gen(
     database, sql, arguments=None, returning_id=False, start_transaction=False
 ):
     cache = database._get_cache()
-    if not isinstance(cache, SessionCacheGen):
+    if not isinstance(cache, AbstractSessionCache):
         throw(
             core.TransactionError,
-            "exec_sql_gen() requires a SessionCacheGen-backed session",
+            "exec_sql_gen() requires a pony session cache",
         )
     if start_transaction:
         cache.immediate = True
-    connection = await SessionCacheGen.prepare_connection_for_query_execution(cache)
+    connection = await cache._gen.prepare_connection_for_query_execution()
     cursor = connection.cursor()
     if core.local.debug:
         core.log_sql(sql, arguments)
@@ -30,7 +34,7 @@ async def exec_sql_gen(
     try:
         new_id = await ops.execute(cursor, sql, arguments, returning_id)
     except Exception as e:
-        connection = await SessionCacheGen.reconnect(cache, e)
+        connection = await cache._gen.reconnect(e)
         cursor = connection.cursor()
         if core.local.debug:
             core.log_sql(sql, arguments)
@@ -367,15 +371,15 @@ async def query_fetch_gen(query, limit=None, offset=None):
         )
         database = query._database
         cache = database._get_cache()
-        if not isinstance(cache, SessionCacheGen):
+        if not isinstance(cache, AbstractSessionCache):
             throw(
                 core.TransactionError,
-                "query fetch requires a SessionCacheGen-backed session",
+                "query fetch requires a pony session cache",
             )
         ops = ops_for(database.provider, cache.is_async)
         if query._for_update:
             cache.immediate = True
-        await SessionCacheGen.prepare_connection_for_query_execution(cache)
+        await cache._gen.prepare_connection_for_query_execution()
         items = cache.query_results.get(query_key)
         if items is None:
             cursor = await exec_sql_gen(database, sql, arguments)
@@ -419,10 +423,10 @@ async def load_obj_gen(obj):
     cache = obj._session_cache_
     if cache is None or not cache.is_alive:
         core.throw_db_session_is_over("load object", obj)
-    if not isinstance(cache, SessionCacheGen):
+    if not isinstance(cache, AbstractSessionCache):
         throw(
             core.TransactionError,
-            "load requires a SessionCacheGen-backed session",
+            "load requires a pony session cache",
         )
     entity = obj.__class__
     database = entity._database_
@@ -455,10 +459,10 @@ async def load_attr_gen(obj, attr):
     cache = obj._session_cache_
     if cache is None or not cache.is_alive:
         core.throw_db_session_is_over("load attribute", obj, attr)
-    if not isinstance(cache, SessionCacheGen):
+    if not isinstance(cache, AbstractSessionCache):
         throw(
             core.TransactionError,
-            "load requires a SessionCacheGen-backed session",
+            "load requires a pony session cache",
         )
     if attr in obj._vals_:
         # значение уже есть: если это seed — догружаем сам seed-объект
@@ -512,10 +516,10 @@ async def load_collection_gen(obj, attr, items=None):
     cache = obj._session_cache_
     if cache is None or not cache.is_alive:
         core.throw_db_session_is_over("load collection", obj, attr)
-    if not isinstance(cache, SessionCacheGen):
+    if not isinstance(cache, AbstractSessionCache):
         throw(
             core.TransactionError,
-            "collection loading requires a SessionCacheGen-backed session",
+            "collection loading requires a pony session cache",
         )
     if obj._status_ in core.del_statuses:
         core.throw_object_was_deleted(obj)

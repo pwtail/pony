@@ -41,6 +41,27 @@ from pony.orm.dbapiprovider import (
 )
 from pony.orm.decompiling import decompile
 from pony.orm.drive import drive
+# Gen-функции и кэш сессии импортируются на уровне модуля: core_gen обращается
+# к атрибутам core только во время вызова, поэтому цикл core <-> core_gen
+# безопасен (раньше импорт был ленивым — внутри каждой функции).
+from pony.orm.core_gen import (
+    exec_sql_gen,
+    fetch_objects_gen,
+    load_attr_gen,
+    load_collection_gen,
+    load_many_gen,
+    load_obj_gen,
+    query_fetch_gen,
+    save_created_gen,
+    save_gen,
+)
+from pony.orm.session_cache import (
+    AsyncSessionCache,
+    SyncSessionCache,
+    _get_async_caches,
+    async_commit,
+    async_rollback,
+)
 from pony.orm.ormtypes import (
     Array,
     FloatArray,
@@ -831,8 +852,6 @@ class DBSessionContextManager:
                 local.pop_debug_state()
 
     async def _async_commit_or_rollback(self, exc_type, exc, tb):
-        from pony.orm.session_cache import async_commit, async_rollback
-
         try:
             if exc_type is None:
                 can_commit = True
@@ -848,8 +867,6 @@ class DBSessionContextManager:
                     rollback_and_reraise(sys.exc_info())
             if can_commit:
                 await async_commit()
-                from pony.orm.session_cache import _get_async_caches
-
                 for cache in _get_async_caches():
                     await cache.release()
                 assert not local.db2cache
@@ -1388,8 +1405,6 @@ class Database:
                     "async db_session requires an async-capable provider; "
                     "bind the database as Database(%s, ...)" % "'postgres_async'",
                 )
-            from pony.orm.session_cache import AsyncSessionCache
-
             cache = local.db2cache[self] = AsyncSessionCache(self)
         else:
             if _running_in_user_coroutine():
@@ -1398,7 +1413,7 @@ class Database:
                     "sync database access cannot be used inside a coroutine; "
                     "use 'async with db_session:'",
                 )
-            cache = local.db2cache[self] = SessionCache(self)
+            cache = local.db2cache[self] = SyncSessionCache(self)
         return cache
 
     @cut_traceback
@@ -1551,8 +1566,6 @@ class Database:
                 TransactionError,
                 "sync SQL execution in an async session; use the async API",
             )
-        from pony.orm.core_gen import exec_sql_gen
-
         return drive(
             exec_sql_gen(self, sql, arguments, returning_id, start_transaction)
         )
@@ -2736,8 +2749,6 @@ class QueryStat:
 num_counter = itertools.count()
 
 
-from pony.orm.session_cache import SessionCache
-
 class NotLoadedValueType:
     def __repr__(self):
         return "NOT_LOADED"
@@ -3240,8 +3251,6 @@ class Attribute:
             else:
                 assert obj._vals_[self] == dbval
             return dbval
-        from pony.orm.core_gen import load_attr_gen
-
         return drive(load_attr_gen(obj, self))
 
     def __get__(self, obj, cls=None):
@@ -4554,8 +4563,6 @@ class Set(Collection):
                 "Collection %s.%s is not loaded; use 'await obj.%s'"
                 % (obj.__class__.__name__, self.name, self.name),
             )
-        from pony.orm.core_gen import load_collection_gen
-
         return drive(load_collection_gen(obj, self, items))
 
     def construct_sql_m2m(self, batch_size=1, items_count=0):
@@ -4988,14 +4995,10 @@ class SetInstance:
 
     def __await__(self):
         """`await obj.related_set` loads the collection."""
-        from pony.orm.core_gen import load_collection_gen
-
         return load_collection_gen(self._obj_, self._attr_).__await__()
 
     async def __aiter__(self):
         """`async for rel in obj.related_set` loads the collection and iterates."""
-        from pony.orm.core_gen import load_collection_gen
-
         setdata = await load_collection_gen(self._obj_, self._attr_)
         for item in setdata:
             yield item
@@ -6519,8 +6522,6 @@ class EntityMeta(type):
         for_update=False,
         used_attrs=(),
     ):
-        from pony.orm.core_gen import fetch_objects_gen
-
         return drive(
             fetch_objects_gen(
                 cls, cursor, attr_offsets, max_fetch_count, for_update, used_attrs
@@ -6579,8 +6580,6 @@ class EntityMeta(type):
         return real_entity_subclass, pkval, avdict
 
     def _load_many_(cls, objects):
-        from pony.orm.core_gen import load_many_gen
-
         return drive(load_many_gen(cls, objects))
 
     def _select_all(cls):
@@ -7241,15 +7240,11 @@ class Entity(metaclass=EntityMeta):
                 TransactionError,
                 "Object %s doesn't belong to current transaction" % safe_repr(self),
             )
-        from pony.orm.core_gen import load_obj_gen
-
         return drive(load_obj_gen(self))
 
     @cut_traceback
     async def _async_load(self, attrs):
         """Async branch of load(): `await obj.load()` or `await obj.load('attr')`."""
-        from pony.orm.core_gen import load_attr_gen, load_obj_gen
-
         if not attrs:
             await load_obj_gen(self)
         else:
@@ -7830,8 +7825,6 @@ class Entity(metaclass=EntityMeta):
             dbvals.pop(attr, None)
 
     def _save_created_(self):
-        from pony.orm.core_gen import save_created_gen
-
         return drive(save_created_gen(self))
 
     def find_updated_attributes(self):
@@ -7898,8 +7891,6 @@ class Entity(metaclass=EntityMeta):
         )
 
     def _save_(self, dependent_objects=None):
-        from pony.orm.core_gen import save_gen
-
         return drive(save_gen(self, dependent_objects))
 
     def flush(self):
@@ -8459,20 +8450,14 @@ class Query:
 
     def __await__(self):
         """`await select(...)` returns the list of query results."""
-        from pony.orm.core_gen import query_fetch_gen
-
         return query_fetch_gen(self).__await__()
 
     async def __aiter__(self):
         """`async for obj in select(...)` fetches and iterates the query."""
-        from pony.orm.core_gen import query_fetch_gen
-
         for item in await query_fetch_gen(self):
             yield item
 
     def _actual_fetch(self, limit=None, offset=None):
-        from pony.orm.core_gen import query_fetch_gen
-
         if self._prefetch:
             saved = self._prefetch
             self._prefetch = False

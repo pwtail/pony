@@ -1,16 +1,19 @@
-"""Sync driver for the Gen implementation: `drive()` and the `DriveGen` descriptor.
+"""Мост между sync- и async-миром: `drive()` и `Delegate`.
 
-The Gen implementation (SessionCacheGen and the `*_gen` functions) is written
-in async style. Sync classes expose it through the DriveGen descriptor:
+Логика сессии (SessionCacheGen) и остальные `*_gen`-функции написаны в async
+стиле; состояние сессии живёт в AbstractSessionCache. Режимные классы
+вызывают Gen-методы по-своему:
 
-    class SessionCache(SessionCacheGen):
-        connect = DriveGen()  # sync wrapper over SessionCacheGen.connect
+    class SyncSessionCache(AbstractSessionCache):
+        def connect(self):               # drive(self._gen.connect())
+            return drive(self._gen.connect())
 
-`drive(coro)` runs a coroutine to completion without an event loop: every await
-inside must complete synchronously (all I/O goes through ops.SyncOps).
+    class AsyncSessionCache(AbstractSessionCache):
+        connect = Delegate('_gen')       # await self._gen.connect()
+
+`drive(coro)` прокручивает корутину до конца без event loop: каждый await
+внутри обязан завершиться синхронно (весь I/O идёт через ops.SyncOps).
 """
-
-from functools import wraps
 
 
 def drive(coro):
@@ -25,49 +28,20 @@ def drive(coro):
         return ex.value
 
 
-class DriveGen:
-    """Descriptor: exposes the parent's async Gen method as a sync one.
+class Delegate:
+    """Дескриптор: Gen-метод как async-метод кэша.
 
-    `connect = DriveGen()` makes `instance.connect(...)` perform
-    `drive(GenParent.connect(instance, ...))`. The implementation is looked up
-    in the MRO *after* the class where the descriptor is defined — so the
-    descriptor never re-enters itself.
+    `connect = Delegate('_gen')` делает `cache.connect(...)` эквивалентом
+    `cache._gen.connect(...)` — вызывающий сам ожидает корутину.
     """
 
-    def __init__(self):
-        self.owner = None
-        self.name = None
-        self._methods = {}
+    def __init__(self, target):
+        self.target = target
 
     def __set_name__(self, owner, name):
-        self.owner = owner
         self.name = name
-
-    def _find_method(self, cls):
-        mro = cls.__mro__
-        try:
-            start = mro.index(self.owner) + 1
-        except ValueError:  # pragma: no cover
-            start = 1
-        for base in mro[start:]:
-            # берём функцию прямо из __dict__, не задевая дескрипторы
-            method = base.__dict__.get(self.name)
-            if method is not None:
-                return method
-        raise AttributeError(  # pragma: no cover
-            "Async implementation of %s.%s not found" % (cls.__name__, self.name)
-        )
 
     def __get__(self, obj, cls=None):
         if obj is None:
             return self
-        cls = type(obj)
-        method = self._methods.get(cls)
-        if method is None:
-            method = self._methods[cls] = self._find_method(cls)
-
-        @wraps(method)
-        def wrapper(*args, **kwargs):
-            return drive(method(obj, *args, **kwargs))
-
-        return wrapper
+        return getattr(getattr(obj, self.target), self.name)
