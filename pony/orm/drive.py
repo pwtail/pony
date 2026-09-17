@@ -54,4 +54,5 @@ class Delegate:
     def __get__(self, obj, cls=None):
         if obj is None:
             return self
-        return getattr(getattr(obj, self.target), self.name)
+        delegate = getattr(obj, self.target)
+        return getattr(delegate, self.name)
