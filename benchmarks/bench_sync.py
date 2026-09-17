@@ -21,7 +21,8 @@ import time
 
 import pony.options
 
-# в старом дереве опции IO_GUARD нет — игнорируем
+# опция IO_GUARD есть только в ревизиях с io-механизмом; в остальных
+# деревьях присваивание безвредно
 try:
     pony.options.IO_GUARD = False
 except AttributeError:

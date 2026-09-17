@@ -1,21 +1,9 @@
-"""Shared async/Gen implementation of the ORM core plumbing.
-
-Everything here is written once in async style and driven in both modes:
-async sessions await it normally, sync code drives it via gen_core.drive()
-(SyncOps complete immediately). Contains: exec_sql_gen (exec), the save
-chain (save_gen*), query fetching and object/attribute/collection loading
-(query_fetch_gen, fetch_objects_gen, gen_load_*), and the async
-transaction globals (async_flush/async_commit/async_rollback).
-"""
-
-import sys
 import time
 from itertools import starmap
 from operator import attrgetter
 
 from pony.orm import core
-from pony.orm.async_session_cache import AsyncSessionCache
-from pony.orm.gen_core import ops_for
+from pony.orm.ops import ops_for
 from pony.orm.session_cache import SessionCacheGen
 
 throw = core.throw
@@ -37,7 +25,7 @@ async def exec_sql_gen(
     if core.local.debug:
         core.log_sql(sql, arguments)
     provider = database.provider
-    ops = provider.async_ops if cache.is_async else provider.ops
+    ops = provider.async_ops if cache.is_async else provider.sync_ops
     t = time.time()
     try:
         new_id = await ops.execute(cursor, sql, arguments, returning_id)
@@ -359,74 +347,6 @@ async def load_many_gen(cls, objects):
                         core.UnrepeatableReadError,
                         "Phantom object %s disappeared" % core.safe_repr(obj),
                     )
-
-
-# ---------------------------------------------------------------------------
-# async session globals (mirror core.flush / core.commit / core.rollback)
-# ---------------------------------------------------------------------------
-
-
-def _get_async_caches():
-    return [
-        cache for cache in core._get_caches() if isinstance(cache, AsyncSessionCache)
-    ]
-
-
-async def async_flush():
-    for cache in _get_async_caches():
-        await cache.flush()
-
-
-async def async_commit():
-    caches = core._get_caches()
-    if not caches:
-        return
-    for cache in caches:
-        if not isinstance(cache, AsyncSessionCache):
-            throw(
-                core.TransactionError,
-                "mixing sync and async sessions in one transaction is not supported",
-            )
-    for cache in caches:
-        await cache.flush()
-    primary_cache = caches[0]
-    other_caches = caches[1:]
-    exceptions = []
-    try:
-        await primary_cache.commit()
-    except BaseException:
-        exceptions.append(sys.exc_info())
-        for cache in other_caches:
-            try:
-                await cache.rollback()
-            except BaseException:
-                exceptions.append(sys.exc_info())
-        core.transact_reraise(core.CommitException, exceptions)
-    else:
-        for cache in other_caches:
-            try:
-                await cache.commit()
-            except BaseException:
-                exceptions.append(sys.exc_info())
-        if exceptions:
-            core.transact_reraise(core.PartialCommitException, exceptions)
-    finally:
-        del exceptions
-
-
-async def async_rollback():
-    exceptions = []
-    try:
-        for cache in _get_async_caches():
-            try:
-                await cache.rollback()
-            except BaseException:
-                exceptions.append(sys.exc_info())
-        if exceptions:
-            core.transact_reraise(core.RollbackException, exceptions)
-        assert not core.local.db2cache
-    finally:
-        del exceptions
 
 
 # ---------------------------------------------------------------------------

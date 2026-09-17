@@ -1,30 +1,18 @@
-"""Shared machinery for the Gen-classes (single codebase for sync and async).
+"""ProviderOps: the single place where sync and async modes differ physically.
 
 Gen-classes are written once in async style; every I/O point goes through
-the ProviderOps adapter (``provider.ops`` / ``provider.async_ops``):
+this adapter (``provider.sync_ops`` / ``provider.async_ops``):
 
 - SyncOps  — coroutines with no real await points: the body executes fully
-  on the first ``next()``, on top of the sync dbapi machinery (including the
-  io-guard wrapper). Driven by ``drive()`` without an event loop.
-- AsyncOps — real psycopg async calls, driven by a normal ``await``.
+  on the first ``next()``, on top of the sync dbapi machinery. Driven by
+  ``drive()`` from pony.orm.drive without an event loop.
+- AsyncOps — real async driver calls, awaited normally.
 """
-
-
-def drive(coro):
-    """Run a coroutine to completion without an event loop.
-
-    All awaits inside must complete synchronously (I/O only through
-    ProviderOps); this is the sync driver for Gen-classes.
-    """
-    try:
-        next(coro.__await__())
-    except StopIteration as ex:
-        return ex.value
 
 
 def ops_for(provider, is_async):
     """ProviderOps for the given session mode."""
-    return provider.async_ops if is_async else provider.ops
+    return provider.async_ops if is_async else provider.sync_ops
 
 
 class SyncOps:

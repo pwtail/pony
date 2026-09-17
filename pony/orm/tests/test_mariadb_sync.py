@@ -10,7 +10,6 @@ from pony.orm import (
     Set,
     commit,
     db_session,
-    io,
     rollback,
     select,
 )
@@ -56,8 +55,7 @@ class TestMariaDBSync(unittest.TestCase):
             dept = Optional(Dept)
 
         cls.Dept, cls.Person = Dept, Person
-        with io:
-            db.generate_mapping(create_tables=True)
+        db.generate_mapping(create_tables=True)
 
     def setUp(self):
         conn = mariadb_module.connect(**MDB)
@@ -71,62 +69,52 @@ class TestMariaDBSync(unittest.TestCase):
 
     def test_create_and_select(self):
         with db_session:
-            with io:
-                d = self.Dept(name="IT")
-                self.Person(name="ann", age=30, dept=d)
-                self.Person(name="bob", age=17, dept=d)
-                commit()
+            d = self.Dept(name="IT")
+            self.Person(name="ann", age=30, dept=d)
+            self.Person(name="bob", age=17, dept=d)
+            commit()
         with db_session:
-            with io:
-                objs = select(x for x in self.Person).order_by(self.Person.id)
-                self.assertEqual([x.name for x in objs], ["ann", "bob"])
+            objs = select(x for x in self.Person).order_by(self.Person.id)
+            self.assertEqual([x.name for x in objs], ["ann", "bob"])
 
     def test_filter_and_update(self):
         with db_session:
-            with io:
-                d = self.Dept(name="IT")
-                self.Person(name="ann", age=30, dept=d)
-                self.Person(name="bob", age=17, dept=d)
-                commit()
+            d = self.Dept(name="IT")
+            self.Person(name="ann", age=30, dept=d)
+            self.Person(name="bob", age=17, dept=d)
+            commit()
         with db_session:
-            with io:
-                adults = select(x for x in self.Person if x.age > 18)
-                self.assertEqual([x.name for x in adults], ["ann"])
-                bob = self.Person.get(name="bob")
-                bob.age = 20
-                commit()
+            adults = select(x for x in self.Person if x.age > 18)
+            self.assertEqual([x.name for x in adults], ["ann"])
+            bob = self.Person.get(name="bob")
+            bob.age = 20
+            commit()
         with db_session:
-            with io:
-                adults = select(x for x in self.Person if x.age > 18)
-                self.assertEqual(sorted(x.name for x in adults), ["ann", "bob"])
+            adults = select(x for x in self.Person if x.age > 18)
+            self.assertEqual(sorted(x.name for x in adults), ["ann", "bob"])
 
     def test_collection_load(self):
         with db_session:
-            with io:
-                d = self.Dept(name="IT")
-                self.Person(name="ann", age=30, dept=d)
-                self.Person(name="bob", age=17, dept=d)
-                commit()
+            d = self.Dept(name="IT")
+            self.Person(name="ann", age=30, dept=d)
+            self.Person(name="bob", age=17, dept=d)
+            commit()
         with db_session:
-            with io:
-                d = self.Dept.get(name="IT")
-                self.assertEqual(sorted(p.name for p in d.persons), ["ann", "bob"])
+            d = self.Dept.get(name="IT")
+            self.assertEqual(sorted(p.name for p in d.persons), ["ann", "bob"])
 
     def test_delete_and_rollback(self):
         with db_session:
-            with io:
-                d = self.Dept(name="IT")
-                self.Person(name="ann", age=30, dept=d)
-                commit()
+            d = self.Dept(name="IT")
+            self.Person(name="ann", age=30, dept=d)
+            commit()
         with db_session:
-            with io:
-                ann = self.Person.get(name="ann")
-                ann.delete()
-                rollback()
+            ann = self.Person.get(name="ann")
+            ann.delete()
+            rollback()
         with db_session:
-            with io:
-                objs = select(x for x in self.Person)
-                self.assertEqual([x.name for x in objs], ["ann"])
+            objs = select(x for x in self.Person)
+            self.assertEqual([x.name for x in objs], ["ann"])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,6 @@ from pony.orm import (
     Set,
     TransactionError,
     db_session,
-    io,
     select,
 )
 
@@ -54,8 +53,7 @@ class TestAsyncAPI(unittest.TestCase):
         conn.autocommit = True
         conn.cursor().execute("DROP TABLE IF EXISTS person, dept CASCADE")
         conn.close()
-        with io:
-            db.generate_mapping(create_tables=True)
+        db.generate_mapping(create_tables=True)
 
     def setUp(self):
         conn = psycopg.connect(DSN)

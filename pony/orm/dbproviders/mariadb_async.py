@@ -4,7 +4,7 @@ Async-режим на встроенном asyncio-модуле коннекто
 официальном пуле mariadb_pool.AsyncConnectionPool (loop-локальный, ленивое
 создание — пулу нужен event loop). Sync-часть (диалект, schema, sync-пул)
 наследуется от MariaDBProvider. Gen-слой подключается через AsyncOps из
-gen_core — он делегирует этим async_* методам.
+ops — он делегирует этим async_* методам.
 """
 
 import asyncio
@@ -29,7 +29,7 @@ from pony.orm.core import (
     log_orm,
 )
 from pony.orm.dbproviders.mariadb import MariaDBProvider
-from pony.orm.gen_core import AsyncOps
+from pony.orm.ops import AsyncOps
 
 
 def async_wrap_dbapi_exceptions(func):

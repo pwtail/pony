@@ -7,7 +7,6 @@ import pony.orm.core
 
 pony.options.CUT_TRACEBACK = False
 pony.orm.core.sql_debug(False)
-pony.options.IO_GUARD = False  # legacy suite predates 'with io:'; dedicated tests re-enable it
 
 
 def _load_env():

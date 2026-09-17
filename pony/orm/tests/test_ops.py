@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from pony.orm import Database, Required
-from pony.orm.gen_core import drive
+from pony.orm.drive import DriveGen, drive
 
 
 async def _identity(x):
@@ -29,6 +29,29 @@ class TestDrive(unittest.TestCase):
             drive(_boom())
 
 
+class TestDriveGen(unittest.TestCase):
+    def test_descriptor_drives_parent_method(self):
+        class Base:
+            async def calc(self, x):
+                return x + 1
+
+        class Sync(Base):
+            calc = DriveGen()
+
+        self.assertEqual(Sync().calc(41), 42)
+
+    def test_descriptor_propagates_exceptions(self):
+        class Base:
+            async def boom(self):
+                raise ValueError("boom")
+
+        class Sync(Base):
+            boom = DriveGen()
+
+        with self.assertRaises(ValueError):
+            Sync().boom()
+
+
 class TestSyncOps(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -42,7 +65,7 @@ class TestSyncOps(unittest.TestCase):
 
     def test_ops_roundtrip_via_drive(self):
         db = self.db
-        ops = db.provider.ops
+        ops = db.provider.sync_ops
         connection = drive(ops.connect(db, None))
         try:
             cursor = connection.cursor()
@@ -68,7 +91,7 @@ class TestSyncOps(unittest.TestCase):
         # SyncOps-корутины — обычные async-функции: работают и под event loop
         async def scenario():
             db = self.db
-            ops = db.provider.ops
+            ops = db.provider.sync_ops
             connection = await ops.connect(db, None)
             try:
                 cursor = connection.cursor()

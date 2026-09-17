@@ -1,7 +1,5 @@
 DEBUG = True
 
-IO_GUARD = True  # forbid database access outside 'with io:' (temporary, removed with async support)
-
 STATIC_DIR = None
 
 CUT_TRACEBACK = True

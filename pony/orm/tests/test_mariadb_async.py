@@ -12,7 +12,6 @@ from pony.orm import (
     Set,
     TransactionError,
     db_session,
-    io,
     select,
 )
 
@@ -58,8 +57,7 @@ class TestMariaDBAsync(unittest.TestCase):
             bio = Optional(str, lazy=True)
 
         cls.Dept, cls.Person = Dept, Person
-        with io:
-            db.generate_mapping(create_tables=True)
+        db.generate_mapping(create_tables=True)
 
     def setUp(self):
         conn = mariadb_module.connect(**MDB)

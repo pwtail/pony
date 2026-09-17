@@ -29,7 +29,7 @@ from pony.orm.core import (
     log_orm,
 )
 from pony.orm.dbproviders.postgres import PGProvider
-from pony.orm.gen_core import AsyncOps
+from pony.orm.ops import AsyncOps
 
 
 def async_wrap_dbapi_exceptions(func):
@@ -91,7 +91,7 @@ class AsyncPostgreSQLProvider(PGProvider):
 
     def __init__(self, database, *args, **kwargs):
         super().__init__(database, *args, **kwargs)
-        self.async_ops = AsyncOps(self)  # self.ops (SyncOps) наследуется от DBAPIProvider
+        self.async_ops = AsyncOps(self)  # self.sync_ops (SyncOps) наследуется от DBAPIProvider
         pool_kwargs = dict(kwargs)
         pool_kwargs.pop("pony_call_on_connect", None)  # внутренние ключи core, не dsn-опции
         pool_kwargs.pop("pony_pool_mockup", None)

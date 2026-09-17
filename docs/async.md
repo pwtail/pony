@@ -75,6 +75,5 @@ async with db_session:
 - `await Entity[pk]` не реализован: `Entity[pk]` — синхронная операция,
   в async-сессии запрещена; выборка по pk — через `select(...)`.
 - `load()` для reverse-атрибутов без собственных колонок — `NotImplementedError`.
-- Schema-операции (`generate_mapping`, `create_tables`) — только sync, оборачивать
-  в `with io:`.
+- Schema-операции (`generate_mapping`, `create_tables`) — только sync.
 - Смешение sync- и async-сессий в одной транзакции не поддерживается.

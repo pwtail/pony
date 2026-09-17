@@ -1,13 +1,11 @@
 """Session cache: per-session identity map, connection and transaction state.
 
 SessionCacheGen is the single implementation, written in async style; every
-I/O point goes through the ProviderOps adapter (provider.ops). Two thin
+I/O point goes through the ProviderOps adapter (provider.sync_ops). Two thin
 facades drive it:
 
-- SessionCache      — sync: steps the coroutines with gen_core.drive(),
-                      no event loop needed.
-- AsyncSessionCache — async (defined in async_session_cache.py): awaited
-                      normally.
+- SessionCache      — sync: methods are DriveGen descriptors, no loop.
+- AsyncSessionCache — async: awaited normally (same module, below).
 
 Names owned by core (core.num_counter, core.local, exceptions, ...) are
 resolved lazily: core.py imports this module, so module-level attribute
@@ -19,7 +17,8 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 import pony.orm.core as core
-from pony.orm.gen_core import drive
+from pony.orm.drive import DriveGen
+from pony.utils import throw
 
 
 class SessionCacheGen:
@@ -29,7 +28,7 @@ class SessionCacheGen:
         provider = self.database.provider
         if self.is_async:
             return provider.async_ops
-        return provider.ops
+        return provider.sync_ops
 
     def __init__(self, database):
         self.is_alive = True
@@ -198,7 +197,7 @@ class SessionCacheGen:
             ) = self.collection_statistics = self.dbvals_deduplication_cache = None
 
     async def flush(self):
-        from pony.orm.async_core import save_gen  # lazy: async_core imports pony.orm
+        from pony.orm.core_gen import save_gen  # lazy: core_gen imports pony.orm
 
         if self.noflush_counter:
             return
@@ -377,31 +376,91 @@ class SessionCacheGen:
 
 
 class SessionCache(SessionCacheGen):
-    """Sync-фасад SessionCacheGen: та же логика, исполняется drive() без event loop."""
+    """Sync-фасад SessionCacheGen: те же методы, исполняются драйвером drive()."""
 
-    def connect(self):
-        return drive(SessionCacheGen.connect(self))
+    connect = DriveGen()
+    reconnect = DriveGen()
+    prepare_connection_for_query_execution = DriveGen()
+    flush_and_commit = DriveGen()
+    commit = DriveGen()
+    rollback = DriveGen()
+    release = DriveGen()
+    close = DriveGen()
+    flush = DriveGen()
 
-    def reconnect(self, exc):
-        return drive(SessionCacheGen.reconnect(self, exc))
 
-    def prepare_connection_for_query_execution(self):
-        return drive(SessionCacheGen.prepare_connection_for_query_execution(self))
+# ---------------------------------------------------------------------------
+# async facade and session globals (asyncio)
+# ---------------------------------------------------------------------------
 
-    def flush_and_commit(self):
-        return drive(SessionCacheGen.flush_and_commit(self))
 
-    def commit(self):
-        return drive(SessionCacheGen.commit(self))
+class AsyncSessionCache(SessionCacheGen):
+    is_async = True
 
-    def rollback(self):
-        return drive(SessionCacheGen.rollback(self))
 
-    def release(self):
-        return drive(SessionCacheGen.release(self))
+# ---------------------------------------------------------------------------
+# async session globals (mirror core.flush / core.commit / core.rollback)
+# ---------------------------------------------------------------------------
 
-    def close(self, rollback=True):
-        return drive(SessionCacheGen.close(self, rollback))
 
-    def flush(self):
-        return drive(SessionCacheGen.flush(self))
+def _get_async_caches():
+    return [
+        cache for cache in core._get_caches() if isinstance(cache, AsyncSessionCache)
+    ]
+
+
+async def async_flush():
+    for cache in _get_async_caches():
+        await cache.flush()
+
+
+async def async_commit():
+    caches = core._get_caches()
+    if not caches:
+        return
+    for cache in caches:
+        if not isinstance(cache, AsyncSessionCache):
+            throw(
+                core.TransactionError,
+                "mixing sync and async sessions in one transaction is not supported",
+            )
+    for cache in caches:
+        await cache.flush()
+    primary_cache = caches[0]
+    other_caches = caches[1:]
+    exceptions = []
+    try:
+        await primary_cache.commit()
+    except BaseException:
+        exceptions.append(sys.exc_info())
+        for cache in other_caches:
+            try:
+                await cache.rollback()
+            except BaseException:
+                exceptions.append(sys.exc_info())
+        core.transact_reraise(core.CommitException, exceptions)
+    else:
+        for cache in other_caches:
+            try:
+                await cache.commit()
+            except BaseException:
+                exceptions.append(sys.exc_info())
+        if exceptions:
+            core.transact_reraise(core.PartialCommitException, exceptions)
+    finally:
+        del exceptions
+
+
+async def async_rollback():
+    exceptions = []
+    try:
+        for cache in _get_async_caches():
+            try:
+                await cache.rollback()
+            except BaseException:
+                exceptions.append(sys.exc_info())
+        if exceptions:
+            core.transact_reraise(core.RollbackException, exceptions)
+        assert not core.local.db2cache
+    finally:
+        del exceptions
