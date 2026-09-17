@@ -145,8 +145,24 @@ class TestMariaDBAsync(unittest.TestCase):
                 d = self.Dept(name="IT")
                 self.Person(name="ann", age=30, dept=d)
             async with db_session:
+                # sync-выборка в async-сессии — ошибка с подсказкой
                 with self.assertRaises(TransactionError):
-                    self.Person[1]
+                    len(select(x for x in self.Person)[:1])
+
+        asyncio.run(scenario())
+
+    def test_await_entity_by_pk(self):
+        async def scenario():
+            async with db_session:
+                d = self.Dept(name="IT")
+                self.Person(name="ann", age=30, dept=d)
+            async with db_session:
+                person = (await select(x for x in self.Person))[0]
+                pk = person.id
+            async with db_session:
+                person = await self.Person[pk]
+                self.assertEqual(person.name, "ann")
+                self.assertIs(await self.Person[pk], person)   # кэш сессии
 
         asyncio.run(scenario())
 

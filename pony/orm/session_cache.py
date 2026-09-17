@@ -342,7 +342,7 @@ class SessionCacheGen:
                     for attr, (_added, removed) in modified_m2m.items():
                         if not removed:
                             continue
-                        attr.remove_m2m(removed)
+                        await core.remove_m2m_gen(attr, removed)
                     for obj in self.cache.objects_to_save:
                         if obj is not None:
                             # save_gen живёт в core_gen; берём его через core:
@@ -351,7 +351,7 @@ class SessionCacheGen:
                     for attr, (added, _removed) in modified_m2m.items():
                         if not added:
                             continue
-                        attr.add_m2m(added)
+                        await core.add_m2m_gen(attr, added)
 
                 self.cache.max_id_cache.clear()
                 self.cache.modified_collections.clear()

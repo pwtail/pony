@@ -45,6 +45,7 @@ from pony.orm.drive import drive
 # к атрибутам core только во время вызова, поэтому цикл core <-> core_gen
 # безопасен (раньше импорт был ленивым — внутри каждой функции).
 from pony.orm.core_gen import (
+    add_m2m_gen,
     exec_sql_gen,
     fetch_objects_gen,
     load_attr_gen,
@@ -52,6 +53,7 @@ from pony.orm.core_gen import (
     load_many_gen,
     load_obj_gen,
     query_fetch_gen,
+    remove_m2m_gen,
     save_created_gen,
     save_gen,
 )
@@ -60,6 +62,7 @@ from pony.orm.session_cache import (
     SyncSessionCache,
     _get_async_caches,
     async_commit,
+    async_flush,
     async_rollback,
 )
 from pony.orm.ormtypes import (
@@ -104,6 +107,9 @@ from pony.utils import (
 
 __all__ = [
     "JOIN",
+    "async_commit",
+    "async_flush",
+    "async_rollback",
     "BindingError",
     "CacheIndexError",
     "CommitException",
@@ -603,14 +609,43 @@ def _get_caches():
     )
 
 
+def _async_caches():
+    """Список кэшей, если активна async-сессия; иначе None.
+
+    Смешение sync- и async-сессий в одной транзакции не поддерживается.
+    """
+    caches = _get_caches()
+    if not caches or not any(cache.is_async for cache in caches):
+        return None
+    if not all(cache.is_async for cache in caches):
+        throw(
+            TransactionError,
+            "mixing sync and async sessions in one transaction is not supported",
+        )
+    return caches
+
+
+def _in_async_context():
+    """True, если код исполняется внутри корутины.
+
+    Сессия создаётся лениво — при первом обращении к базе, — поэтому в самом начале
+    `async with db_session:` кэшей ещё нет. Проверка по работающему loop нужна,
+    чтобы `await flush()/commit()/rollback()` в этот момент тоже получали корутину,
+    а не None (иначе await падал с TypeError).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 @cut_traceback
 def flush():
+    # В async-сессии те же функции возвращают корутину: await flush()
+    if _async_caches() is not None or _in_async_context():
+        return async_flush()
     for cache in _get_caches():
-        if cache.is_async:
-            throw(
-                TransactionError,
-                "async session is active; use 'await flush()'",
-            )
         cache.flush()
 
 
@@ -640,14 +675,12 @@ def commit():
     caches = _get_caches()
     if not caches:
         return
+    if _async_caches() is not None or _in_async_context():
+        # В async-сессии: await commit()
+        return async_commit()
 
     try:
         for cache in caches:
-            if cache.is_async:
-                throw(
-                    TransactionError,
-                    "async session is active; use 'await commit()'",
-                )
             cache.flush()
     except BaseException:
         rollback_and_reraise(sys.exc_info())
@@ -679,12 +712,9 @@ def commit():
 
 @cut_traceback
 def rollback():
-    for cache in _get_caches():
-        if cache.is_async:
-            throw(
-                TransactionError,
-                "async session is active; use 'await rollback()'",
-            )
+    if _async_caches() is not None or _in_async_context():
+        # В async-сессии: await rollback()
+        return async_rollback()
     exceptions = []
     try:
         for cache in _get_caches():
@@ -4869,6 +4899,10 @@ class Set(Collection):
         return reverse.columns
 
     def remove_m2m(self, removed):
+        sql, arguments_list = self._m2m_remove_sql_and_arguments(removed)
+        self.entity._database_._exec_sql(sql, arguments_list)
+
+    def _m2m_remove_sql_and_arguments(self, removed):
         assert removed
         entity = self.entity
         database = entity._database_
@@ -4900,9 +4934,13 @@ class Set(Collection):
             adapter(obj._get_raw_pkval_() + robj._get_raw_pkval_())
             for obj, robj in removed
         ]
-        database._exec_sql(sql, arguments_list)
+        return sql, arguments_list
 
     def add_m2m(self, added):
+        sql, arguments_list = self._m2m_add_sql_and_arguments(added)
+        self.entity._database_._exec_sql(sql, arguments_list)
+
+    def _m2m_add_sql_and_arguments(self, added):
         assert added
         entity = self.entity
         database = entity._database_
@@ -4928,7 +4966,7 @@ class Set(Collection):
             adapter(obj._get_raw_pkval_() + robj._get_raw_pkval_())
             for obj, robj in added
         ]
-        database._exec_sql(sql, arguments_list)
+        return sql, arguments_list
 
     @cut_traceback
     @db_session(ddl=True)
@@ -5561,6 +5599,63 @@ select_re = re.compile(r"select\b", re.IGNORECASE)
 lambda_re = re.compile(r"lambda\b")
 
 
+class AsyncEntityLookup:
+    """Результат `Entity[pk]` в async-сессии: объект получают через await.
+
+    `await Person[1]` сначала смотрит в identity map сессии (без обращения к базе),
+    и только затем идёт запросом по атрибутам первичного ключа.
+
+    Пример:
+
+        async with db_session:
+            person = await Person[1]
+
+    Обращение к результату без `await` — ошибка с подсказкой.
+    """
+
+    __slots__ = ("_cls", "_key")
+
+    def __init__(self, cls, key):
+        self._cls = cls
+        self._key = key if type(key) is tuple else (key,)
+
+    def __await__(self):
+        return self._load().__await__()
+
+    async def _load(self):
+        cls, key = self._cls, self._key
+        if len(key) != len(cls._pk_attrs_):
+            # ключ задан «сырыми» колонками pk: доступно только кэш-попадание
+            pkval = cls._pkval_from_raw_pkval_(key)
+            obj = cls._database_._get_cache().indexes[cls._pk_attrs_].get(pkval)
+            if obj is not None:
+                return obj
+            throw(
+                TransactionError,
+                "lookup by raw primary key columns is not implemented in an async "
+                "session; use 'await %s.get(...)' or 'await select(...)'" % cls.__name__,
+            )
+        kwargs = {attr.name: value for attr, value in zip(cls._pk_attrs_, key)}
+        avdict, pkval = cls._prepare_key_(kwargs)
+        obj, _unique = cls._find_in_cache_(pkval, avdict)
+        if obj is not None:
+            return obj
+        obj = await cls.select().filter(**kwargs).get()
+        if obj is None:
+            throw(ObjectNotFound, cls, pkval)
+        return obj
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        throw(
+            TransactionError,
+            "Entity[pk] in an async session requires await: "
+            "'await %s[%r]' or 'await %s.get(...)'"
+            % (self._cls.__name__, self._key, self._cls.__name__),
+        )
+
+
 class EntityMeta(type):
     def __new__(meta, name, bases, cls_dict):
         if "Entity" in globals():
@@ -6038,6 +6133,10 @@ class EntityMeta(type):
 
     @cut_traceback
     def __getitem__(cls, key):
+        cache = cls._database_._get_cache()
+        if cache is not None and cache.is_async:
+            # В async-сессии `Person[1]` возвращает awaitable: await Person[1]
+            return AsyncEntityLookup(cls, key)
         if type(key) is not tuple:
             key = (key,)
         if len(key) == len(cls._pk_attrs_):
@@ -6052,9 +6151,18 @@ class EntityMeta(type):
             % (cls.__name__, len(key), len(cls._pk_attrs_)),
         )
 
+    def _is_async_(cls):
+        # обычный метод, а не classmethod: entities — экземпляры EntityMeta,
+        # поэтому classmethod связал бы cls с самим метаклассом
+        cache = cls._database_._get_cache()
+        return cache is not None and cache.is_async
+
     @cut_traceback
     def exists(cls, *args, **kwargs):
-        if args:
+        if args or cls._is_async_():
+            if not args:
+                # в async-сессии поиск по атрибутам идёт через запрос
+                return cls.select().filter(**kwargs).exists()
             return cls._query_from_args_(
                 args, kwargs, frame_depth=cut_traceback_depth + 1
             ).exists()
@@ -6068,7 +6176,10 @@ class EntityMeta(type):
 
     @cut_traceback
     def get(cls, *args, **kwargs):
-        if args:
+        if args or cls._is_async_():
+            if not args:
+                # в async-сессии поиск по атрибутам идёт через запрос
+                return cls.select().filter(**kwargs).get()
             return cls._query_from_args_(
                 args, kwargs, frame_depth=cut_traceback_depth + 1
             ).get()
@@ -6208,12 +6319,8 @@ class EntityMeta(type):
             shuffle(result)
         return result
 
-    def _find_one_(cls, kwargs, for_update=False, nowait=False, skip_locked=False):
-        if cls._database_.schema is None:
-            throw(
-                ERDiagramError,
-                "Mapping is not generated for entity %r" % cls.__name__,
-            )
+    def _prepare_key_(cls, kwargs):
+        """Проверенные значения атрибутов и pkval для поиска по ключу."""
         avdict = {}
         get_attr = cls._adict_.get
         for name, val in kwargs.items():
@@ -6234,8 +6341,25 @@ class EntityMeta(type):
                     "Collection attribute %s cannot be specified as search criteria"
                     % attr,
                 )
+        return avdict, pkval
+
+    def _find_one_(cls, kwargs, for_update=False, nowait=False, skip_locked=False):
+        if cls._database_.schema is None:
+            throw(
+                ERDiagramError,
+                "Mapping is not generated for entity %r" % cls.__name__,
+            )
+        avdict, pkval = cls._prepare_key_(kwargs)
         obj, unique = cls._find_in_cache_(pkval, avdict, for_update)
         if obj is None:
+            cache = cls._database_._get_cache()
+            if cache is not None and cache.is_async:
+                throw(
+                    TransactionError,
+                    "sync lookup by key in an async session; use 'await %s[...]', "
+                    "'await %s.get(...)' or 'await select(...)' instead"
+                    % (cls.__name__, cls.__name__),
+                )
             obj = cls._find_in_db_(avdict, unique, for_update, nowait, skip_locked)
         if obj is None:
             throw(ObjectNotFound, cls, pkval)
@@ -6706,6 +6830,29 @@ class EntityMeta(type):
             assert cache.in_transaction
             cache.for_update.add(obj)
         return obj
+
+    def _pkval_from_raw_pkval_(cls, raw_pkval, from_db=False):
+        """Значения pk-атрибутов из «сырых» значений колонок первичного ключа."""
+        i = 0
+        pkval = []
+        for attr in cls._pk_attrs_:
+            if attr.column is not None:
+                val = raw_pkval[i]
+                i += 1
+                if not attr.reverse:
+                    val = attr.validate(val, None, cls, from_db=from_db)
+                else:
+                    val = attr.py_type._pkval_from_raw_pkval_((val,), from_db=from_db)
+            else:
+                if not attr.reverse:
+                    throw(NotImplementedError)
+                vals = raw_pkval[i : i + len(attr.columns)]
+                val = attr.py_type._pkval_from_raw_pkval_(vals, from_db=from_db)
+                i += len(attr.columns)
+            pkval.append(val)
+        if not cls._pk_is_composite_:
+            return pkval[0]
+        return tuple(pkval)
 
     def _get_by_raw_pkval_(cls, raw_pkval, for_update=False, from_db=True, seed=True):
         i = 0
@@ -8458,6 +8605,13 @@ class Query:
             yield item
 
     def _actual_fetch(self, limit=None, offset=None):
+        cache = self._database._get_cache()
+        if cache is not None and cache.is_async:
+            throw(
+                TransactionError,
+                "sync query execution in an async session; use 'await select(...)', "
+                "'await query[:n]' or 'await query.count()' instead",
+            )
         if self._prefetch:
             saved = self._prefetch
             self._prefetch = False
@@ -8569,7 +8723,20 @@ class Query:
 
     @cut_traceback
     def get(self):
+        if self._is_async():
+            return self._async_get()
         objects = self[:2]
+        if not objects:
+            return None
+        if len(objects) > 1:
+            throw(
+                MultipleObjectsFoundError,
+                "Multiple objects were found. Use select(...) to retrieve them",
+            )
+        return objects[0]
+
+    async def _async_get(self):
+        objects = await self[:2]
         if not objects:
             return None
         if len(objects) > 1:
@@ -8590,10 +8757,16 @@ class Query:
             )
         else:
             self = self.order_by(1)
+        if self._is_async():
+            return self._async_first()
         objects = self.without_distinct()[:1]
         if not objects:
             return None
         return objects[0]
+
+    async def _async_first(self):
+        objects = await self.without_distinct()[:1]
+        return objects[0] if objects else None
 
     @cut_traceback
     def without_distinct(self):
@@ -8605,11 +8778,18 @@ class Query:
 
     @cut_traceback
     def exists(self):
+        if self._is_async():
+            return self._async_exists()
         objects = self[:1]
         return bool(objects)
 
+    async def _async_exists(self):
+        return bool(await self[:1])
+
     @cut_traceback
     def delete(self, bulk=None):
+        if self._is_async():
+            return self._async_delete(bulk)
         if not bulk:
             if not isinstance(self._translator.expr_type, EntityMeta):
                 throw(
@@ -8635,6 +8815,37 @@ class Query:
         cache.immediate = True
         cache.prepare_connection_for_query_execution()  # may clear cache.query_results
         cursor = database._exec_sql(sql, arguments)
+        cache.query_results.clear()
+        return cursor.rowcount
+
+    async def _async_delete(self, bulk):
+        from pony.orm.core_gen import exec_sql_gen
+
+        if not bulk:
+            if not isinstance(self._translator.expr_type, EntityMeta):
+                throw(
+                    TypeError,
+                    "Delete query should be applied to a single entity. Got: %s"
+                    % ast2src(self._translator.tree.elt),
+                )
+            objects = await self
+            for obj in objects:
+                obj._delete_()
+            return len(objects)
+        translator = self._translator
+        sql_key = HashableDict(self._key, sql_command="DELETE")
+        database = self._database
+        cache = database._get_cache()
+        cache_entry = database._constructed_sql_cache.get(sql_key)
+        if cache_entry is None:
+            sql_ast = translator.construct_delete_sql_ast()
+            cache_entry = database.provider.ast2sql(sql_ast)
+            database._constructed_sql_cache[sql_key] = cache_entry
+        sql, adapter = cache_entry
+        arguments = adapter(self._vars)
+        cache.immediate = True
+        await cache._gen.prepare_connection_for_query_execution()
+        cursor = await exec_sql_gen(database, sql, arguments)
         cache.query_results.clear()
         return cursor.rowcount
 
@@ -9006,6 +9217,10 @@ class Query:
         offset = (pagenum - 1) * pagesize
         return self._fetch(pagesize, offset, lazy=True)
 
+    def _is_async(self):
+        cache = self._database._get_cache()
+        return cache is not None and cache.is_async
+
     def _aggregate(self, aggr_func_name, distinct=None, sep=None):
         translator = self._translator
         sql, arguments, attr_offsets, query_key = self._construct_sql_and_arguments(
@@ -9015,31 +9230,52 @@ class Query:
         try:
             result = cache.query_results[query_key]
         except KeyError:
+            if cache.is_async:
+                # В async-сессии агрегаты возвращают корутину: await query.count()
+                return self._async_aggregate(
+                    aggr_func_name, sql, arguments, query_key, translator
+                )
             cursor = self._database._exec_sql(sql, arguments)
             row = cursor.fetchone()
-            if row is not None:
-                result = row[0]
-            else:
-                result = None
-            if result is None and aggr_func_name == "SUM":
-                result = 0
-            if result is None:
-                pass
-            elif aggr_func_name == "COUNT":
-                pass
-            else:
-                if aggr_func_name == "AVG":
-                    expr_type = float
-                elif aggr_func_name == "GROUP_CONCAT":
-                    expr_type = str
-                else:
-                    expr_type = translator.expr_type
-                provider = self._database.provider
-                converter = provider.get_converter_by_py_type(expr_type)
-                result = converter.sql2py(result)
+            result = self._aggregate_result(
+                aggr_func_name, None if row is None else row[0], translator
+            )
             if query_key is not None:
                 cache.query_results[query_key] = result
         return result
+
+    async def _async_aggregate(
+        self, aggr_func_name, sql, arguments, query_key, translator
+    ):
+        from pony.orm.core_gen import exec_sql_gen
+        from pony.orm.ops import ops_for
+
+        database = self._database
+        cache = database._get_cache()
+        cursor = await exec_sql_gen(database, sql, arguments)
+        ops = ops_for(database.provider, cache.is_async)
+        row = await ops.fetchone(cursor)
+        result = self._aggregate_result(
+            aggr_func_name, None if row is None else row[0], translator
+        )
+        if query_key is not None:
+            cache.query_results[query_key] = result
+        return result
+
+    def _aggregate_result(self, aggr_func_name, result, translator):
+        if result is None and aggr_func_name == "SUM":
+            result = 0
+        if result is None or aggr_func_name in ("COUNT",):
+            return result
+        if aggr_func_name == "AVG":
+            expr_type = float
+        elif aggr_func_name == "GROUP_CONCAT":
+            expr_type = str
+        else:
+            expr_type = translator.expr_type
+        provider = self._database.provider
+        converter = provider.get_converter_by_py_type(expr_type)
+        return converter.sql2py(result)
 
     @cut_traceback
     def sum(self, distinct=None):
@@ -9151,7 +9387,12 @@ class QueryResult:
         self._query = query
         self._limit = limit
         self._offset = offset
-        self._items = None if lazy else self._query._actual_fetch(limit, offset)
+        cache = query._database._get_cache()
+        if not lazy and not (cache is not None and cache.is_async):
+            # В async-сессии результат остаётся ленивым: его получает `await query[:n]`
+            self._items = self._query._actual_fetch(limit, offset)
+        else:
+            self._items = None
         self._expr_type = translator.expr_type
         self._col_names = translator.col_names
 
@@ -9199,6 +9440,13 @@ class QueryResult:
 
     def __iter__(self):
         return QueryResultIterator(self)
+
+    def __await__(self):
+        """`await query[:10]` / `await query.limit(5)` — выборка среза в async-режиме."""
+        return query_fetch_gen(self._query, self._limit, self._offset).__await__()
+
+    def _is_async(self):
+        return self._query._is_async()
 
     def __len__(self):
         if self._items is None:

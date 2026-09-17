@@ -21,11 +21,21 @@ def drive(coro):
 
     All awaits inside must complete synchronously (I/O only through
     ProviderOps); this is the sync driver for Gen-classes.
+
+    A coroutine that does not finish on the first step means the sync driver was
+    given a real async coroutine (an async session reached a sync-only code
+    path). Silent suspension used to produce `None` and obscure errors such as
+    "object of type 'NoneType' has no len()"; now it is a loud error.
     """
+    iterator = coro.__await__()
     try:
-        next(coro.__await__())
+        next(iterator)
     except StopIteration as ex:
         return ex.value
+    raise RuntimeError(
+        "drive() got a coroutine with real await points: "
+        "an async session reached a sync-only code path (see docs/async.md)"
+    )
 
 
 class Delegate:

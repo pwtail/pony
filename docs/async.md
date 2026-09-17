@@ -62,18 +62,110 @@ async with db_session:
         ...
 ```
 
+## Запросы: агрегаты, срезы, поиск, bulk-удаление
+
+Все операции, исполняющие SQL, в async-режиме возвращают корутину:
+
+```python
+async with db_session:
+    # агрегаты
+    n = await select(x for x in Person).count()
+    total = await select(x.age for x in Person).sum()
+    avg_age = await select(x.age for x in Person).avg()
+    oldest = await select(x.age for x in Person).max()
+    top = await select(x for x in Person).order_by(Person.age).first()
+    found = await select(x for x in Person).exists()
+    n = await count(x for x in Person)          # модульный агрегат по генератору
+
+    # срезы и пагинация
+    page = await select(x for x in Person).order_by(Person.name)[:10]
+    page = await select(x for x in Person).limit(10, offset=20)
+    page = await select(x for x in Person).page(2, pagesize=10)
+
+    # доступ по первичному ключу и поиск по атрибутам
+    person = await Person[1]
+    person = await Person.get(name="Ann")
+    exists = await Person.exists(name="Ann")
+    name = await get(x.name for x in Person if x.age == 30)
+
+    # удаление
+    deleted = await delete(x for x in Person if x.age < 18)          # по объектам
+    deleted = await select(x for x in Person if x.age < 18).delete(bulk=True)   # одним SQL
+
+    # m2m-мутации
+    person.tags.add(tag)
+    person.tags.remove(tag)
+```
+
+## Два правила при работе с коллекциями
+
+**1. Коллекции отдают seed-объекты.** После `await obj.related_set` элементы загружены
+частично (известен только их первичный ключ), поэтому их атрибуты догружаются явно:
+
+```python
+async with db_session:
+    person = await select(p for p in Person).first()
+    await person.cars
+    for car in person.cars:
+        await car.load()          # или await car.load("make")
+        print(car.make)
+```
+
+**2. Удаление объекта с коллекциями требует их предварительной загрузки.** В async-режиме
+`obj.delete()` не догружает коллекции сам (в sync-режиме это происходит неявно), поэтому
+m2m- и cascade-коллекции нужно загрузить заранее. Bulk-удаление коллекций не требует:
+
+```python
+async with db_session:
+    person = await Person[1]
+    await person.tags             # коллекцию нужно загрузить
+    person.delete()
+
+async with db_session:
+    await delete(p for p in Person if p.age < 18)    # bulk — без загрузки коллекций
+```
+
 ## Транзакции
 
-`await commit()` / `await rollback()` / `await flush()` — async-аналоги
-глобальных функций (внутри async-сессии). Флаги `db_session` работают как
-в sync (`immediate`, `serializable`, `optimistic`, `allowed_exceptions`).
+Транзакция коммитится при выходе из `async with db_session:` и откатывается,
+если внутри сессии было исключение. Явные операции доступны и внутри сессии —
+в async-режиме те же функции возвращают корутину:
+
+```python
+async with db_session:
+    ...
+    await flush()        # отправить изменения в базу
+    await commit()       # зафиксировать транзакцию
+    await rollback()     # откатить
+```
+
+Есть и явные async-имена (то же самое, для кода без двусмысленности):
+`async_flush`, `async_commit`, `async_rollback`.
+
+Флаги `db_session` работают как в sync (`immediate`, `serializable`,
+`optimistic`, `allowed_exceptions`).
 
 ## Ограничения (текущее состояние)
 
-- PostgreSQL (psycopg3) и MariaDB (коннектор `mariadb` 2.0RC); остальные диалекты — sync.
-- `prefetch()` в async-режиме — `NotImplementedError` (используйте явный `load()`).
-- `await Entity[pk]` не реализован: `Entity[pk]` — синхронная операция,
-  в async-сессии запрещена; выборка по pk — через `select(...)`.
+> **Важно:** это не полная замена синхронного режима. Всё перечисленное ниже в
+> async-сессии поднимает `TransactionError` с подсказкой (а не работает «наполовину»).
+
+- PostgreSQL (psycopg3) и MariaDB / MySQL (коннектор `mariadb` 2.0RC); остальные
+  диалекты — sync.
+- **Синхронная форма доступа по ключу** (`Person[1]` без `await`) в async-сессии
+  недоступна: `Person[1]` возвращает awaitable-объект, обращение к нему без `await`
+  даёт `TransactionError` с подсказкой. Правильная форма — `await Person[1]`
+  (кэш → запрос) или `await Person.get(...)`.
+- Коллекции отдают seed-объекты, а удаление объекта с коллекциями требует их
+  загрузки — см. «Два правила при работе с коллекциями» выше.
+- `prefetch()` — `NotImplementedError` (используйте явный `load()`).
 - `load()` для reverse-атрибутов без собственных колонок — `NotImplementedError`.
-- Schema-операции (`generate_mapping`, `create_tables`) — только sync.
+- Schema-операции (`generate_mapping`, `create_tables`) — только sync, вне корутины.
+- Декораторы `@db_session` и `@transaction` — sync-only; в async используйте
+  `async with db_session:`.
 - Смешение sync- и async-сессий в одной транзакции не поддерживается.
+- Синхронная операция, вызванная в async-сессии, поднимает `TransactionError`
+  с подсказкой (раньше в части путей она давала невнятную ошибку или `None`).
+
+Обзор обоих режимов и примеры — в документации (`pony-doc`: `index.rst`,
+раздел «Async mode» в `firststeps.rst`).

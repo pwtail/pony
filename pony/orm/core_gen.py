@@ -48,6 +48,20 @@ async def exec_sql_gen(
     return new_id
 
 
+async def add_m2m_gen(attr, added):
+    """Исполнение m2m-вставок (sync и async): SQL строит sync-хелпер атрибута."""
+    database = attr.entity._database_
+    sql, arguments_list = attr._m2m_add_sql_and_arguments(added)
+    await exec_sql_gen(database, sql, arguments_list)
+
+
+async def remove_m2m_gen(attr, removed):
+    """Исполнение m2m-удалений (sync и async)."""
+    database = attr.entity._database_
+    sql, arguments_list = attr._m2m_remove_sql_and_arguments(removed)
+    await exec_sql_gen(database, sql, arguments_list)
+
+
 async def save_created_gen(obj):
     auto_pk = obj._pkval_ is None
     attrs = []
