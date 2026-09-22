@@ -1795,6 +1795,12 @@ class Database:
                                 "Parameter 'column' is not allowed for many-to-one attribute %s"
                                 % attr,
                             )
+                        elif attr.pk_name is not None:
+                            throw(
+                                MappingError,
+                                "Parameter 'pk_name' is not allowed for many-to-one attribute %s"
+                                % attr,
+                            )
                         continue
                     # many-to-many:
                     if not isinstance(reverse, Set):
@@ -1865,7 +1871,23 @@ class Database:
                         m2m_table.add_column(
                             column_name, converter.get_sql_type(), converter, True
                         )
-                    m2m_table.add_index(None, tuple(m2m_table.column_list), is_pk=True)
+                    if attr.pk_name:
+                        if not reverse.pk_name:
+                            reverse.pk_name = attr.pk_name
+                        elif reverse.pk_name != attr.pk_name:
+                            throw(
+                                MappingError,
+                                "Parameter 'pk_name' for %s and %s do not match"
+                                % (attr, reverse),
+                            )
+                        pk_name = attr.pk_name
+                    elif reverse.pk_name:
+                        pk_name = attr.pk_name = reverse.pk_name
+                    else:
+                        pk_name = None
+                    m2m_table.add_index(
+                        pk_name, tuple(m2m_table.column_list), is_pk=True
+                    )
                     m2m_table.m2m.add(attr)
                     m2m_table.m2m.add(reverse)
                 else:
@@ -2961,6 +2983,7 @@ class Attribute:
         "is_unique",
         "is_part_of_unique_index",
         "is_pk",
+        "pk_constraint_name",
         "is_collection",
         "is_relation",
         "is_basic",
@@ -3035,6 +3058,12 @@ class Attribute:
             self.pk_offset = 0
         else:
             self.pk_offset = None
+        self.pk_constraint_name = None
+        if self.is_pk:
+            name = kwargs.pop("name", None)
+            if name is not None and not isinstance(name, str):
+                throw(TypeError, "PrimaryKey name must be a string. Got: %r" % name)
+            self.pk_constraint_name = name
         self.id = next(attr_id_counter)
         if not isinstance(py_type, (type, str, types.FunctionType, Array)):
             if py_type is datetime:
@@ -4369,11 +4398,6 @@ class PrimaryKey(Required):
         cls_dict = sys._getframe(1).f_locals
 
         if not attrs:
-            if name is not None:
-                throw(
-                    TypeError,
-                    "PrimaryKey name option requires composite primary key",
-                )
             return Required.__new__(cls)
         elif non_attrs or kwargs:
             throw(TypeError, "PrimaryKey got invalid arguments: %r %r" % (args, kwargs))
@@ -4419,6 +4443,7 @@ class Collection(Attribute):
         "cached_count_sql",
         "cached_empty_sql",
         "reverse_fk_name",
+        "pk_name",
     )
 
     def __init__(self, py_type, *args, **kwargs):
@@ -4480,6 +4505,12 @@ class Collection(Attribute):
             self.reverse_columns = []
 
         self.reverse_fk_name = kwargs.pop("reverse_fk_name", None)
+        self.pk_name = kwargs.pop("pk_name", None)
+        if self.pk_name is not None and not isinstance(self.pk_name, str):
+            throw(
+                TypeError,
+                "Parameter 'pk_name' must be a string. Got: %r" % self.pk_name,
+            )
 
         self.nplus1_threshold = kwargs.pop("nplus1_threshold", 1)
         self.cached_load_sql = {}
@@ -5947,7 +5978,10 @@ class EntityMeta(type):
         for attr in new_attrs:
             if attr.is_unique:
                 unique_value = attr.is_unique
-                name = unique_value if isinstance(unique_value, str) else None
+                if isinstance(attr, PrimaryKey):
+                    name = attr.pk_constraint_name
+                else:
+                    name = unique_value if isinstance(unique_value, str) else None
                 indexes.append(
                     Index(
                         attr,

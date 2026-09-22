@@ -175,7 +175,7 @@ class Table(DBObject):
             cmd.append(case("CREATE TABLE IF NOT EXISTS %s (") % quote_name(self.name))
         for column in self.column_list:
             cmd.append(schema.indent + column.get_sql() + ",")
-        if len(self.pk_index.columns) > 1:
+        if len(self.pk_index.columns) > 1 or self.pk_index.name is not None:
             cmd.append(schema.indent + self.pk_index.get_sql() + ",")
         indexes = [
             index
@@ -376,6 +376,10 @@ class Table(DBObject):
 class Column:
     auto_template = "%(type)s PRIMARY KEY AUTOINCREMENT"
     identity_template = None
+    # Варианты без inline PRIMARY KEY — для именованного PK-констрейнта
+    # (PRIMARY KEY выносится в CONSTRAINT ... PRIMARY KEY (...)).
+    auto_template_named = None
+    identity_template_named = None
 
     def __init__(
         self,
@@ -413,6 +417,13 @@ class Column:
         schema = table.schema
         quote_name = schema.provider.quote_name
         case = schema.case
+        pk_index = table.pk_index
+        named_pk = (
+            bool(self.is_pk)
+            and pk_index is not None
+            and pk_index.name is not None
+            and len(pk_index.columns) == 1
+        )
         result = []
         append = result.append
         append(quote_name(self.name))
@@ -427,11 +438,17 @@ class Column:
             and self.auto_template
             and self.converter.py_type in int_types
         ):
-            template = (
-                self.identity_template
-                if self.is_pk == "identity" and self.identity_template
-                else self.auto_template
-            )
+            if named_pk:
+                if self.is_pk == "identity" and self.identity_template_named:
+                    template = self.identity_template_named
+                else:
+                    template = self.auto_template_named
+            else:
+                template = (
+                    self.identity_template
+                    if self.is_pk == "identity" and self.identity_template
+                    else self.auto_template
+                )
             append(case(template % dict(type=self.sql_type)))
             add_default()
         else:
@@ -440,7 +457,8 @@ class Column:
             if self.is_pk:
                 if schema.dialect == "SQLite":
                     append(case("NOT NULL"))
-                append(case("PRIMARY KEY"))
+                if not named_pk:
+                    append(case("PRIMARY KEY"))
             else:
                 index = table.indexes.get((self,))
                 if self.is_unique and not (
@@ -569,6 +587,15 @@ class DBIndex(Constraint):
             throw(
                 TypeError,
                 "'nulls_not_distinct' option is allowed only for unique indexes",
+            )
+        if (
+            name is not None
+            and is_pk in ("auto", "identity")
+            and schema.provider.dialect == "SQLite"
+        ):
+            throw(
+                TypeError,
+                "Named autoincrement primary key is not supported in SQLite",
             )
         if is_pk == "identity" and schema.provider.dialect != "PostgreSQL":
             throw(

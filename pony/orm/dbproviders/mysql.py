@@ -53,6 +53,7 @@ from pony.utils import throw
 
 class MySQLColumn(dbschema.Column):
     auto_template = "%(type)s PRIMARY KEY AUTO_INCREMENT"
+    auto_template_named = "%(type)s AUTO_INCREMENT"
 
 
 class MySQLSchema(dbschema.DBSchema):

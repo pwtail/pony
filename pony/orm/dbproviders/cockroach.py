@@ -34,6 +34,7 @@ NoneType = type(None)
 
 class CRColumn(PGColumn):
     auto_template = "SERIAL PRIMARY KEY"
+    auto_template_named = "SERIAL"
 
 
 class CRSchema(PGSchema):
