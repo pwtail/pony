@@ -41,6 +41,7 @@ from pony.orm.dbapiprovider import (
 )
 from pony.orm.decompiling import decompile
 from pony.orm.drive import drive
+from pony.orm.ops import ops_for
 # Gen-функции и кэш сессии импортируются на уровне модуля: core_gen обращается
 # к атрибутам core только во время вызова, поэтому цикл core <-> core_gen
 # безопасен (раньше импорт был ленивым — внутри каждой функции).
@@ -625,25 +626,10 @@ def _async_caches():
     return caches
 
 
-def _in_async_context():
-    """True, если код исполняется внутри корутины.
-
-    Сессия создаётся лениво — при первом обращении к базе, — поэтому в самом начале
-    `async with db_session:` кэшей ещё нет. Проверка по работающему loop нужна,
-    чтобы `await flush()/commit()/rollback()` в этот момент тоже получали корутину,
-    а не None (иначе await падал с TypeError).
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return False
-    return True
-
-
 @cut_traceback
 def flush():
-    # В async-сессии те же функции возвращают корутину: await flush()
-    if _async_caches() is not None or _in_async_context():
+    # В async-сессии те же функции возвращают корутину: await flush().
+    if _async_caches() is not None or local.async_db_context:
         return async_flush()
     for cache in _get_caches():
         cache.flush()
@@ -672,12 +658,22 @@ def rollback_and_reraise(exc_info):
 
 @cut_traceback
 def commit():
+    if _async_caches() is not None or local.async_db_context:
+        # В async-режиме: await commit(). Проверка идёт до раннего выхода по
+        # отсутствию кэшей: сессия могла ещё не обращаться к базе (кэш ленивый),
+        # но флаг открытой async-сессии уже выставлен.
+        #   local.async_db_context — открыта именно async-сессия: точный признак,
+        #                           не зависящий от того, как среда запускает код
+        #                           (Jupyter, фреймворк, своя задача);
+        #   _async_caches()        — живой async-кэш (низкоуровневые входы).
+        # Критерий — именно открытая async-сессия, а не «мы в корутине»: async with
+        # и @db_session на корутине эквивалентны, оба выставляют этот флаг, тогда как
+        # Jupyter/фреймворк запускают код — не наше дело, и get_running_loop здесь
+        # критерием быть не может.
+        return async_commit()
     caches = _get_caches()
     if not caches:
         return
-    if _async_caches() is not None or _in_async_context():
-        # В async-сессии: await commit()
-        return async_commit()
 
     try:
         for cache in caches:
@@ -712,7 +708,7 @@ def commit():
 
 @cut_traceback
 def rollback():
-    if _async_caches() is not None or _in_async_context():
+    if _async_caches() is not None or local.async_db_context:
         # В async-сессии: await rollback()
         return async_rollback()
     exceptions = []
@@ -730,29 +726,6 @@ def rollback():
 
 
 select_re = re.compile(r"\s*select\b", re.IGNORECASE)
-
-
-def _running_in_user_coroutine():
-    """True, если текущий код исполняется внутри пользовательской корутины.
-
-    Jupyter/ipykernel исполняет даже sync-ячейки внутри своей внутренней
-    задачи — такие встраивания сами блокируют свой event loop, и защищать
-    от них не нужно (иначе sync-код в ноутбуках работать не сможет).
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return False
-    task = asyncio.current_task()
-    if task is None:
-        return False
-    coro = task.get_coro()
-    if coro is None or coro.cr_code is None:
-        return False
-    filename = coro.cr_code.co_filename
-    if "ipykernel" in filename or "jupyter" in filename:
-        return False
-    return True
 
 
 class DBSessionContextManager:
@@ -835,11 +808,12 @@ class DBSessionContextManager:
                 "Pass only keyword arguments to db_session or use db_session as decorator",
             )
         func = args[0]
-        if isgeneratorfunction(func) or (
-            hasattr(inspect, "iscoroutinefunction")
-            and inspect.iscoroutinefunction(func)
-        ):
+        if isgeneratorfunction(func):
             return self._wrap_coroutine_or_generator_function(func)
+        if hasattr(inspect, "iscoroutinefunction") and inspect.iscoroutinefunction(
+            func
+        ):
+            return self._wrap_async_function(func)
         return self._wrap_function(func)
 
     def __enter__(self):
@@ -848,11 +822,11 @@ class DBSessionContextManager:
                 TypeError,
                 "@db_session can accept 'retry' parameter only when used as decorator and not as context manager",
             )
-        if _running_in_user_coroutine():
+        if local.async_db_context:
             throw(
                 TransactionError,
-                "sync db_session cannot be used inside a coroutine; "
-                "use 'async with db_session:'",
+                "sync db_session cannot be used inside an async db_session: "
+                "mixing the two modes is not supported, use 'async with db_session:'",
             )
         self._enter()
 
@@ -862,15 +836,23 @@ class DBSessionContextManager:
                 TypeError,
                 "@db_session can accept 'retry' parameter only when used as decorator and not as context manager",
             )
+        await self._async_enter()
+        return self
+
+    async def _async_enter(self):
+        """Вход в сессию без проверок, рассчитанных на пользователя (для декоратора)."""
         local.async_db_context += 1
         try:
             self._enter()
         except BaseException:
             local.async_db_context -= 1
             raise
-        return self
 
     async def __aexit__(self, exc_type=None, exc=None, tb=None):
+        await self._async_exit(exc_type, exc, tb)
+
+    async def _async_exit(self, exc_type=None, exc=None, tb=None):
+        """Выход из сессии: commit/rollback и освобождение соединения."""
         local.db_context_counter -= 1
         try:
             if not local.db_context_counter:
@@ -1035,6 +1017,80 @@ class DBSessionContextManager:
                 del exc, tb
 
         return decorator(new_func, func)
+
+    def _wrap_async_function(self, func):
+        """Оборачивает async-функцию в асинхронную сессию.
+
+        Аналог _wrap_function для корутин: на вызов открывается сессия
+        (async with db_session), на выходе commit, при исключении rollback и,
+        если исключение в retry_exceptions, повтор. Опция ddl не поддерживается:
+        schema-операции синхронные.
+        """
+
+        @wraps(func)
+        async def new_async_func(*args, **kwargs):
+            if local.async_db_context:
+                # вызов внутри уже открытой async-сессии
+                if self.ddl:
+                    throw(
+                        TransactionError,
+                        "@db_session-decorated %s() function with `ddl` option "
+                        "cannot be called inside of another db_session"
+                        % func.__name__,
+                    )
+                if self.retry:
+                    message = (
+                        "@db_session decorator with `retry=%d` option is ignored for %s() "
+                        "function because it is called inside another db_session"
+                        % (self.retry, func.__name__)
+                    )
+                    warnings.warn(message, PonyRuntimeWarning, stacklevel=3)
+                if self.sql_debug is None:
+                    return await func(*args, **kwargs)
+                local.push_debug_state(self.sql_debug, self.show_values)
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    local.pop_debug_state()
+
+            if self.ddl:
+                throw(
+                    TransactionError,
+                    "'ddl' option of db_session is not supported for async functions: "
+                    "schema operations are synchronous, call them outside a coroutine",
+                )
+
+            exc = tb = None
+            try:
+                for _i in range(self.retry + 1):
+                    await self._async_enter()
+                    exc_type = exc = tb = None
+                    try:
+                        result = await func(*args, **kwargs)
+                        await commit()
+                        return result
+                    except BaseException:
+                        exc_type, exc, tb = sys.exc_info()
+                        if getattr(exc, "should_retry", False):
+                            do_retry = True
+                        else:
+                            retry_exceptions = self.retry_exceptions
+                            if not callable(retry_exceptions):
+                                do_retry = issubclass(
+                                    exc_type, tuple(retry_exceptions)
+                                )
+                            else:
+                                do_retry = retry_exceptions(exc)
+                        if not do_retry:
+                            raise
+                        await rollback()
+                    finally:
+                        await self._async_exit(exc_type, exc, tb)
+                reraise(exc_type, exc, tb)
+            finally:
+                del exc, tb
+
+        return new_async_func
 
     def _wrap_coroutine_or_generator_function(self, gen_func):
         for option in ("ddl", "retry", "serializable"):
@@ -1437,12 +1493,9 @@ class Database:
                 )
             cache = local.db2cache[self] = AsyncSessionCache(self)
         else:
-            if _running_in_user_coroutine():
-                throw(
-                    TransactionError,
-                    "sync database access cannot be used inside a coroutine; "
-                    "use 'async with db_session:'",
-                )
+            # Сюда попадаем только вне async-сессии: синхронный доступ разрешён
+            # (в том числе внутри корутины — тогда это осознанный блокирующий
+            # вызов; смешение режимов ловят guard'ы ниже).
             cache = local.db2cache[self] = SyncSessionCache(self)
         return cache
 
@@ -1483,6 +1536,12 @@ class Database:
 
     @cut_traceback
     def execute(self, sql, globals=None, locals=None):
+        if _async_caches() is not None or local.async_db_context:
+            # В async-сессии: await db.execute(...)
+            # кадра sync-обёртки в стеке нет: отсчёт идёт от вызывающей корутины
+            return self._async_exec_raw_sql(
+                sql, globals, locals, start_transaction=True, frame_depth=0
+            )
         return self._exec_raw_sql(
             sql,
             globals,
@@ -1505,10 +1564,71 @@ class Database:
         arguments = eval(code, globals, locals)
         return self._exec_sql(adapted_sql, arguments, False, start_transaction)
 
+    async def _async_exec_raw_sql(
+        self, sql, globals=None, locals=None, start_transaction=False, frame_depth=0
+    ):
+        """Асинхронный аналог _exec_raw_sql: возвращает курсор."""
+        provider = self.provider
+        if provider is None:
+            throw(MappingError, "Database object is not bound with a provider yet")
+        if globals is None:
+            assert locals is None
+            frame_depth += 1
+            globals = sys._getframe(frame_depth).f_globals
+            locals = sys._getframe(frame_depth).f_locals
+        adapted_sql, code = adapt_sql(sql, provider.paramstyle)
+        arguments = eval(code, globals, locals)
+        return await exec_sql_gen(self, adapted_sql, arguments, False, start_transaction)
+
+    async def _async_select(self, sql, globals=None, locals=None, frame_depth=0):
+        """Асинхронный аналог select(): список строк (или значений одной колонки)."""
+        cursor = await self._async_exec_raw_sql(
+            sql, globals, locals, frame_depth=frame_depth + 1
+        )
+        ops = ops_for(self.provider, True)
+        max_fetch_count = options.MAX_FETCH_COUNT
+        if max_fetch_count is not None:
+            result = await ops.fetchmany(cursor, max_fetch_count)
+            if await ops.fetchone(cursor) is not None:
+                throw(TooManyRowsFound)
+        else:
+            result = await ops.fetchall(cursor)
+        if len(cursor.description) == 1:
+            return [row[0] for row in result]
+        row_class = type("row", (tuple,), {})
+        for i, column_info in enumerate(cursor.description):
+            column_name = column_info[0]
+            if not is_ident(column_name):
+                continue
+            if hasattr(tuple, column_name) and column_name.startswith("__"):
+                continue
+            setattr(row_class, column_name, property(itemgetter(i)))
+        return [row_class(row) for row in result]
+
+    async def _async_get(self, sql, globals=None, locals=None, frame_depth=0):
+        rows = await self._async_select(
+            sql, globals, locals, frame_depth=frame_depth + 1
+        )
+        if not rows:
+            throw(RowNotFound)
+        if len(rows) > 1:
+            throw(MultipleRowsFound)
+        return rows[0]
+
+    async def _async_exists(self, sql, globals=None, locals=None, frame_depth=0):
+        cursor = await self._async_exec_raw_sql(
+            sql, globals, locals, frame_depth=frame_depth + 1
+        )
+        ops = ops_for(self.provider, True)
+        return bool(await ops.fetchone(cursor))
+
     @cut_traceback
     def select(self, sql, globals=None, locals=None, frame_depth=0):
         if not select_re.match(sql):
             sql = "select " + sql
+        if _async_caches() is not None or local.async_db_context:
+            # В async-сессии: await db.select(...)
+            return self._async_select(sql, globals, locals, frame_depth)
         cursor = self._exec_raw_sql(
             sql, globals, locals, frame_depth + cut_traceback_depth + 1
         )
@@ -1533,6 +1653,9 @@ class Database:
 
     @cut_traceback
     def get(self, sql, globals=None, locals=None):
+        if _async_caches() is not None or local.async_db_context:
+            # В async-сессии: await db.get(...)
+            return self._async_get(sql, globals, locals, 0)
         rows = self.select(sql, globals, locals, frame_depth=cut_traceback_depth + 1)
         if not rows:
             throw(RowNotFound)
@@ -1545,6 +1668,9 @@ class Database:
     def exists(self, sql, globals=None, locals=None):
         if not select_re.match(sql):
             sql = "select " + sql
+        if _async_caches() is not None or local.async_db_context:
+            # В async-сессии: await db.exists(...)
+            return self._async_exists(sql, globals, locals, 0)
         cursor = self._exec_raw_sql(
             sql, globals, locals, frame_depth=cut_traceback_depth + 1
         )
@@ -4532,48 +4658,12 @@ class Set(Collection):
                 cursor = database._exec_sql(sql, arguments)
                 result.update(rentity._fetch_objects(cursor, attr_offsets))
         else:
-            pk_len = len(entity._pk_columns_)
-            m2m_dict = defaultdict(set)
             for i in range(0, len(objects), max_batch_size):
                 batch = objects[i : i + max_batch_size]
                 sql, adapter = self.construct_sql_m2m(len(batch))
                 arguments = adapter(batch)
                 cursor = database._exec_sql(sql, arguments)
-                if len(batch) > 1:
-                    for row in cursor.fetchall():
-                        obj = entity._get_by_raw_pkval_(row[:pk_len])
-                        item = rentity._get_by_raw_pkval_(row[pk_len:])
-                        m2m_dict[obj].add(item)
-                else:
-                    obj = batch[0]
-                    m2m_dict[obj] = {
-                        rentity._get_by_raw_pkval_(row) for row in cursor.fetchall()
-                    }
-
-                for obj2, items in m2m_dict.items():
-                    setdata2 = obj2._vals_.get(self)
-                    if setdata2 is None:
-                        setdata2 = obj2._vals_[self] = SetData()
-                    else:
-                        phantoms = setdata2 - items
-                        if setdata2.added:
-                            phantoms -= setdata2.added
-                        if phantoms and not self.is_volatile:
-                            throw(
-                                UnrepeatableReadError,
-                                "Phantom object %s disappeared from collection %s.%s"
-                                % (
-                                    safe_repr(phantoms.pop()),
-                                    safe_repr(obj2),
-                                    self.name,
-                                ),
-                            )
-                    items -= setdata2
-                    if setdata2.removed:
-                        items -= setdata2.removed
-                    setdata2 |= items
-                    reverse.db_reverse_add(items, obj2)
-                    result.update(items)
+                self._prefetch_load_all_m2m_rows(batch, cursor.fetchall(), result)
         for obj in objects:
             setdata = obj._vals_.get(self)
             if setdata is None:
@@ -4582,6 +4672,43 @@ class Set(Collection):
             setdata.absent = None
             setdata.count = len(setdata)
         return result
+
+    def _prefetch_load_all_m2m_rows(self, batch, rows, result):
+        """Разбор строк батча m2m-загрузки (общий код sync- и async-режимов)."""
+        entity = self.entity
+        rentity = self.reverse.entity
+        pk_len = len(entity._pk_columns_)
+        m2m_dict = defaultdict(set)
+        if len(batch) > 1:
+            for row in rows:
+                obj = entity._get_by_raw_pkval_(row[:pk_len])
+                item = rentity._get_by_raw_pkval_(row[pk_len:])
+                m2m_dict[obj].add(item)
+        else:
+            obj = batch[0]
+            m2m_dict[obj] = {rentity._get_by_raw_pkval_(row) for row in rows}
+
+        reverse = self.reverse
+        for obj2, items in m2m_dict.items():
+            setdata2 = obj2._vals_.get(self)
+            if setdata2 is None:
+                setdata2 = obj2._vals_[self] = SetData()
+            else:
+                phantoms = setdata2 - items
+                if setdata2.added:
+                    phantoms -= setdata2.added
+                if phantoms and not self.is_volatile:
+                    throw(
+                        UnrepeatableReadError,
+                        "Phantom object %s disappeared from collection %s.%s"
+                        % (safe_repr(phantoms.pop()), safe_repr(obj2), self.name),
+                    )
+            items -= setdata2
+            if setdata2.removed:
+                items -= setdata2.removed
+            setdata2 |= items
+            reverse.db_reverse_add(items, obj2)
+            result.update(items)
 
     def load(self, obj, items=None):
         cache = obj._session_cache_
@@ -5625,20 +5752,27 @@ class AsyncEntityLookup:
     async def _load(self):
         cls, key = self._cls, self._key
         if len(key) != len(cls._pk_attrs_):
-            # ключ задан «сырыми» колонками pk: доступно только кэш-попадание
-            pkval = cls._pkval_from_raw_pkval_(key)
-            obj = cls._database_._get_cache().indexes[cls._pk_attrs_].get(pkval)
-            if obj is not None:
-                return obj
-            throw(
-                TransactionError,
-                "lookup by raw primary key columns is not implemented in an async "
-                "session; use 'await %s.get(...)' or 'await select(...)'" % cls.__name__,
-            )
+            if len(key) != len(cls._pk_columns_):
+                throw(
+                    TypeError,
+                    "Invalid count of attrs in %s primary key (%s instead of %s)"
+                    % (cls.__name__, len(key), len(cls._pk_attrs_)),
+                )
+            # Ключ задан «сырыми» колонками pk (pk — составной related-объект):
+            # значения атрибутов собираем через seed-объект — это чистая память,
+            # без обращения к базе, — и ищем запросом по атрибутам pk.
+            seed = cls._get_by_raw_pkval_(key, from_db=False, seed=True)
+            kwargs = {attr.name: seed._vals_[attr] for attr in cls._pk_attrs_}
+            obj = await cls.select().filter(**kwargs).get()
+            if obj is None:
+                throw(ObjectNotFound, cls, seed)
+            return obj
         kwargs = {attr.name: value for attr, value in zip(cls._pk_attrs_, key)}
         avdict, pkval = cls._prepare_key_(kwargs)
         obj, _unique = cls._find_in_cache_(pkval, avdict)
-        if obj is not None:
+        if obj is not None and obj._dbvals_:
+            # объект уже загружен целиком — в базу не ходим; у seed-объекта
+            # (и у не полностью загруженного) _dbvals_ пуст, его надо догрузить
             return obj
         obj = await cls.select().filter(**kwargs).get()
         if obj is None:
@@ -9248,7 +9382,6 @@ class Query:
         self, aggr_func_name, sql, arguments, query_key, translator
     ):
         from pony.orm.core_gen import exec_sql_gen
-        from pony.orm.ops import ops_for
 
         database = self._database
         cache = database._get_cache()

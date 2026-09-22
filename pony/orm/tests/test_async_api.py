@@ -56,6 +56,15 @@ class TestAsyncAPI(unittest.TestCase):
             b = Required(int)
             value = Optional(str)
             PrimaryKey(a, b)
+            links = Set("Link")
+
+        class Link(db.Entity):
+            pair = PrimaryKey(Pair)          # pk = related-объект (составной ключ)
+            label = Required(str)
+
+        class Passport(db.Entity):
+            number = Required(str)
+            person = Required("Person")
 
         class Tag(db.Entity):
             name = Required(str)
@@ -67,13 +76,22 @@ class TestAsyncAPI(unittest.TestCase):
             dept = Required(Dept)
             bio = Optional(str, lazy=True)
             tags = Set(Tag)
+            passport = Optional(Passport)
 
-        cls.Dept, cls.Person, cls.Tag, cls.Pair = Dept, Person, Tag, Pair
+        cls.Dept, cls.Person, cls.Tag, cls.Pair, cls.Link, cls.Passport = (
+            Dept,
+            Person,
+            Tag,
+            Pair,
+            Link,
+            Passport,
+        )
         # сброс возможной устаревшей схемы от прошлых прогонов
         conn = psycopg.connect(DSN)
         conn.autocommit = True
         conn.cursor().execute(
-            "DROP TABLE IF EXISTS person, dept, tag, pair, tag_person CASCADE"
+            "DROP TABLE IF EXISTS person, dept, tag, pair, link, passport, "
+            "tag_person CASCADE"
         )
         conn.close()
         db.generate_mapping(create_tables=True)
@@ -81,7 +99,7 @@ class TestAsyncAPI(unittest.TestCase):
     def setUp(self):
         conn = psycopg.connect(DSN)
         conn.autocommit = True
-        conn.cursor().execute("TRUNCATE person, dept, tag, pair CASCADE")
+        conn.cursor().execute("TRUNCATE person, dept, tag, pair, link, passport CASCADE")
         conn.close()
 
     def test_create_commit_on_session_exit(self):
@@ -186,12 +204,37 @@ class TestAsyncAPI(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_sync_session_forbidden_in_coroutine(self):
+    def test_raw_sql(self):
+        """Сырой SQL в async-сессии: db.select / get / exists / execute."""
+
         async def scenario():
-            with self.assertRaises(TransactionError) as cm:
-                with db_session:
-                    pass
-            self.assertIn("async with", str(cm.exception))
+            async with db_session:
+                self.Dept(name="IT")
+            async with db_session:
+                x = "IT"
+                self.assertEqual(await self.db.select("name from dept where name = $x"), ["IT"])
+                self.assertEqual(await self.db.get("select name from dept where name = $x"), "IT")
+                self.assertTrue(await self.db.exists("select 1 from dept where name = $x"))
+                self.assertFalse(await self.db.exists("select 1 from dept where name = 'ZZ'"))
+                await self.db.execute("update dept set name = 'HR' where name = $x")
+            async with db_session:
+                self.assertEqual(await self.db.get("select name from dept"), "HR")
+
+        asyncio.run(scenario())
+
+    def test_modes_cannot_be_mixed(self):
+        """Sync-сессия внутри async-сессии — ошибка; вне async-сессии sync-код можно."""
+
+        async def scenario():
+            async with db_session:
+                with self.assertRaises(TransactionError) as cm:
+                    with db_session:
+                        pass
+                self.assertIn("async with", str(cm.exception))
+            # вне async-сессии синхронный код работает и внутри корутины:
+            # это осознанный блокирующий вызов (критерий — открытая async-сессия)
+            with db_session:
+                self.Dept(name="sync-in-coroutine")
 
         asyncio.run(scenario())
 
@@ -326,6 +369,7 @@ class TestAsyncAPI(unittest.TestCase):
             async with db_session:
                 await flush()
                 await rollback()
+                await commit()          # в сессии без обращений к базе
             async with db_session:
                 self.Dept(name="IT")
                 await flush()
@@ -357,6 +401,7 @@ class TestAsyncAPI(unittest.TestCase):
             async with db_session:
                 person = await self.Person.get(name="bob")
                 await person.tags                       # нужна загруженная m2m-коллекция
+                await person.load("passport")           # и обратная связь без колонок
                 self.assertEqual(await delete(x for x in self.Person if x.name == "bob"), 1)
             async with db_session:
                 self.assertEqual(await select(x for x in self.Person).count(), 1)
@@ -430,6 +475,97 @@ class TestAsyncAPI(unittest.TestCase):
                 with self.assertRaises(TransactionError) as cm:
                     self.Dept[dept_pk].name
                 self.assertIn("await", str(cm.exception))
+
+        asyncio.run(scenario())
+
+    def test_raw_primary_key_lookup(self):
+        """await Entity[raw-pk]: pk — related-объект с составным ключом."""
+
+        async def scenario():
+            async with db_session:
+                pair = self.Pair(a=1, b=2, value="x")
+                self.Link(pair=pair, label="L")
+            async with db_session:
+                link = await self.Link[1, 2]          # «сырые» колонки pk
+                self.assertEqual(link.label, "L")
+                self.assertIs(await self.Link[1, 2], link)
+                pair = await self.Pair[1, 2]          # seed догружен запросом
+                self.assertEqual(pair.value, "x")
+                with self.assertRaises(ObjectNotFound):
+                    await self.Link[9, 9]
+
+        asyncio.run(scenario())
+
+    def test_load_reverse_attribute_without_columns(self):
+        """load() обратной стороны связи «один к одному»."""
+
+        async def scenario():
+            async with db_session:
+                person = self.Person(name="ann", dept=self.Dept(name="IT"))
+                self.Passport(number="123", person=person)
+            async with db_session:
+                person = await self.Person.get(name="ann")
+                with self.assertRaises(NotLoadedError):
+                    person.passport
+                await person.load("passport")
+                self.assertEqual(person.passport.number, "123")
+                self.assertEqual(person.passport.person.name, "ann")   # загружен целиком
+
+        asyncio.run(scenario())
+
+    def test_prefetch(self):
+        """prefetch() в async-сессии: связи догружаются батчами."""
+
+        async def scenario():
+            async with db_session:
+                for i in range(3):
+                    dept = self.Dept(name=f"d{i}")
+                    self.Person(name=f"p{i}", dept=dept, tags=[self.Tag(name=f"t{i}")])
+            async with db_session:
+                persons = await select(x for x in self.Person).prefetch(self.Person.dept)
+                self.assertEqual(
+                    sorted({p.dept.name for p in persons}), ["d0", "d1", "d2"]
+                )   # to-one связь прочитана без await
+            async with db_session:
+                depts = await select(x for x in self.Dept).prefetch(self.Dept.persons)
+                self.assertEqual(sorted(len(d.persons) for d in depts), [1, 1, 1])
+            async with db_session:
+                tags = await select(x for x in self.Tag).prefetch(self.Tag.persons)
+                self.assertEqual(sorted(len(t.persons) for t in tags), [1, 1, 1])
+
+        asyncio.run(scenario())
+
+    def test_db_session_decorator_on_coroutine(self):
+        """@db_session на async-функции: commit, откат и retry."""
+
+        @db_session
+        async def add_dept(name):
+            self.Dept(name=name)
+            return name
+
+        @db_session
+        async def fail_to_add():
+            self.Dept(name="should-not-survive")
+            raise ValueError("boom")
+
+        attempts = []
+
+        @db_session(retry=2, retry_exceptions=[ZeroDivisionError])
+        async def flaky():
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise ZeroDivisionError
+            self.Dept(name="retried")
+
+        async def scenario():
+            self.assertEqual(await add_dept("IT"), "IT")
+            with self.assertRaises(ValueError):
+                await fail_to_add()
+            await flaky()
+            async with db_session:
+                names = sorted(d.name for d in await select(x for x in self.Dept))
+                self.assertEqual(names, ["IT", "retried"])     # без should-not-survive
+            self.assertEqual(len(attempts), 2)
 
         asyncio.run(scenario())
 

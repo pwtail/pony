@@ -37,9 +37,10 @@ async with db_session:
 # выход из сессии: flush + commit
 ```
 
-- Вход в **синхронный** `with db_session:` внутри корутины — ошибка
-  (`TransactionError`): он заблокировал бы event loop. Sync-код в потоках
-  (`run_in_executor`) работает как раньше.
+- Смешивать режимы нельзя: **синхронный** `with db_session:` внутри асинхронной сессии
+  (`async with db_session:` или `@db_session`-корутины) — ошибка (`TransactionError`
+  с подсказкой). Вне async-сессии синхронный код работает и внутри корутины: это
+  осознанный блокирующий вызов, поэтому sync-ячейки Jupyter тоже продолжают работать.
 - Одна async-сессия = одна задача; две задачи одновременно — две независимые
   сессии (соединения из общего пула, identity map изолирован).
 
@@ -57,6 +58,7 @@ async with db_session:
         ...
 
     await p.load("dept")           # загрузка атрибута (в т.ч. lazy и seed-объектов)
+    await p.load("passport")       # и обратной стороны связи «один к одному»
     await p.load()                 # загрузка всех незагруженных атрибутов
     async for rel in d.persons:     # async-итерация с загрузкой
         ...
@@ -82,7 +84,12 @@ async with db_session:
     page = await select(x for x in Person).limit(10, offset=20)
     page = await select(x for x in Person).page(2, pagesize=10)
 
-    # доступ по первичному ключу и поиск по атрибутам
+    # prefetch: связи догружаются заранее, батчами
+    persons = await select(p for p in Person).prefetch(Person.dept)
+    for p in persons:
+        p.dept.name                    # читается без await
+
+    # доступ по первичному ключу (простой, составной и «сырые» колонки)
     person = await Person[1]
     person = await Person.get(name="Ann")
     exists = await Person.exists(name="Ann")
@@ -145,10 +152,30 @@ async with db_session:
 Флаги `db_session` работают как в sync (`immediate`, `serializable`,
 `optimistic`, `allowed_exceptions`).
 
+## Декоратор @db_session
+
+Асинхронную функцию можно декорировать так же, как синхронную: на вызов открывается
+сессия, на выходе коммит, при исключении — откат, `retry` и `retry_exceptions` работают.
+
+```python
+@db_session
+async def add_person(name):
+    Person(name=name)          # commit при выходе из функции
+
+@db_session(retry=2, retry_exceptions=[ZeroDivisionError])
+async def flaky():
+    ...
+```
+
+Опция `ddl` для корутин запрещена (schema-операции синхронные), async-генераторы
+декоратор не поддерживает.
+
 ## Ограничения (текущее состояние)
 
-> **Важно:** это не полная замена синхронного режима. Всё перечисленное ниже в
-> async-сессии поднимает `TransactionError` с подсказкой (а не работает «наполовину»).
+> **Важно:** осталось совсем немного ограничений (ниже). Запросы, агрегаты, срезы,
+> prefetch, доступ по ключу, m2m-мутации, явные транзакции и `@db_session` на корутинах
+> в async-режиме работают; синхронная операция в async-сессии поднимает
+> `TransactionError` с подсказкой, а не молчаливый `None`.
 
 - PostgreSQL (psycopg3) и MariaDB / MySQL (коннектор `mariadb` 2.0RC); остальные
   диалекты — sync.
@@ -158,11 +185,12 @@ async with db_session:
   (кэш → запрос) или `await Person.get(...)`.
 - Коллекции отдают seed-объекты, а удаление объекта с коллекциями требует их
   загрузки — см. «Два правила при работе с коллекциями» выше.
-- `prefetch()` — `NotImplementedError` (используйте явный `load()`).
-- `load()` для reverse-атрибутов без собственных колонок — `NotImplementedError`.
-- Schema-операции (`generate_mapping`, `create_tables`) — только sync, вне корутины.
-- Декораторы `@db_session` и `@transaction` — sync-only; в async используйте
-  `async with db_session:`.
+- **Schema-операции** (`generate_mapping`, `create_tables`) — только sync: вызывайте их
+  до старта event loop. Внутри async-сессии они дают `TransactionError` (смешение
+  режимов), а внутри корутины вне сессии просто блокируют loop.
+- Async-генераторы (`async def` с `yield`) декоратор `@db_session` не поддерживает —
+  оборачивайте итерацию в `async with db_session:`. Обычные корутины и синхронные
+  генераторы — поддерживаются.
 - Смешение sync- и async-сессий в одной транзакции не поддерживается.
 - Синхронная операция, вызванная в async-сессии, поднимает `TransactionError`
   с подсказкой (раньше в части путей она давала невнятную ошибку или `None`).

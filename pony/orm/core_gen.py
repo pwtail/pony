@@ -1,4 +1,5 @@
 import time
+from collections import defaultdict
 from itertools import starmap
 from operator import attrgetter
 
@@ -375,10 +376,17 @@ async def load_many_gen(cls, objects):
 async def query_fetch_gen(query, limit=None, offset=None):
     translator = query._translator
     if query._prefetch:
-        throw(
-            core.NotImplementedError,
-            "prefetch() is not supported in async mode yet; use explicit fetch() calls",
-        )
+        # Как в синхронном QueryResult._actual_fetch: снимаем флаг на время
+        # выборки, затем догружаем связи из prefetch-контекста батчами.
+        saved = query._prefetch
+        query._prefetch = False
+        try:
+            with query._prefetch_context:
+                items = await query_fetch_gen(query, limit, offset)
+                await prefetch_gen(query, items)
+        finally:
+            query._prefetch = saved
+        return items
     with query._prefetch_context:
         sql, arguments, attr_offsets, query_key = (
             query._construct_sql_and_arguments(limit, offset)
@@ -433,6 +441,133 @@ async def query_fetch_gen(query, limit=None, offset=None):
         return items
 
 
+async def prefetch_load_all_gen(attr, objects):
+    """Асинхронный аналог Attribute.prefetch_load_all: батч-загрузка связи."""
+    entity = attr.entity
+    database = entity._database_
+    cache = database._get_cache()
+    if cache is None or not cache.is_alive:
+        throw(
+            core.DatabaseSessionIsOver,
+            "Cannot load objects from the database: the database session is over",
+        )
+    reverse = attr.reverse
+    rentity = reverse.entity
+    objects = sorted(objects, key=entity._get_raw_pkval_)
+    max_batch_size = database.provider.max_params_count // len(entity._pk_columns_)
+    ops = ops_for(database.provider, cache.is_async)
+    result = set()
+    if not reverse.is_collection:
+        for i in range(0, len(objects), max_batch_size):
+            batch = objects[i : i + max_batch_size]
+            sql, adapter, attr_offsets = rentity._construct_batchload_sql_(
+                len(batch), reverse
+            )
+            arguments = adapter(batch)
+            cursor = await exec_sql_gen(database, sql, arguments)
+            result.update(await fetch_objects_gen(rentity, cursor, attr_offsets))
+    else:
+        for i in range(0, len(objects), max_batch_size):
+            batch = objects[i : i + max_batch_size]
+            sql, adapter = attr.construct_sql_m2m(len(batch))
+            arguments = adapter(batch)
+            cursor = await exec_sql_gen(database, sql, arguments)
+            rows = await ops.fetchall(cursor)
+            attr._prefetch_load_all_m2m_rows(batch, rows, result)
+    for obj in objects:
+        setdata = obj._vals_.get(attr)
+        if setdata is None:
+            setdata = obj._vals_[attr] = core.SetData()
+        setdata.is_fully_loaded = True
+        setdata.absent = None
+        setdata.count = len(setdata)
+    return result
+
+
+async def prefetch_load_all_objects_gen(cls, objects):
+    """Асинхронный аналог EntityMeta._prefetch_load_all_: догрузка объектов."""
+    objects = sorted(objects, key=cls._get_raw_pkval_)
+    database = cls._database_
+    cache = database._get_cache()
+    if cache is None or not cache.is_alive:
+        throw(
+            core.DatabaseSessionIsOver,
+            "Cannot load objects from the database: the database session is over",
+        )
+    max_batch_size = database.provider.max_params_count // len(cls._pk_columns_)
+    for i in range(0, len(objects), max_batch_size):
+        batch = objects[i : i + max_batch_size]
+        sql, adapter, attr_offsets = cls._construct_batchload_sql_(len(batch))
+        arguments = adapter(batch)
+        cursor = await exec_sql_gen(database, sql, arguments)
+        await fetch_objects_gen(cls, cursor, attr_offsets)
+
+
+async def prefetch_gen(query, query_result):
+    """Асинхронная версия QueryResult._do_prefetch: обход prefetch-контекста."""
+    expr_type = query._translator.expr_type
+    all_objects = set()
+    objects_to_process = set()
+    objects_to_prefetch = set()
+
+    if isinstance(expr_type, core.EntityMeta):
+        objects_to_process.update(query_result)
+        all_objects.update(query_result)
+    elif type(expr_type) is tuple:
+        obj_indexes = [
+            i for i, t in enumerate(expr_type) if isinstance(t, core.EntityMeta)
+        ]
+        if obj_indexes:
+            for row in query_result:
+                objects_to_prefetch.update(row[i] for i in obj_indexes)
+            all_objects.update(objects_to_prefetch)
+
+    prefetch_context = core.local.prefetch_context
+    assert prefetch_context
+    collection_prefetch_dict = defaultdict(set)
+
+    objects_to_prefetch_dict = defaultdict(set)
+    while objects_to_process or objects_to_prefetch:
+        for obj in objects_to_process:
+            entity = obj.__class__
+            relations_to_prefetch = prefetch_context.get_relations_to_prefetch(entity)
+            for attr in relations_to_prefetch:
+                if attr.is_collection:
+                    collection_prefetch_dict[attr].add(obj)
+                else:
+                    if attr in obj._vals_:
+                        # значение связи уже в строке (обычно seed) — догрузит
+                        # батч prefetch_load_all_objects_gen ниже
+                        obj2 = obj._vals_[attr]
+                    else:
+                        obj2 = await load_attr_gen(obj, attr)
+                    if obj2 is not None and obj2 not in all_objects:
+                        all_objects.add(obj2)
+                        objects_to_prefetch.add(obj2)
+
+        next_objects_to_process = set()
+        for attr, objects in collection_prefetch_dict.items():
+            items = await prefetch_load_all_gen(attr, objects)
+            if attr.reverse.is_collection:
+                objects_to_prefetch.update(items)
+            else:
+                next_objects_to_process.update(
+                    item for item in items if item not in all_objects
+                )
+        collection_prefetch_dict.clear()
+
+        for obj in objects_to_prefetch:
+            objects_to_prefetch_dict[obj.__class__._root_].add(obj)
+        objects_to_prefetch.clear()
+
+        for entity, objects in objects_to_prefetch_dict.items():
+            next_objects_to_process.update(objects)
+            await prefetch_load_all_objects_gen(entity, objects)
+        objects_to_prefetch_dict.clear()
+
+        objects_to_process = next_objects_to_process
+
+
 async def load_obj_gen(obj):
     cache = obj._session_cache_
     if cache is None or not cache.is_alive:
@@ -485,10 +620,16 @@ async def load_attr_gen(obj, attr):
             await load_obj_gen(val)
         return val
     if not attr.columns:
-        throw(
-            core.NotImplementedError,
-            "fetch() of reverse attributes without columns is not supported yet",
+        # Обратная сторона связи «один к одному»: у этого атрибута нет колонок,
+        # связанный объект ищем запросом по reverse-атрибуту (как делает
+        # синхронный Attribute.load через _find_in_db_).
+        reverse = attr.reverse
+        assert reverse is not None and reverse.columns
+        related = (
+            await reverse.entity.select().filter(**{reverse.name: obj}).first()
         )
+        obj._vals_[attr] = related
+        return related
     if attr.lazy:
         entity = attr.entity
         database = entity._database_
