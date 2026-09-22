@@ -545,21 +545,25 @@ class DBIndex(Constraint):
         has_special_keys = key_spec is not None and any(
             order or expr for _, order, expr in key_spec
         )
-        if (
-            schema.provider.dialect != "PostgreSQL"
-            and (
-                using
-                or where is not None
-                or include
-                or nulls_not_distinct
-                or has_expressions
-                or has_special_keys
+        dialect = schema.provider.dialect
+        if dialect != "PostgreSQL" and (using or include or nulls_not_distinct):
+            throw(
+                TypeError,
+                "Index options 'using', 'include' and 'nulls_not_distinct' "
+                "are supported only in PostgreSQL",
             )
+        if dialect not in ("PostgreSQL", "SQLite") and (
+            has_expressions or has_special_keys
         ):
             throw(
                 TypeError,
-                "Index options 'using', 'where', 'include', 'nulls_not_distinct', "
-                "column order and RawSQL expressions are supported only in PostgreSQL",
+                "Index expressions and column order are supported only "
+                "in PostgreSQL and SQLite",
+            )
+        if where is not None and dialect not in ("PostgreSQL", "SQLite"):
+            throw(
+                TypeError,
+                "'where' option is supported only in PostgreSQL and SQLite",
             )
         if nulls_not_distinct and not is_unique:
             throw(

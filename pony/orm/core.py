@@ -1983,7 +1983,7 @@ class Database:
                     real_columns,
                     is_unique=index.is_unique,
                     using=index.using,
-                    where=index.where,
+                    where=_resolve_index_where(entity, index.where),
                     include=include_columns,
                     nulls_not_distinct=index.nulls_not_distinct,
                     key_spec=tuple(key_spec_items),
@@ -2072,7 +2072,7 @@ class Database:
                             columns,
                             is_unique=attr.is_unique,
                             using=attr.using,
-                            where=attr.where,
+                            where=_resolve_index_where(entity, attr.where),
                         )
             entity._initialize_bits_()
 
@@ -2944,6 +2944,15 @@ class DescWrapper:
 attr_id_counter = itertools.count(1)
 
 
+def _check_index_where(where):
+    if where is not None and not (callable(where) or isinstance(where, RawSQL)):
+        throw(
+            TypeError,
+            "'where' option must be a lambda or raw_sql() result. Got: %r" % where,
+        )
+    return where
+
+
 class Attribute:
     __slots__ = (
         "nullable",
@@ -3104,7 +3113,7 @@ class Attribute:
         self.index = kwargs.pop("index", None)
         self.reverse_index = kwargs.pop("reverse_index", None)
         self.using = kwargs.pop("using", None)
-        self.where = kwargs.pop("where", None)
+        self.where = _check_index_where(kwargs.pop("where", None))
         self.comment = kwargs.pop("comment", None)
         if self.comment is not None and not isinstance(self.comment, str):
             throw(
@@ -3122,8 +3131,6 @@ class Attribute:
             if isinstance(self, PrimaryKey):
                 throw(TypeError, "'using' option cannot be set for PrimaryKey attribute")
         if self.where is not None:
-            if not isinstance(self.where, str):
-                throw(TypeError, "'where' option must be a string. Got: %r" % self.where)
             if isinstance(self, PrimaryKey):
                 throw(TypeError, "'where' option cannot be set for PrimaryKey attribute")
         if (self.using is not None or self.where is not None) and self.is_collection:
@@ -3941,9 +3948,7 @@ class Index:
                     "Invalid index method %r. Allowed: btree, hash, gin, gist, brin"
                     % self.using,
                 )
-        self.where = options.pop("where", None)
-        if self.where is not None and not isinstance(self.where, str):
-            throw(TypeError, "Index 'where' option must be a string. Got: %r" % self.where)
+        self.where = _check_index_where(options.pop("where", None))
         self.include = options.pop("include", None)
         if self.include is not None:
             if not isinstance(self.include, (tuple, list)):
@@ -4269,29 +4274,22 @@ def _validate_constraint_ast(ast_node, func_name):
     return ast_node
 
 
-def _translate_constraint_check(entity, func):
+def _translate_boolean_func(entity, func, what):
     database = entity._database_
     provider = database.provider
-    func_name = "%s.%s" % (entity.__name__, func.__name__)
     names = get_lambda_args(func)
     if len(names) != 1:
         throw(
             TypeError,
-            "Constraint method %s must have exactly one parameter (self)" % func_name,
+            "%s must have exactly one parameter (the entity instance)" % what,
         )
     name = names[0]
     try:
         cond_expr, external_names, cells = decompile(func)
     except Exception as cause:
-        throw(
-            TypeError,
-            "Constraint method %s cannot be translated: %s" % (func_name, cause),
-        )
+        throw(TypeError, "%s cannot be translated: %s" % (what, cause))
     if not isinstance(cond_expr, ast.expr):
-        throw(
-            TypeError,
-            "Constraint method %s must consist of a single boolean expression" % func_name,
-        )
+        throw(TypeError, "%s must consist of a single boolean expression" % what)
     locals_dict = {".0": entity}
     for ext_name in external_names:
         if ext_name == name:
@@ -4307,14 +4305,11 @@ def _translate_constraint_check(entity, func):
     inner_expr = ast.GeneratorExp(
         elt=ast.Name(name, ast.Load()), generators=[for_expr]
     )
-    code_key = ("constraint_check", id(func.__code__))
+    code_key = ("boolean_func", id(func.__code__))
     try:
         query = Query(code_key, inner_expr, func.__globals__, locals_dict, cells)
     except (TranslationError, ExprEvalError) as cause:
-        throw(
-            TypeError,
-            "Constraint method %s cannot be translated: %s" % (func_name, cause),
-        )
+        throw(TypeError, "%s cannot be translated: %s" % (what, cause))
     translator = query._translator
     conditions = list(translator.conditions)
     discr_attr = entity._discriminator_attr_
@@ -4330,16 +4325,33 @@ def _translate_constraint_check(entity, func):
             )
         ]
     if len(conditions) != 1:
-        throw(
-            TypeError,
-            "Constraint method %s must consist of a single boolean expression" % func_name,
-        )
-    cond_ast = _validate_constraint_ast(conditions[0], func_name)
+        throw(TypeError, "%s must consist of a single boolean expression" % what)
+    cond_ast = _validate_constraint_ast(conditions[0], what)
     cond_ast = _strip_constraint_aliases(cond_ast)
     cond_ast = _inline_constraint_constants(cond_ast, query._vars)
     sql, adapter = provider.ast2sql(cond_ast)
     database._translator_cache.pop(query._key, None)
     return sql
+
+
+def _translate_constraint_check(entity, func):
+    return _translate_boolean_func(
+        entity, func, "Constraint method %s.%s" % (entity.__name__, func.__name__)
+    )
+
+
+def _resolve_index_where(entity, where):
+    if where is None:
+        return None
+    if isinstance(where, RawSQL):
+        return where.sql
+    if callable(where):
+        what = "Index predicate of entity %s" % entity.__name__
+        return _translate_boolean_func(entity, where, what)
+    throw(
+        TypeError,
+        "'where' option must be a lambda or raw_sql() result. Got: %r" % where,
+    )
 
 
 class PrimaryKey(Required):

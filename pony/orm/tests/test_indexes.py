@@ -339,18 +339,20 @@ class TestIndexes(unittest.TestCase):
             class Bad2(db2.Entity):
                 a = Required(str)
                 b = Required(int)
-                composite_index(a, b, where="b > 0")
+                c = Required(int)
+                composite_index(a, b, include=(c,))
             db2.generate_mapping()
         teardown_database(db2)
 
         db3 = Database(**db_params)
-        with self.assertRaises(TypeError):
-            class Bad3(db3.Entity):
-                a = Required(str)
-                b = Required(int)
-                unique(a, desc(b))
-            db3.generate_mapping()
-        teardown_database(db3)
+        if db.provider.dialect != "SQLite":  # expressions/order are OK on SQLite
+            with self.assertRaises(TypeError):
+                class Bad3(db3.Entity):
+                    a = Required(str)
+                    b = Required(int)
+                    unique(a, desc(b))
+                db3.generate_mapping()
+            teardown_database(db3)
 
     def test_15(self):  # attribute using/where require index or unique
         db = self.db
@@ -361,11 +363,24 @@ class TestIndexes(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             class Bad(db.Entity):
-                a = Required(str, where="a > ''")
+                a = Required(str, where=lambda x: x.a != "")
 
         with self.assertRaises(TypeError):
             class Bad(db.Entity):
                 a = PrimaryKey(int, using="hash")
+
+    def test_16(self):  # 'where' accepts a lambda or raw_sql(), not a raw string
+        db = self.db
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str, index=True, where="a > ''")
+
+        with self.assertRaises(TypeError):
+            class Bad(db.Entity):
+                a = Required(str)
+                b = Required(int)
+                unique(a, b, name="unq_bad", where="b > 0")
 
     def test_5(self):
         db = self.db
@@ -427,12 +442,12 @@ class TestIndexOptionsPostgreSQL(unittest.TestCase):
         class Person(db.Entity):
             a = Required(str)
             b = Required(int)
-            composite_index(a, b, name="ix_ab", where="b > 0")
+            composite_index(a, b, name="ix_ab", where=lambda x: x.b > 0)
 
         db.generate_mapping(create_tables=True)
         script = db.schema.generate_create_script()
         self.assertIn(
-            'CREATE INDEX "ix_ab" ON "person" ("a", "b") WHERE b > 0', script
+            'CREATE INDEX "ix_ab" ON "person" ("a", "b") WHERE "b" > 0', script
         )
 
     def test_partial_unique(self):
@@ -441,7 +456,7 @@ class TestIndexOptionsPostgreSQL(unittest.TestCase):
         class Person(db.Entity):
             a = Required(str)
             b = Required(int)
-            unique(a, b, name="unq_ab", where="a IS NOT NULL")
+            unique(a, b, name="unq_ab", where=raw_sql("a IS NOT NULL"))
 
         db.generate_mapping(create_tables=True)
         script = db.schema.generate_create_script()
@@ -509,18 +524,151 @@ class TestIndexOptionsPostgreSQL(unittest.TestCase):
         db = self.db
 
         class Person(db.Entity):
-            email = Required(str, unique=True, where="email IS NOT NULL")
+            email = Required(str, unique=True, where=lambda x: x.email is not None)
             name = Required(str, index="ix_name", using="hash")
 
         db.generate_mapping(create_tables=True)
         script = db.schema.generate_create_script()
         self.assertIn(
             'CREATE UNIQUE INDEX "unq_person__email" ON "person" ("email") '
-            "WHERE email IS NOT NULL",
+            'WHERE "email" IS NOT NULL',
             script,
         )
         self.assertIn(
             'CREATE INDEX "ix_name" ON "person" USING HASH ("name")', script
+        )
+
+
+@only_for("sqlite")
+class TestIndexOptionsSQLite(unittest.TestCase):
+    def setUp(self):
+        self.db = Database(**db_params)
+
+    def tearDown(self):
+        teardown_database(self.db)
+
+    def _script(self, db):
+        db.generate_mapping(create_tables=True)
+        return db.schema.generate_create_script()
+
+    def test_partial_index(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_index(a, b, name="ix_ab", where=lambda x: x.b > 0)
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE INDEX "ix_ab" ON "Person" ("a", "b") WHERE "b" > 0', script
+        )
+
+    def test_partial_unique(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            unique(a, b, name="unq_ab", where=raw_sql("a IS NOT NULL"))
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_ab" ON "Person" ("a", "b") WHERE a IS NOT NULL',
+            script,
+        )
+        self.assertNotIn('CONSTRAINT "unq_ab"', script)
+
+    def test_partial_attribute_level(self):
+        db = self.db
+
+        class Person(db.Entity):
+            email = Required(str, unique=True, where=lambda x: x.email is not None)
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_person__email" ON "Person" ("email") '
+            'WHERE "email" IS NOT NULL',
+            script,
+        )
+
+    def test_expression_index(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            composite_index(raw_sql("lower(a)"), name="ix_lower")
+
+        script = self._script(db)
+        self.assertIn('CREATE INDEX "ix_lower" ON "Person" ((lower(a)))', script)
+
+    def test_unique_expression_index(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            unique(raw_sql("lower(a)"), name="unq_lower")
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_lower" ON "Person" ((lower(a)))', script
+        )
+
+    def test_desc_index(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_index(a, desc(b), name="ix_desc")
+
+        script = self._script(db)
+        self.assertIn('CREATE INDEX "ix_desc" ON "Person" ("a", "b" DESC)', script)
+
+    def test_desc_partial_unique(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            unique(a, desc(b), where=lambda x: x.b > 0, name="unq_ab")
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_ab" ON "Person" ("a", "b" DESC) '
+            'WHERE "b" > 0',
+            script,
+        )
+
+    def test_partial_unique_named_function(self):
+        db = self.db
+
+        def positive(x):
+            return x.b > 0
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            unique(a, b, name="unq_ab", where=positive)
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE UNIQUE INDEX "unq_ab" ON "Person" ("a", "b") WHERE "b" > 0',
+            script,
+        )
+
+    def test_partial_composite_key(self):
+        db = self.db
+
+        class Person(db.Entity):
+            a = Required(str)
+            b = Required(int)
+            composite_key(a, b, name="ck_ab", where=lambda x: x.b > 0)
+
+        script = self._script(db)
+        self.assertIn(
+            'CREATE UNIQUE INDEX "ck_ab" ON "Person" ("a", "b") WHERE "b" > 0',
+            script,
         )
 
 
