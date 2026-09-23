@@ -39,29 +39,69 @@ class DBSchema:
     def add_table(self, table_name, entity=None):
         return self.table_class(table_name, self, entity)
 
-    def order_tables_to_create(self):
-        tables = []
+    def order_tables_to_create(self, tables=None):
+        if tables is None:
+            tables = self.tables.values()
+            subset = None
+        else:
+            tables = list(tables)
+            subset = set(tables)
+        ordered = []
         created_tables = set()
         split = self.provider.split_table_name
-        tables_to_create = sorted(
-            self.tables.values(), key=lambda table: split(table.name)
-        )
-        while tables_to_create:
-            for table in tables_to_create:
-                if table.parent_tables.issubset(created_tables):
+        remaining = sorted(tables, key=lambda table: split(table.name))
+        while remaining:
+            for table in remaining:
+                parents = table.parent_tables
+                if subset is not None:
+                    parents = parents & subset
+                if parents.issubset(created_tables):
                     created_tables.add(table)
-                    tables_to_create.remove(table)
+                    remaining.remove(table)
                     break
             else:
-                table = tables_to_create.pop()
-            tables.append(table)
-        return tables
+                table = remaining.pop()
+            ordered.append(table)
+        return ordered
 
-    def generate_create_script(self):
+    def get_schema_names(self, tables=None):
+        """Схемы, которые нужно создать перед таблицами (кроме дефолтной)."""
+        if tables is None:
+            tables = self.tables.values()
+        default = self.provider.default_schema_name
+        names = set()
+        for table in tables:
+            if not isinstance(table.name, str):
+                schema_name = table.name[0]
+                if schema_name != default:
+                    names.add(schema_name)
+        return names
+
+    def schema_create_commands(self, tables=None):
+        provider = self.provider
+        return [
+            provider.get_create_schema_sql(name)
+            for name in sorted(self.get_schema_names(tables))
+        ]
+
+    def create_schemas(self, provider, connection):
+        for sql in self.schema_create_commands():
+            if core.local.debug:
+                log_sql(sql)
+            cursor = connection.cursor()
+            provider.execute(cursor, sql)
+
+    def generate_create_script(self, tables=None):
+        if tables is None:
+            tables = self.order_tables_to_create()
+            subset = None
+        else:
+            tables = self.order_tables_to_create(tables)
+            subset = set(tables)
+        commands = list(self.schema_create_commands(tables))
         created_tables = set()
-        commands = []
-        for table in self.order_tables_to_create():
-            for db_object in table.get_objects_to_create(created_tables):
+        for table in tables:
+            for db_object in table.get_objects_to_create(created_tables, subset):
                 commands.append(db_object.get_create_command())
         return self.command_separator.join(commands)
 
@@ -227,7 +267,7 @@ class Table(DBObject):
             return None
         return "%s %s" % (name, value)
 
-    def get_objects_to_create(self, created_tables=None):
+    def get_objects_to_create(self, created_tables=None, subset=None):
         if created_tables is None:
             created_tables = set()
         created_tables.add(self)
@@ -255,10 +295,15 @@ class Table(DBObject):
             for foreign_key in sorted(
                 self.foreign_keys.values(), key=lambda fk: fk.name
             ):
-                if foreign_key.parent_table not in created_tables:
+                parent_available = foreign_key.parent_table in created_tables
+                if subset is not None and foreign_key.parent_table not in subset:
+                    parent_available = True
+                if not parent_available:
                     continue
                 result.append(foreign_key)
             for child_table in self.child_tables:
+                if subset is not None and child_table not in subset:
+                    continue
                 if child_table not in created_tables:
                     continue
                 for foreign_key in sorted(

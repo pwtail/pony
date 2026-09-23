@@ -305,6 +305,9 @@ class DBAPIProvider:
     def format_table_name(self, name):
         return self.quote_name(name)
 
+    def get_create_schema_sql(self, schema_name):
+        return "CREATE SCHEMA IF NOT EXISTS %s" % self.quote_name(schema_name)
+
     def normalize_vars(self, vars, vartypes):
         for key, value in vars.items():
             vartype = vartypes[key]

@@ -5,6 +5,7 @@ import datetime
 import inspect
 import itertools
 import json
+import keyword
 import logging
 import re
 import sys
@@ -1320,6 +1321,29 @@ class OnConnectDecorator:
 
 db_id_counter = itertools.count(1)
 
+
+class Application:
+    """Приложение: группа сущностей, живущих в отдельной схеме БД."""
+
+    def __init__(self, database, name, schema_name):
+        self._database = database
+        self.name = name
+        self.schema_name = schema_name
+        entity_base = type.__new__(EntityMeta, "Entity", (database.Entity,), {})
+        entity_base._database_ = database
+        entity_base._app_ = self
+        self.Entity = entity_base
+
+    def __repr__(self):
+        return "<Application(%s)>" % self.name
+
+    @property
+    def migrations(self):
+        from pony.orm import migrations
+
+        return migrations.MigrationsFacade(self._database, self.name)
+
+
 class Database:
     def __deepcopy__(self, memo):
         return self  # Database cannot be cloned by deepcopy()
@@ -1335,6 +1359,7 @@ class Database:
         self._translator_cache = {}
         self._constructed_sql_cache = {}
         self.entities = {}
+        self._apps = {}
         self.schema = None
         self.Entity = type.__new__(EntityMeta, "Entity", (Entity,), {})
         self.Entity._database_ = self
@@ -1349,6 +1374,48 @@ class Database:
         self.provider = self.provider_name = None
         if args or kwargs:
             self._bind(*args, **kwargs)
+
+    @cut_traceback
+    def app(self, name, schema=None):
+        app = self._apps.get(name)
+        if app is not None:
+            return app
+        if not isinstance(name, str) or not name:
+            throw(TypeError, "App name must be a non-empty string. Got: %r" % (name,))
+        if not name.isidentifier() or keyword.iskeyword(name):
+            throw(
+                MappingError,
+                "App name %r must be a valid Python identifier "
+                "(it is accessed as db.%s)" % (name, name),
+            )
+        if name in self.__dict__ or hasattr(Database, name):
+            throw(
+                MappingError,
+                "App name %r conflicts with an existing Database attribute; "
+                "choose another name" % name,
+            )
+        if self.schema is not None:
+            throw(
+                MappingError,
+                "Cannot define app %r: database mapping has already been generated" % name,
+            )
+        schema_name = schema if schema is not None else name
+        if not isinstance(schema_name, str) or not schema_name:
+            throw(
+                TypeError,
+                "Schema name must be a non-empty string. Got: %r" % (schema_name,),
+            )
+        app = Application(self, name, schema_name)
+        self._apps[name] = app
+        return app
+
+    def __getattr__(self, name):
+        apps = self.__dict__.get("_apps")
+        if apps is not None and name in apps:
+            return apps[name]
+        raise AttributeError(
+            "%r object has no attribute %r" % (type(self).__name__, name)
+        )
 
     def call_on_connect(self, con):
         for func, provider in self._on_connect_funcs:
@@ -1781,11 +1848,15 @@ class Database:
                     )
                 table_name = entity._root_._table_
                 entity._table_ = table_name
-            elif table_name is None:
-                table_name = provider.get_default_entity_table_name(entity)
-                entity._table_ = table_name
             else:
-                assert isinstance(table_name, (str, tuple))
+                if table_name is None:
+                    table_name = provider.get_default_entity_table_name(entity)
+                elif not isinstance(table_name, str):
+                    assert isinstance(table_name, tuple)
+                app = getattr(entity, "_app_", None)
+                if app is not None and isinstance(table_name, str):
+                    table_name = (app.schema_name, table_name)
+                entity._table_ = table_name
 
             table = schema.tables.get(table_name)
             if table is None:
@@ -1842,6 +1913,10 @@ class Database:
                         table_name = attr.table = reverse.table
                     else:
                         table_name = provider.get_default_m2m_table_name(attr, reverse)
+
+                    app = getattr(attr.entity, "_app_", None)
+                    if app is not None and isinstance(table_name, str):
+                        table_name = (app.schema_name, table_name)
 
                     m2m_table = schema.tables.get(table_name)
                     if m2m_table is not None:
@@ -2243,6 +2318,7 @@ class Database:
         if self.schema is None:
             throw(MappingError, "No mapping was generated for the database")
         connection = cache.prepare_connection_for_query_execution()
+        self.schema.create_schemas(self.provider, connection)
         self.schema.create_tables(self.provider, connection)
         if check_tables:
             self.schema.check_tables(self.provider, connection)
