@@ -1320,7 +1320,6 @@ class OnConnectDecorator:
 
 db_id_counter = itertools.count(1)
 
-
 class Database:
     def __deepcopy__(self, memo):
         return self  # Database cannot be cloned by deepcopy()

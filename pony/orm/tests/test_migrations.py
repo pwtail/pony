@@ -71,8 +71,9 @@ class TestMigrations(unittest.TestCase):
         self._write("0001_create.sql", 'CREATE TABLE "t1" (id integer PRIMARY KEY)')
         self._write(
             "0002_seed.py",
-            "def up(db):\n"
-            "    db.execute('INSERT INTO t1 (id) VALUES (1)')\n",
+            "# depends: 0001_create.sql\n"
+            "from pony.migrate import db\n\n"
+            "db.execute('INSERT INTO t1 (id) VALUES (1)')\n",
         )
         self.assertEqual(
             migrations.apply_migrations(db, self.dir),
@@ -95,16 +96,113 @@ class TestMigrations(unittest.TestCase):
         migrations.add_migration(db, self.dir)  # 0001_initial.sql
         self._write(
             "0002_seed.py",
-            "from pony.orm import db_session\n"
-            "def up(db):\n"
-            "    with db_session:\n"
-            "        db.Person(name='migrated')\n",
+            "# depends: 0001_initial.sql\n"
+            "from pony.migrate import db\n\n"
+            "class Person(db.Entity):\n"
+            "    pass\n\n"
+            "if __name__ == '__main__':\n"
+            "    db.introspect()\n"
+            "    db.Person(name='migrated')\n",
         )
         migrations.apply_migrations(db, self.dir)
         with db_session:
             self.assertEqual(
                 [p.name for p in db.Person.select()], ["migrated"]
             )
+
+    def test_py_migration_runs_as_main_script(self):
+        db = self.db
+        self._write(
+            "0001_name.py",
+            "from pony.migrate import db\n\n"
+            "assert __name__ == '__main__', __name__\n"
+            "db.execute('CREATE TABLE nm (v text)')\n"
+            "db.execute(\"INSERT INTO nm VALUES ('%s')\" % __name__)\n",
+        )
+        migrations.apply_migrations(db, self.dir)
+        with db_session:
+            self.assertEqual(list(db.select("SELECT v FROM nm")), ["__main__"])
+
+    def test_pony_migrate_db_inside_migration(self):
+        from pony import migrate as pony_migrate
+
+        db = self.db
+        self._write(
+            "0001_x.py",
+            "from pony.migrate import db\n\n"
+            "def helper():\n"
+            "    return db\n\n"
+            "db.execute('CREATE TABLE iv (v text)')\n"
+            "db.execute(\"INSERT INTO iv VALUES ('%s')\" % (helper() is db))\n",
+        )
+        self.assertIsNone(pony_migrate.db)
+        migrations.apply_migrations(db, self.dir)
+        self.assertIsNone(pony_migrate.db)
+        with db_session:
+            self.assertEqual(list(db.select("SELECT v FROM iv")), ["True"])
+
+    def test_add_named_data_migration(self):
+        db = self.db
+        path = migrations.add_named_migration(db, self.dir, "some_name.py")
+        self.assertEqual(os.path.basename(path), "0001_some_name.py")
+        with open(path) as f:
+            content = f.read()
+        self.assertIn("from pony.migrate import db", content)
+        self.assertIn("if __name__ == '__main__':", content)
+        self.assertNotIn("depends", content)
+        path2 = migrations.add_named_migration(db, self.dir, "second.py")
+        self.assertEqual(os.path.basename(path2), "0002_second.py")
+        with open(path2) as f:
+            self.assertIn("# depends: 0001_some_name.py", f.read())
+        self.assertEqual(
+            migrations.apply_migrations(db, self.dir),
+            ["0001_some_name.py", "0002_second.py"],
+        )
+
+    def test_add_named_sql_migration(self):
+        db = self.db
+        path = migrations.add_named_migration(db, self.dir, "add_orders.sql")
+        self.assertEqual(os.path.basename(path), "0001_add_orders.sql")
+        with open(path) as f:
+            self.assertNotIn("depends", f.read())
+        # заготовка (только комментарий) применяется без ошибки
+        self.assertEqual(
+            migrations.apply_migrations(db, self.dir), ["0001_add_orders.sql"]
+        )
+        self.assertEqual(self._applied_names(), ["0001_add_orders.sql"])
+
+    def test_migration_gets_fresh_database(self):
+        db = self.db
+
+        class AppModel(db.Entity):
+            name = Required(str)
+
+        self._write(
+            "0001_x.py",
+            "from pony.migrate import db\n\n"
+            "assert 'AppModel' not in db.entities\n"
+            "assert db.schema is None\n"
+            "assert db.provider is not None\n",
+        )
+        migrations.apply_migrations(db, self.dir)
+        self.assertEqual(self._applied_names(), ["0001_x.py"])
+
+    def test_module_entry_point(self):
+        import subprocess
+
+        root = os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "pony.migrate", "--help"],
+            capture_output=True,
+            text=True,
+            cwd=root,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("merge", result.stdout)
 
     def test_modified_after_apply_is_an_error(self):
         db = self.db
@@ -129,7 +227,10 @@ class TestMigrations(unittest.TestCase):
     def test_failed_py_rolls_back_its_transaction(self):
         db = self.db
         self._write("0001_ok.sql", 'CREATE TABLE "px" (id integer)')
-        self._write("0002_bad.py", "def up(db):\n    raise RuntimeError('boom')\n")
+        self._write(
+            "0002_bad.py",
+            "# depends: 0001_ok.sql\nraise RuntimeError('boom')\n",
+        )
         with self.assertRaises(RuntimeError):
             migrations.apply_migrations(db, self.dir)
         # 0001 — в своей транзакции, применена; 0002 — откатилась
@@ -142,12 +243,14 @@ class TestMigrations(unittest.TestCase):
         self.assertEqual(self._applied_names(), ["0001_a.sql"])
         self.assertEqual(self._table_count("fa"), 0)
 
-    def test_dry_run(self):
+    def test_plan_does_not_apply(self):
         db = self.db
         self._write("0001_a.sql", 'CREATE TABLE "da" (id integer)')
-        migrations.apply_migrations(db, self.dir, dry_run=True)
-        self.assertEqual(self._applied_names(), [])
+        infos = migrations.plan_migrations(db, self.dir)
+        self.assertEqual([info.name for info in infos], ["0001_a.sql"])
+        self.assertFalse(infos[0].applied)
         self.assertEqual(self._table_count("da"), 0)
+        self.assertEqual(self._table_count("pony_migrations"), 0)
 
     def test_cli_migrate(self):
         db = self.db
