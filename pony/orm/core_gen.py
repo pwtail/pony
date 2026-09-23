@@ -74,7 +74,7 @@ async def save_created_gen(obj):
         val = obj._vals_[attr]
         if val is not None:
             attrs.append(attr)
-            if not attr.reverse:
+            if not attr.reverse and not attr.is_relation:
                 assert len(attr.converters) == 1
                 dbval = attr.converters[0].val2dbval(val, obj)
                 new_dbvals[attr] = dbval
@@ -165,7 +165,7 @@ async def save_updated_gen(obj):
     for attr in obj._attrs_with_bit_(obj._attrs_with_columns_, obj._wbits_):
         update_columns.extend(attr.columns)
         val = obj._vals_[attr]
-        if not attr.reverse:
+        if not attr.reverse and not attr.is_relation:
             assert len(attr.converters) == 1
             dbval = attr.converters[0].val2dbval(val, obj)
             new_dbvals[attr] = dbval

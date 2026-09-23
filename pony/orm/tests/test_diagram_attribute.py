@@ -151,8 +151,7 @@ class TestAttribute(unittest.TestCase):
         class Entity1(db.Entity):
             id = Optional(str)
 
-    @raises_exception(ERDiagramError, "Reverse attribute for Entity1.attr1 not found")
-    def test_attribute13(self):
+    def test_attribute13(self):  # обратный Set создаётся автоматически
         db = self.db
 
         class Entity1(db.Entity):
@@ -163,9 +162,10 @@ class TestAttribute(unittest.TestCase):
             id = PrimaryKey(int)
 
         db.generate_mapping(check_tables=False)
+        self.assertIsInstance(Entity2.entity1_set, Set)
+        self.assertEqual(Entity2.entity1_set.reverse, Entity1.attr1)
 
-    @raises_exception(ERDiagramError, "Reverse attribute Entity1.attr1 not found")
-    def test_attribute14(self):
+    def test_attribute14(self):  # reverse="имя" создаёт атрибут, если его нет
         db = self.db
 
         class Entity1(db.Entity):
@@ -176,6 +176,8 @@ class TestAttribute(unittest.TestCase):
             attr2 = Required(Entity1, reverse="attr1")
 
         db.generate_mapping(check_tables=False)
+        self.assertIsInstance(Entity1.attr1, Set)
+        self.assertEqual(Entity1.attr1.reverse, Entity2.attr2)
 
     @raises_exception(
         ERDiagramError,
@@ -219,8 +221,7 @@ class TestAttribute(unittest.TestCase):
 
         db.generate_mapping(check_tables=False)
 
-    @raises_exception(ERDiagramError, "Reverse attribute for Entity2.attr2 not found")
-    def test_attribute18(self):
+    def test_attribute18(self):  # FK без reverse → Set с именем по умолчанию
         db = self.db
 
         class Entity1(db.Entity):
@@ -231,6 +232,8 @@ class TestAttribute(unittest.TestCase):
             attr2 = Required("Entity1")
 
         db.generate_mapping(check_tables=False)
+        self.assertIsInstance(Entity1.entity2_set, Set)
+        self.assertEqual(Entity1.entity2_set.reverse, Entity2.attr2)
 
     @raises_exception(
         ERDiagramError,

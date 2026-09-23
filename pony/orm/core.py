@@ -1398,6 +1398,16 @@ class Database:
         self.provider = provider_cls(self, *args, **kwargs)
 
     @property
+    def migrations(self):
+        """Объект db.migrations: db.migrations.add() / db.migrations.apply()."""
+        facade = getattr(self, "_migrations_facade", None)
+        if facade is None:
+            from pony.orm import migrations
+
+            facade = self._migrations_facade = migrations.MigrationsFacade(self)
+        return facade
+
+    @property
     def last_sql(self):
         return self._dblocal.last_sql
 
@@ -2059,19 +2069,22 @@ class Database:
                             attr.reverse_index,
                             on_delete,
                         )
-                elif attr.reverse and attr.columns:
-                    rentity = attr.reverse.entity
+                elif attr.columns and attr.is_relation:
+                    rentity = attr.reverse.entity if attr.reverse else attr.py_type
                     parent_table = schema.tables[rentity._table_]
                     parent_columns = get_columns(parent_table, rentity._pk_columns_)
                     child_columns = get_columns(table, attr.columns)
-                    if attr.reverse.cascade_delete:
+                    if attr.reverse and attr.reverse.cascade_delete:
                         on_delete = "CASCADE"
                     elif isinstance(attr, Optional) and attr.nullable:
                         on_delete = "SET NULL"
                     else:
                         on_delete = None
+                    fk_name = (
+                        attr.reverse.fk_name if attr.reverse else attr.fk_name
+                    )
                     table.add_foreign_key(
-                        attr.reverse.fk_name,
+                        fk_name,
                         child_columns,
                         parent_table,
                         parent_columns,
@@ -3289,6 +3302,16 @@ class Attribute:
 
     def linked(self):
         reverse = self.reverse
+        if reverse is None:
+            if self.cascade_delete:
+                throw(
+                    TypeError,
+                    "'cascade_delete' option cannot be set for attribute %s "
+                    "because it has no reverse attribute" % self,
+                )
+            for option in self.kwargs:
+                throw(TypeError, "Attribute %s has unknown option %r" % (self, option))
+            return
         if reverse.is_volatile:
             self.is_volatile = True
         if self.cascade_delete is None:
@@ -3349,7 +3372,12 @@ class Attribute:
 
         entity = self._get_entity(obj, entity)
         reverse = self.reverse
-        if not reverse:
+        rentity = (
+            reverse.entity
+            if reverse
+            else (self.py_type if self.is_relation else None)
+        )
+        if rentity is None:
             if isinstance(val, Entity):
                 throw(
                     TypeError,
@@ -3373,7 +3401,6 @@ class Attribute:
                         % (self, truncate_repr(val)),
                     )
         else:
-            rentity = reverse.entity
             if not isinstance(val, rentity):
                 vals = val if type(val) is tuple else (val,)
                 if len(vals) != len(rentity._pk_columns_):
@@ -3409,7 +3436,7 @@ class Attribute:
 
     def parse_value(self, row, offsets, dbvals_deduplication_cache):
         assert len(self.columns) == len(offsets)
-        if not self.reverse:
+        if not self.reverse and not self.is_relation:
             if len(offsets) > 1:
                 throw(NotImplementedError)
             offset = offsets[0]
@@ -3660,7 +3687,7 @@ class Attribute:
                     cache.db_update_composite_index(obj, attrs, old_vals, new_vals)
             if new_dbval is NOT_LOADED:
                 obj._vals_.pop(self, None)
-            elif self.reverse:
+            elif self.reverse or self.is_relation:
                 obj._vals_[self] = new_dbval
             else:
                 assert len(self.converters) == 1
@@ -3725,6 +3752,11 @@ class Attribute:
     def get_raw_values(self, val):
         reverse = self.reverse
         if not reverse:
+            if self.is_relation:
+                rentity = self.py_type
+                if val is None:
+                    return rentity._pk_nones_
+                return val._get_raw_pkval_()
             return (val,)
         rentity = reverse.entity
         if val is None:
@@ -3740,12 +3772,33 @@ class Attribute:
         provider = self.entity._database_.provider
         reverse = self.reverse
         if not reverse:  # attr is not part of relationship
-            if not self.columns:
-                self.columns = provider.get_default_column_names(self)
-            elif len(self.columns) > 1:
-                throw(MappingError, "Too many columns were specified for %s" % self)
-            self.col_paths = [self.name]
-            self.converters = [provider.get_converter_by_attr(self)]
+            if self.is_relation:
+                rentity = self.py_type
+                reverse_pk_columns = rentity._get_pk_columns_()
+                if not self.columns:
+                    self.columns = provider.get_default_column_names(
+                        self, reverse_pk_columns
+                    )
+                elif len(self.columns) != len(reverse_pk_columns):
+                    throw(
+                        MappingError,
+                        "Invalid number of columns specified for %s" % self,
+                    )
+                self.col_paths = [
+                    "-".join((self.name, paths)) for paths in rentity._pk_paths_
+                ]
+                self.converters = []
+                for a in rentity._pk_attrs_:
+                    self.converters.extend(a.converters)
+            else:
+                if not self.columns:
+                    self.columns = provider.get_default_column_names(self)
+                elif len(self.columns) > 1:
+                    throw(
+                        MappingError, "Too many columns were specified for %s" % self
+                    )
+                self.col_paths = [self.name]
+                self.converters = [provider.get_converter_by_attr(self)]
         else:
 
             def generate_columns():
@@ -6207,13 +6260,48 @@ class EntityMeta(type):
                     "Entities %s and %s belongs to different databases"
                     % (cls.__name__, entity2.__name__),
                 )
-            reverse = attr.reverse
-            if isinstance(reverse, str):
-                attr2 = getattr(entity2, reverse, None)
-                if attr2 is None:
+
+            def create_reverse_attr(name):
+                if hasattr(entity2, name):
                     throw(
                         ERDiagramError,
-                        "Reverse attribute %s.%s not found"
+                        "Cannot create reverse attribute %s.%s for %s: "
+                        "the name is already in use"
+                        % (entity2.__name__, name, attr),
+                    )
+                attr2 = Set(cls, reverse=attr)
+                attr2._init_(entity2, name)
+                entity2._attrs_.append(attr2)
+                entity2._new_attrs_.append(attr2)
+                entity2._adict_[name] = attr2
+                setattr(entity2, name, attr2)
+                return attr2
+
+            reverse = attr.reverse
+            if isinstance(reverse, str):
+                if reverse == "-":
+                    if attr.is_collection:
+                        throw(
+                            ERDiagramError,
+                            "'reverse=\"-\"' can be set only for to-one attributes: %s"
+                            % attr,
+                        )
+                    attr.reverse = None
+                    attr.linked()
+                    continue
+                attr2 = getattr(entity2, reverse, None)
+                if attr2 is None:
+                    if attr.is_collection:
+                        throw(
+                            ERDiagramError,
+                            "Reverse attribute %s.%s not found"
+                            % (entity2.__name__, reverse),
+                        )
+                    attr2 = create_reverse_attr(reverse)
+                elif not isinstance(attr2, Attribute):
+                    throw(
+                        ERDiagramError,
+                        "Name %s.%s is already in use"
                         % (entity2.__name__, reverse),
                     )
             elif isinstance(reverse, Attribute):
@@ -6251,7 +6339,12 @@ class EntityMeta(type):
                 elif len(candidates2) == 1:
                     attr2 = candidates2[0]
                 else:
-                    throw(ERDiagramError, "Reverse attribute for %s not found" % attr)
+                    if attr.is_collection:
+                        throw(
+                            ERDiagramError,
+                            "Reverse attribute for %s not found" % attr,
+                        )
+                    attr2 = create_reverse_attr(cls.__name__.lower() + "_set")
 
             type2 = attr2.py_type
             if type2 != cls:

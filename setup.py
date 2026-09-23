@@ -135,4 +135,9 @@ if __name__ == "__main__":
         package_data=package_data,
         download_url=download_url,
         python_requires=">=3.10,<3.15",
+        entry_points={
+            "console_scripts": [
+                "pony-migrate=pony.orm.migrations:main",
+            ],
+        },
     )
