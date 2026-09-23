@@ -1407,6 +1407,15 @@ class Database:
             facade = self._migrations_facade = migrations.MigrationsFacade(self)
         return facade
 
+    @cut_traceback
+    def introspect(self, out=None):
+        """Этап 2 миграций: достроить entity-классы атрибутами из схемы БД
+        и сгенерировать маппинг (PostgreSQL). `out='файл.py'` — отладочный
+        режим: записать выведенные описания сущностей в файл."""
+        from pony.orm import introspection
+
+        return introspection.introspect(self, out=out)
+
     @property
     def last_sql(self):
         return self._dblocal.last_sql
