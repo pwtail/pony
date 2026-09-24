@@ -575,6 +575,8 @@ class Local(ContextLocal):
         self.db2cache = {}
         self.db_context_counter = 0
         self.async_db_context = 0
+        self.scoped_db = None
+        self.scoped_db_counter = 0
         self.db_session = None
         self.prefetch_context_stack = []
         self.current_user = None
@@ -731,6 +733,7 @@ select_re = re.compile(r"\s*select\b", re.IGNORECASE)
 
 class DBSessionContextManager:
     __slots__ = (
+        "database",
         "retry",
         "retry_exceptions",
         "allowed_exceptions",
@@ -745,6 +748,7 @@ class DBSessionContextManager:
 
     def __init__(
         self,
+        database=None,
         retry=0,
         immediate=False,
         ddl=False,
@@ -782,6 +786,7 @@ class DBSessionContextManager:
                         "The same exception %s cannot be specified in both "
                         "allowed and retry exception lists simultaneously" % e.__name__,
                     )
+        self.database = database
         self.retry = retry
         self.ddl = ddl
         self.serializable = serializable
@@ -802,7 +807,7 @@ class DBSessionContextManager:
                 "Pass only keyword arguments to db_session or use db_session as decorator",
             )
         if not args:
-            return self.__class__(**kwargs)
+            return self.__class__(database=self.database, **kwargs)
         if kwargs:
             throw(
                 TypeError,
@@ -829,7 +834,7 @@ class DBSessionContextManager:
                 "sync db_session cannot be used inside an async db_session: "
                 "mixing the two modes is not supported, use 'async with db_session:'",
             )
-        self._enter()
+        self._begin()
 
     async def __aenter__(self):
         if self.retry != 0:
@@ -844,7 +849,7 @@ class DBSessionContextManager:
         """Вход в сессию без проверок, рассчитанных на пользователя (для декоратора)."""
         local.async_db_context += 1
         try:
-            self._enter()
+            self._begin()
         except BaseException:
             local.async_db_context -= 1
             raise
@@ -854,6 +859,11 @@ class DBSessionContextManager:
 
     async def _async_exit(self, exc_type=None, exc=None, tb=None):
         """Выход из сессии: commit/rollback и освобождение соединения."""
+        if self.database is not None:
+            local.scoped_db_counter -= 1
+            if not local.scoped_db_counter:
+                assert local.scoped_db is self.database
+                local.scoped_db = None
         local.db_context_counter -= 1
         try:
             if not local.db_context_counter:
@@ -914,6 +924,11 @@ class DBSessionContextManager:
             local.push_debug_state(self.sql_debug, self.show_values)
 
     def __exit__(self, exc_type=None, exc=None, tb=None):
+        if self.database is not None:
+            local.scoped_db_counter -= 1
+            if not local.scoped_db_counter:
+                assert local.scoped_db is self.database
+                local.scoped_db = None
         local.db_context_counter -= 1
         try:
             if not local.db_context_counter:
@@ -954,6 +969,26 @@ class DBSessionContextManager:
             local.user_groups_cache.clear()
             local.user_roles_cache.clear()
 
+    def _begin(self):
+        if self.database is not None:
+            self._enter_scoped()
+        else:
+            self._enter()
+
+    def _enter_scoped(self):
+        db = self.database
+        if local.scoped_db is not None and local.scoped_db is not db:
+            throw(
+                TransactionError,
+                "per-database session cannot be nested inside a per-database "
+                "session for another database; use a global db_session to work "
+                "with several databases",
+            )
+        if local.scoped_db is None:
+            local.scoped_db = db
+        local.scoped_db_counter += 1
+        self._enter()
+
     def _wrap_function(self, func):
         def new_func(func, *args, **kwargs):
             if local.db_context_counter:
@@ -991,7 +1026,7 @@ class DBSessionContextManager:
             exc = tb = None
             try:
                 for _i in range(self.retry + 1):
-                    self._enter()
+                    self._begin()
                     exc_type = exc = tb = None
                     try:
                         result = func(*args, **kwargs)
@@ -1130,6 +1165,10 @@ class DBSessionContextManager:
                 assert not local.db_context_counter and not local.db2cache
                 local.db_context_counter = 1
                 local.db_session = self
+                if self.database is not None:
+                    assert local.scoped_db is None
+                    local.scoped_db = self.database
+                    local.scoped_db_counter = 1
                 local.db2cache.update(db2cache_copy)
                 db2cache_copy.clear()
                 if self.sql_debug is not None:
@@ -1163,6 +1202,9 @@ class DBSessionContextManager:
                     local.db2cache.clear()
                     local.db_context_counter = 0
                     local.db_session = None
+                    if self.database is not None:
+                        local.scoped_db = None
+                        local.scoped_db_counter = 0
 
             gen = gen_func(*args, **kwargs)
             iterator = gen.__await__() if hasattr(gen, "__await__") else iter(gen)
@@ -1417,6 +1459,30 @@ class Database:
             "%r object has no attribute %r" % (type(self).__name__, name)
         )
 
+    @property
+    def session(self):
+        # per-database скоуп: DBSessionContextManager, привязанный к этой базе.
+        # db.session(...) принимает те же флаги, что db_session(...), но скоуп
+        # ограничен этой базой (коммитится только её кэш).
+        scoped = self.__dict__.get("_session")
+        if scoped is None:
+            scoped = self.__dict__["_session"] = DBSessionContextManager(database=self)
+        return scoped
+
+    def __enter__(self):
+        # with db: — per-database скоуп (≡ with db.session():)
+        return self.session.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.session.__exit__(exc_type, exc, tb)
+
+    def __aenter__(self):
+        # async with db: — per-database скоуп (≡ async with db.session():)
+        return self.session.__aenter__()
+
+    def __aexit__(self, exc_type, exc, tb):
+        return self.session.__aexit__(exc_type, exc, tb)
+
     def call_on_connect(self, con):
         for func, provider in self._on_connect_funcs:
             if not provider or provider == self.provider_name:
@@ -1568,6 +1634,12 @@ class Database:
             throw(
                 TransactionError,
                 "db_session is required when working with the database",
+            )
+        if local.scoped_db is not None and local.scoped_db is not self:
+            throw(
+                TransactionError,
+                "Cannot access another database inside a per-database session; "
+                "use 'with db:' for this database or a global db_session",
             )
         if local.async_db_context:
             if not hasattr(self.provider, "async_pool"):

@@ -584,6 +584,102 @@ class TestAsyncAPI(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_with_db_context_manager(self):
+        """async with db: ≡ async with db_session:"""
+
+        async def scenario():
+            async with self.db:
+                d = self.Dept(name="IT")
+                self.Person(name="ann", dept=d)
+            async with db_session:
+                objs = await select(x for x in self.Person)
+                self.assertEqual([x.name for x in objs], ["ann"])
+
+        asyncio.run(scenario())
+
+    def test_with_db_nested(self):
+        """вложенный async with db: внутри async with db_session: игнорируется"""
+
+        async def scenario():
+            async with db_session:
+                async with self.db:
+                    self.Dept(name="IT")
+            async with db_session:
+                self.assertEqual(await select(x for x in self.Dept).count(), 1)
+
+        asyncio.run(scenario())
+
+    def test_with_db_rollback_on_exception(self):
+        """исключение внутри async with db: откатывает изменения"""
+
+        async def scenario():
+            async with self.db:
+                self.Dept(name="IT")
+            try:
+                async with self.db:
+                    self.Dept(name="should-not-survive")
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+            async with db_session:
+                names = sorted(d.name for d in await select(x for x in self.Dept))
+                self.assertEqual(names, ["IT"])
+
+        asyncio.run(scenario())
+
+    def test_db_session_attr(self):
+        """db.session — per-database скоуп, привязанный к этой базе"""
+
+        async def scenario():
+            self.assertIs(self.db.session.database, self.db)
+            self.assertIsNot(self.db.session, db_session)
+            self.assertIs(self.db.session(), self.db.session)
+            async with self.db.session():
+                self.Dept(name="IT")
+            async with db_session:
+                self.assertEqual(await select(x for x in self.Dept).count(), 1)
+
+        asyncio.run(scenario())
+
+    def test_global_db_session_inside_scoped_is_noop(self):
+        """глобальный db_session внутри async with db: — no-op"""
+
+        async def scenario():
+            async with self.db:
+                async with db_session:
+                    self.Dept(name="IT")
+            async with db_session:
+                self.assertEqual(await select(x for x in self.Dept).count(), 1)
+
+        asyncio.run(scenario())
+
+    def test_db_session_kwargs(self):
+        """async with db.session(immediate=True): ≡ db_session(immediate=True)"""
+
+        async def scenario():
+            async with self.db.session(immediate=True):
+                self.Dept(name="IT")
+            async with db_session:
+                self.assertEqual(await select(x for x in self.Dept).count(), 1)
+
+        asyncio.run(scenario())
+
+    def test_db_decorator_on_coroutine(self):
+        """@db.session на корутине ≡ @db_session"""
+
+        @self.db.session
+        async def add_dept(name):
+            self.Dept(name=name)
+            return name
+
+        async def scenario():
+            self.assertEqual(await add_dept("IT"), "IT")
+            async with db_session:
+                names = sorted(d.name for d in await select(x for x in self.Dept))
+                self.assertEqual(names, ["IT"])
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

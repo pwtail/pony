@@ -437,6 +437,124 @@ class TestDBSession(unittest.TestCase):
             connection.close()
             1 / 0
 
+    def test_db_as_context_manager(self):
+        # with db: ≡ with db_session:
+        with self.db:
+            self.X(a=3, b=3)
+        with db_session:
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_as_context_manager_nested(self):
+        # вложенность with db: внутри with db_session: игнорируется (как у db_session)
+        with db_session:
+            with self.db:
+                self.X(a=3, b=3)
+        with db_session:
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_as_context_manager_rollback(self):
+        # исключение внутри with db: откатывает изменения
+        try:
+            with self.db:
+                self.X(a=3, b=3)
+                1 / 0
+        except ZeroDivisionError:
+            with db_session:
+                self.assertEqual(count(x for x in self.X), 2)
+        else:
+            self.fail()
+
+    def test_db_as_context_manager_commit_error(self):
+        # ошибка commit внутри with db: не оставляет грязного состояния сессии
+        def before_insert(self):
+            1 / 0
+
+        self.X.before_insert = before_insert
+        with self.assertRaises(ZeroDivisionError):
+            with self.db:
+                self.X(a=3, b=3)
+        # после ошибки можно открыть новую per-db сессию
+        with self.db:
+            self.assertEqual(count(x for x in self.X), 2)
+
+    def test_db_session_attr(self):
+        # db.session — per-database скоуп, привязанный к этой базе (не глобальный)
+        self.assertIs(self.db.session.database, self.db)
+        self.assertIsNot(self.db.session, db_session)
+        self.assertIs(self.db.session(), self.db.session)
+
+    def test_db_session_context(self):
+        # with db.session(): ≡ with db_session:
+        with self.db.session():
+            self.X(a=3, b=3)
+        with db_session:
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_session_kwargs(self):
+        # db.session(*args, **kw) ≡ db_session(*args, **kw)
+        with self.db.session(immediate=True):
+            self.X(a=3, b=3)
+        with db_session:
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_session_decorator(self):
+        # @db.session ≡ @db_session
+        @self.db.session
+        def test():
+            self.X(a=3, b=3)
+
+        test()
+        with db_session:
+            self.assertEqual(count(x for x in self.X), 3)
+
+    @raises_exception(
+        TypeError,
+        "@db_session can accept 'retry' parameter "
+        "only when used as decorator and not as context manager",
+    )
+    def test_db_session_kwargs_retry(self):
+        # db.session наследует валидацию db_session (retry нельзя как context manager)
+        with self.db.session(retry=3):
+            self.X(a=3, b=3)
+
+    def test_app_name_session_reserved(self):
+        # имя 'session' зарезервировано property Database.session
+        with self.assertRaises(MappingError):
+            self.db.app("session")
+
+    def test_db_global_inside_scoped_is_noop(self):
+        # глобальный db_session внутри per-db скоупа — no-op (граница не расширяется)
+        with self.db:
+            with db_session:
+                self.X(a=3, b=3)
+        with db_session:
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_cross_db_access_raises(self):
+        # обращение к другой базе внутри with db: — TransactionError
+        other = Database()
+
+        class Y(other.Entity):
+            c = PrimaryKey(int)
+
+        setup_database(other)
+        with self.assertRaises(TransactionError):
+            with self.db:
+                Y(c=1)
+
+    def test_db_scoped_nesting_different_db_raises(self):
+        # with db2: внутри with db: (другая база) — TransactionError
+        other = Database()
+
+        class Y(other.Entity):
+            c = PrimaryKey(int)
+
+        setup_database(other)
+        with self.assertRaises(TransactionError):
+            with self.db:
+                with other:
+                    Y(c=1)
+
 
 db = Database()
 
