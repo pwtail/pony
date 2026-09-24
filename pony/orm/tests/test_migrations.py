@@ -314,20 +314,208 @@ class TestMigrations(unittest.TestCase):
         self.assertEqual(self._applied_names(), ["0001_initial.sql"])
 
 
-class TestMigrationsNotSupported(unittest.TestCase):
+class TestMigrationsDialectGuard(unittest.TestCase):
+    def test_unsupported_dialect_rejected(self):
+        class FakeProvider:
+            dialect = "Oracle"
+
+        db = Database()
+        db.provider = FakeProvider()
+        with self.assertRaises(migrations.MigrationError):
+            migrations._check_supported(db)
+
+
+@only_for("sqlite")
+class TestMigrationsSQLite(unittest.TestCase):
     def setUp(self):
-        self.db = Database(**db_params)
+        self.tmp = tempfile.mkdtemp()
+        dbfile = os.path.join(self.tmp, "test.db")
+        self.db = Database("sqlite", dbfile, create_db=True)
+        self.dir = os.path.join(self.tmp, "migrations")
+        os.makedirs(self.dir)
 
     def tearDown(self):
         teardown_database(self.db)
+        shutil.rmtree(self.tmp)
 
-    def test_non_postgres_rejected(self):
-        if self.db.provider.dialect == "PostgreSQL":
-            self.skipTest("migrations are supported on PostgreSQL")
+    def _write(self, name, content):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as f:
+            f.write(content)
+        return path
+
+    def _applied_names(self):
+        with db_session:
+            return [
+                name
+                for name, _ in self.db.select(
+                    "SELECT name, sha256 FROM pony_migrations ORDER BY name"
+                )
+            ]
+
+    def _table_count(self, table_name):
+        with db_session:
+            rows = self.db.select(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type='table' AND name=$t",
+                {"t": table_name},
+            )
+            return rows[0]
+
+    def test_add_generates_initial_sql(self):
+        db = self.db
+
+        class Person(db.Entity):
+            name = Required(str)
+
+        path = migrations.add_migration(db, self.dir)
+        self.assertEqual(os.path.basename(path), "0001_initial.sql")
+        with open(path) as f:
+            content = f.read()
+        self.assertIn('CREATE TABLE "Person"', content)
         with self.assertRaises(migrations.MigrationError):
-            migrations.apply_migrations(self.db, tempfile.mkdtemp())
+            migrations.add_migration(db, self.dir)
+
+    def test_migrate_sql_and_py_in_order(self):
+        db = self.db
+        self._write("0001_create.sql", 'CREATE TABLE "t1" (id integer PRIMARY KEY)')
+        self._write(
+            "0002_seed.py",
+            "# depends: 0001_create.sql\n"
+            "from pony.migrate import db\n\n"
+            "db.execute('INSERT INTO t1 (id) VALUES (1)')\n",
+        )
+        self.assertEqual(
+            migrations.apply_migrations(db, self.dir),
+            ["0001_create.sql", "0002_seed.py"],
+        )
+        with db_session:
+            self.assertEqual(list(db.select("SELECT id FROM t1")), [1])
+        self.assertEqual(
+            self._applied_names(), ["0001_create.sql", "0002_seed.py"]
+        )
+        self.assertEqual(migrations.apply_migrations(db, self.dir), [])
+
+    def test_py_migration_uses_introspection(self):
+        db = self.db
+
+        class Person(db.Entity):
+            name = Required(str)
+
+        migrations.add_migration(db, self.dir)  # 0001_initial.sql
+        self._write(
+            "0002_seed.py",
+            "# depends: 0001_initial.sql\n"
+            "from pony.migrate import db\n\n"
+            "class Person(db.Entity):\n"
+            "    pass\n\n"
+            "db.introspect()\n"
+            "db.Person(name='migrated')\n",
+        )
+        migrations.apply_migrations(db, self.dir)
+        with db_session:
+            self.assertEqual(
+                [p.name for p in db.Person.select()], ["migrated"]
+            )
+
+    def test_modified_after_apply_is_an_error(self):
+        db = self.db
+        self._write("0001_a.sql", 'CREATE TABLE "ta" (id integer)')
+        migrations.apply_migrations(db, self.dir)
+        self._write("0001_a.sql", 'CREATE TABLE "ta" (id integer, x integer)')
         with self.assertRaises(migrations.MigrationError):
-            migrations.add_migration(self.db, tempfile.mkdtemp())
+            migrations.apply_migrations(db, self.dir)
+
+    def test_fake(self):
+        db = self.db
+        self._write("0001_a.sql", 'CREATE TABLE "fa" (id integer)')
+        migrations.apply_migrations(db, self.dir, fake=True)
+        self.assertEqual(self._applied_names(), ["0001_a.sql"])
+        self.assertEqual(self._table_count("fa"), 0)
+
+    def test_plan_does_not_apply(self):
+        db = self.db
+        self._write("0001_a.sql", 'CREATE TABLE "da" (id integer)')
+        infos = migrations.plan_migrations(db, self.dir)
+        self.assertEqual([info.name for info in infos], ["0001_a.sql"])
+        self.assertFalse(infos[0].applied)
+        self.assertEqual(self._table_count("da"), 0)
+        self.assertEqual(self._table_count("pony_migrations"), 0)
+
+    def test_db_migrations_api(self):
+        db = self.db
+
+        class Person(db.Entity):
+            name = Required(str)
+
+        path = db.migrations.add(self.dir)
+        self.assertEqual(os.path.basename(path), "0001_initial.sql")
+        self.assertEqual(db.migrations.apply(self.dir), ["0001_initial.sql"])
+        self.assertEqual(self._applied_names(), ["0001_initial.sql"])
+        with db_session:
+            tables = set(
+                db.select(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            )
+            self.assertTrue({"Person", "pony_migrations"} <= tables)
+
+
+def _mariadb_available():
+    try:
+        import mariadb
+
+        conn = mariadb.connect(
+            user=os.environ.get("PONY_MARIADB_USER", "ponytest"),
+            password=os.environ.get("PONY_MARIADB_PASSWORD", "ponytest"),
+            host=os.environ.get("PONY_MARIADB_HOST", "127.0.0.1"),
+            port=int(os.environ.get("PONY_MARIADB_PORT", "3306")),
+            database=os.environ.get("PONY_MARIADB_DB", "pony_mariadb_test"),
+        )
+    except Exception:
+        return False
+    else:
+        conn.close()
+        return True
+
+
+@unittest.skipUnless(_mariadb_available(), "MariaDB is not available")
+class TestMigrationsMariaDB(unittest.TestCase):
+    def setUp(self):
+        import mariadb
+
+        self.mdb = dict(
+            user=os.environ.get("PONY_MARIADB_USER", "ponytest"),
+            password=os.environ.get("PONY_MARIADB_PASSWORD", "ponytest"),
+            host=os.environ.get("PONY_MARIADB_HOST", "127.0.0.1"),
+            port=int(os.environ.get("PONY_MARIADB_PORT", "3306")),
+            database=os.environ.get("PONY_MARIADB_DB", "pony_mariadb_test"),
+        )
+        self.db = Database("mariadb", **self.mdb)
+        self.dir = tempfile.mkdtemp()
+        with db_session(ddl=True):
+            rows = self.db.select(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE()"
+            )
+            for table_name in rows:
+                self.db.execute("DROP TABLE IF EXISTS `%s`" % table_name)
+
+    def tearDown(self):
+        teardown_database(self.db)
+        shutil.rmtree(self.dir)
+
+    def test_add_and_apply(self):
+        db = self.db
+
+        class Person(db.Entity):
+            name = Required(str)
+
+        path = migrations.add_migration(db, self.dir)
+        self.assertEqual(os.path.basename(path), "0001_initial.sql")
+        with open(path) as f:
+            self.assertIn("CREATE TABLE `person`", f.read())
+        self.assertEqual(migrations.apply_migrations(db, self.dir), ["0001_initial.sql"])
 
 
 if __name__ == "__main__":

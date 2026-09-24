@@ -5,7 +5,7 @@ title: Режим интроспекции pony ORM (этап 2 миграций
 status: draft
 parent: pony-migrations
 depends-on: [pony-entity-declarations]
-tags: [introspection, postgresql, migrations]
+tags: [introspection, postgresql, mysql, sqlite, migrations]
 ---
 
 # Цель
@@ -41,8 +41,9 @@ entity-классы, так что в моделях можно оставить
 4. **Класс — контракт, схема дополняет** (решение пользователя): объявленное
    сверяется со схемой (несовпадение — ошибка); всё, что есть в схеме и не
    объявлено, добавляется автоматически.
-5. Диалект — **только PostgreSQL**: каталог `pg_catalog` / `information_schema`
-   (из `pony-migrations`).
+5. Диалекты — **PostgreSQL** (`pg_catalog`), **MySQL/MariaDB** (`information_schema`),
+   **SQLite** (`pragma_table_info` / `pragma_index_list` / `pragma_foreign_key_list`).
+   Oracle — вне (из `pony-migrations`).
 6. Интроспекция — **sync** (граница async-режима, из `pony-migrations`).
 7. **API — `db.introspect()`** (решение пользователя): вызов из `.py`-миграции
    данных (`db` — свежая база без моделей приложения, см. `pony-migrations`);
@@ -75,7 +76,9 @@ entity-классы, так что в моделях можно оставить
 (Согласовано с разделом «Связь с интроспекцией» в `pony-entity-declarations`.)
 
 - таблица → entity-класс (сопоставление — решение 3);
-- колонка → атрибут; маппинг типов PostgreSQL:
+- колонка → атрибут; маппинг типов по диалекту.
+
+  PostgreSQL:
 
   | Тип БД | Атрибут |
   |---|---|
@@ -91,8 +94,35 @@ entity-классы, так что в моделях можно оставить
   | bytea | `bytes` |
   | enum | `str` (с комментарием) |
 
+  MySQL/MariaDB (`information_schema.columns.DATA_TYPE`):
+
+  | Тип БД | Атрибут |
+  |---|---|
+  | tinyint/smallint/mediumint/int/bigint/year/bit | `int` |
+  | tinyint(1) | `bool` |
+  | varchar/char/text/*text/enum/set | `str` |
+  | decimal/numeric | `Decimal` |
+  | float/double/real | `float` |
+  | date/time/datetime/timestamp | `date`/`time`/`datetime` |
+  | json | `Json` |
+  | *binary/*blob | `bytes` |
+
+  SQLite (объявленный тип из `pragma_table_info`):
+
+  | Тип БД | Атрибут |
+  |---|---|
+  | INTEGER/INT/BIGINT/SMALLINT/TINYINT/MEDIUMINT | `int` |
+  | BOOLEAN/BOOL | `bool` |
+  | TEXT/VARCHAR/CHAR/CLOB/NCHAR/NVARCHAR | `str` |
+  | REAL/FLOAT/DOUBLE | `float` |
+  | DECIMAL/NUMERIC | `Decimal` |
+  | DATE/TIME/DATETIME/TIMESTAMP | `date`/`time`/`datetime` |
+  | BLOB | `bytes` |
+  | JSON | `Json` |
+
 - NOT NULL → `Required`, иначе `Optional`;
-- PK → `PrimaryKey`; serial → `auto=True`, identity → `auto='identity'`;
+- PK → `PrimaryKey`; serial → `auto=True`, identity → `auto='identity'`, MySQL
+  `auto_increment` → `auto=True`, SQLite `INTEGER PRIMARY KEY` → `auto=True`;
 - FK → `Required(...)` + обратный `Set` на стороне родителя;
 - связочная таблица (два FK, PK из них, без доп. колонок) → пара `Set`;
 - UNIQUE → `unique=True`; индекс → `index=True`; составные — `unique(...)` /

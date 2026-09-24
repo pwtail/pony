@@ -1854,7 +1854,13 @@ class Database:
                 elif not isinstance(table_name, str):
                     assert isinstance(table_name, tuple)
                 app = getattr(entity, "_app_", None)
-                if app is not None and isinstance(table_name, str):
+                # app = реальная схема только в PostgreSQL; в MySQL/SQLite app —
+                # логическая группировка (таблица остаётся с обычным именем)
+                if (
+                    app is not None
+                    and provider.dialect == "PostgreSQL"
+                    and isinstance(table_name, str)
+                ):
                     table_name = (app.schema_name, table_name)
                 entity._table_ = table_name
 
@@ -1915,7 +1921,11 @@ class Database:
                         table_name = provider.get_default_m2m_table_name(attr, reverse)
 
                     app = getattr(attr.entity, "_app_", None)
-                    if app is not None and isinstance(table_name, str):
+                    if (
+                        app is not None
+                        and provider.dialect == "PostgreSQL"
+                        and isinstance(table_name, str)
+                    ):
                         table_name = (app.schema_name, table_name)
 
                     m2m_table = schema.tables.get(table_name)

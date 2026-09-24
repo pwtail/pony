@@ -260,18 +260,133 @@ class TestIntrospection(unittest.TestCase):
             db.introspect()
 
 
-class TestIntrospectionNotSupported(unittest.TestCase):
+class TestIntrospectionDialectGuard(unittest.TestCase):
+    def test_unsupported_dialect_rejected(self):
+        class FakeProvider:
+            dialect = "Oracle"
+
+        db = Database()
+        db.provider = FakeProvider()
+        with self.assertRaises(introspection.IntrospectionError):
+            introspection.introspect(db)
+
+
+@only_for("sqlite")
+class TestIntrospectionSQLite(unittest.TestCase):
     def setUp(self):
-        self.db = Database(**db_params)
+        self.tmp = tempfile.mkdtemp()
+        dbfile = os.path.join(self.tmp, "test.db")
+        self.db = Database("sqlite", dbfile, create_db=True)
 
     def tearDown(self):
         teardown_database(self.db)
+        shutil.rmtree(self.tmp)
 
-    def test_non_postgres_rejected(self):
-        if self.db.provider.dialect == "PostgreSQL":
-            self.skipTest("introspection is supported on PostgreSQL")
-        with self.assertRaises(introspection.IntrospectionError):
-            self.db.introspect()
+    def _exec(self, sql):
+        with db_session(ddl=True):
+            self.db.execute(sql)
+
+    def test_fill_basic_types(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+            "bio TEXT, score INTEGER, active BOOLEAN NOT NULL DEFAULT 1)"
+        )
+
+        class Author(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertIsInstance(Author.id, PrimaryKey)
+        self.assertTrue(Author.id.auto)
+        self.assertIsInstance(Author.name, Required)
+        self.assertIsInstance(Author.bio, Optional)
+        self.assertTrue(Author.bio.nullable)
+        self.assertEqual(Author.score.py_type, int)
+        self.assertEqual(Author.active.py_type, bool)
+        with db_session:
+            Author(name="a", score=5)
+        with db_session:
+            self.assertEqual(Author.select().first().name, "a")
+
+    def test_fill_fk_relationship(self):
+        db = self.db
+        self._exec("CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec(
+            "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT NOT NULL, "
+            "author_id INTEGER NOT NULL REFERENCES author(id))"
+        )
+
+        class Author(db.Entity):
+            pass
+
+        class Book(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertIsInstance(Book.author, Required)
+        self.assertIs(Book.author.py_type, Author)
+        self.assertIsInstance(Author.book_set, Set)
+        with db_session:
+            a = Author(name="a")
+            Book(title="t", author=a)
+        with db_session:
+            self.assertEqual(Book.select().first().author.name, "a")
+
+    def test_unique_index_and_default(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT NOT NULL, "
+            "status TEXT DEFAULT 'new')"
+        )
+        self._exec("CREATE UNIQUE INDEX uq_t_email ON t (email)")
+        self._exec("CREATE INDEX ix_t_status ON t (status)")
+
+        class T(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertEqual(T.email.is_unique, "uq_t_email")
+        self.assertEqual(T.status.index, "ix_t_status")
+        self.assertEqual(T.status.sql_default, "'new'")
+
+    def test_dump_declarations(self):
+        db = self.db
+        self._exec("CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec(
+            "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT NOT NULL, "
+            "author_id INTEGER NOT NULL REFERENCES author(id))"
+        )
+
+        out = os.path.join(self.tmp, "entities.py")
+        result = db.introspect(out=out)
+        self.assertEqual(result, out)
+        with open(out) as f:
+            content = f.read()
+        self.assertIn("class Author(db.Entity):", content)
+        self.assertIn("name = Required(str)", content)
+        self.assertIn(
+            "author = Required('Author', column='author_id', reverse='book_set')",
+            content,
+        )
+        self.assertIn("book_set = Set('Book', reverse='author')", content)
+        self.assertEqual(db.schema, None)
+
+    def test_referenced_entity_is_created(self):
+        db = self.db
+        self._exec("CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec(
+            "CREATE TABLE car (id INTEGER PRIMARY KEY, make TEXT NOT NULL, "
+            "owner INTEGER NOT NULL REFERENCES person(id))"
+        )
+
+        class Person(db.Entity):
+            cars1 = Set("Car")
+
+        db.introspect()
+        Car = db.entities["Car"]
+        self.assertIs(Person.cars1.py_type, Car)
+        self.assertEqual(sorted(a.name for a in Car._attrs_), ["id", "make", "owner"])
 
 
 if __name__ == "__main__":

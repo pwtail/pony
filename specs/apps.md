@@ -1,22 +1,26 @@
 ---
 id: pony-apps
 type: goal-and-requirements
-title: Приложения (app) как схемы PostgreSQL в pony ORM
+title: Приложения (app) в pony ORM
 status: draft
-tags: [apps, schema, postgresql, migrations]
+tags: [apps, schema, postgresql, mysql, sqlite, migrations]
 references: [pony-migrations, pony-entity-declarations]
 ---
 
 # Цель
 
 Добавить в pony ORM абстракцию **приложения** (app) в духе Django: `myapp = db.app('myapp')`
-группирует сущности в отдельную **схему PostgreSQL**, а миграции ведутся **per-app**.
+группирует сущности, а миграции ведутся **per-app**.
 Надстройка аддитивная: сущности без app ведут себя как раньше.
 
 # Область
 
-- **Только PostgreSQL** (psycopg3), как в `pony-migrations`. MariaDB/MySQL/SQLite — вне.
-- app = **реальная схема** Postgres, а не логическая метка: таблицы app живут в схеме с именем app.
+- Смысл app зависит от диалекта:
+  - **PostgreSQL** — app = **реальная схема**: таблицы app живут в схеме с именем app
+    (`_table_ = (schema, table)`);
+  - **MySQL/MariaDB и SQLite** — app = **логическая группировка**: схемы/БД не создаются,
+    таблицы сохраняют обычные имена, app влияет только на каталог миграций (`migrations/<app>/`)
+    и колонку `app` в `pony_migrations` (решение 8).
 - Переиспользует существующие schema-qualified имена (`_table_ = (schema, table)`, `split_table_name`)
   и движок миграций `pony-migrations`; существующий API (`generate_mapping`/`create_tables`/`drop_*`)
   не меняется.
@@ -32,17 +36,23 @@ references: [pony-migrations, pony-entity-declarations]
    (`schema`, `Entity`, `provider`, ...) — на конфликте `db.app()` бросает ошибку.
 
 2. **Принадлежность сущности.** `class Account(myapp.Entity): ...`. При `generate_mapping`
-   имя таблицы строится по `_app_.schema_name`:
-   - без `_table_` → `(schema_name, <имя по конвенции провайдера>)`;
-   - `_table_` = строка → `(schema_name, <строка>)`;
-   - `_table_` = кортеж `(schema, table)` → полное имя как есть, переопределяет app (escape hatch).
+   имя таблицы строится по `_app_`:
+   - **PostgreSQL**: без `_table_` → `(schema_name, <имя по конвенции провайдера>)`;
+     `_table_` = строка → `(schema_name, <строка>)`;
+   - **MySQL/SQLite**: имя таблицы остаётся обычным (без квалификации) — `schema_name`
+     не используется для имён;
+   - `_table_` = кортеж `(schema, table)` → полное имя как есть, переопределяет app
+     (escape hatch, любой диалект).
 
-3. **Cross-app связи разрешены.** `Required`/`Set` на сущность другого app работает; FK идёт
-   между схемами. Имена таблиц/индексов/FK — schema-qualified (механизм уже есть).
+3. **Cross-app связи разрешены.** `Required`/`Set` на сущность другого app работает; в
+   PostgreSQL FK идёт между схемами (имена таблиц/индексов/FK — schema-qualified), в
+   MySQL/SQLite — обычный FK внутри одной БД. Зависимость миграций между app отслеживается
+   в шапке `-- depends: <app>/<файл>` (решение 6).
 
-4. **Создание схемы.** `CREATE SCHEMA IF NOT EXISTS <schema>` эмитится перед таблицами для
-   каждой схемы app, кроме дефолтной `public` провайдера, — и в начальный `.sql` миграций, и в
-   легаси-путь `db.create_tables()`/`generate_create_script()`.
+4. **Создание схемы (только PostgreSQL).** `CREATE SCHEMA IF NOT EXISTS <schema>` эмитится
+   перед таблицами для каждой схемы app, кроме дефолтной `public` провайдера, — и в начальный
+   `.sql` миграций, и в легаси-путь `db.create_tables()`/`generate_create_script()`. Для
+   MySQL/SQLite схемы не создаются (имена таблиц — строки, `get_schema_names()` пуст).
 
 5. **Миграции per-app.** Каталог `migrations/<app>/`. Трекинг — общая таблица `pony_migrations`
    с колонкой `app` (PK `(app, name)`); миграции без app (легаси) — `app = ''`. У каждого app
@@ -60,9 +70,14 @@ references: [pony-migrations, pony-entity-declarations]
    (`pony-migrate myapp apply`), дальше существующая команда `add`/`apply`/`plan`/`merge`;
    без app `pony-migrate <command>` применяет все app.
 
+8. **Логическая группировка в MySQL/MariaDB и SQLite** (решение пользователя). Схемы/БД не
+   создаются; таблицы app живут в текущей БД с обычными именами; app влияет только на каталог
+   миграций и колонку `app` в трекинге. Принадлежность таблицы к app для миграций определяется
+   по `entity._app_` (а не по имени схемы). Одинаковое имя таблицы в двух app — ошибка маппинга.
+   `schema_name` сохраняется в API (default = имя app, `schema=` переопределяет), но для этих
+   диалектов в именах таблиц не участвует.
+
 # Вне области (non-goals)
 
-- MariaDB/MySQL и SQLite — вне (PostgreSQL первым, как в `pony-migrations`).
-- «Логические» app без схемы: app в этом форке всегда = схема Postgres.
 - Маршрутизация между несколькими БД (multi-database) — все app живут в одной БД.
 - Изменение поведения `generate_mapping`/`create_tables`/`drop_*` для сущностей без app.

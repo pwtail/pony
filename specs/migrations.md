@@ -3,7 +3,7 @@ id: pony-migrations
 type: goal-and-requirements
 title: Миграции и интроспекция схемы в pony ORM
 status: draft
-tags: [migrations, introspection, postgresql]
+tags: [migrations, introspection, postgresql, mysql, sqlite]
 references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-introspection, pony-migration-graph, pony-apps]
 ---
 
@@ -27,9 +27,8 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
 
 # Область
 
-- Диалект этапа 1: **только PostgreSQL** (psycopg3) (решение пользователя).
-  Порядок добавления дальше: во вторую очередь — **MariaDB**, затем — **SQLite**
-  (в SQLite нет нормальной поддержки миграций).
+- Диалекты: **PostgreSQL** (psycopg3), **MySQL/MariaDB**, **SQLite**.
+  Oracle — вне (не проверялся).
 - Миграции и интроспекция — **sync**: выполняются CLI-утилитой вне event loop.
   Согласовано с решением асинхронного режима: schema-операции и интроспекция
   остаются синхронными (`pony-async-goal-and-requirements`).
@@ -60,6 +59,13 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
    `pony_migrations` (name, sha256, applied_at); per-app scope добавляет колонку
    `app` (PK `(app, name)`) — см. `pony-apps`; каждая миграция — в своей
    транзакции. Явные зависимости между миграциями — этап 3.
+
+   DDL `pony_migrations` зависит от диалекта: `applied_at` — `timestamptz
+   DEFAULT now()` (PostgreSQL), `DATETIME DEFAULT CURRENT_TIMESTAMP`
+   (MySQL/MariaDB) или `TEXT DEFAULT CURRENT_TIMESTAMP` (SQLite); проверка
+   существования таблицы — `to_regclass` / `information_schema.tables` /
+   `sqlite_master`. `applied_at` заполняется default'ом БД, а не из Python
+   (так тип/значение не зависят от диалекта и tz-aware datetime).
 8. **SQL-миграция применяется целиком** (postgres — одним запросом); откат —
    парный `0001_<имя>.down.sql`.
 9. **Python-миграция данных — скрипт** (решение пользователя): исполняется
@@ -108,7 +114,6 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
 # Вне области (non-goals)
 
 - async-миграции и async-интроспекция — вне (sync, см. «Область»);
-- диалекты кроме PostgreSQL — отдельными этапами: во вторую очередь MariaDB,
-  затем SQLite (в SQLite нет нормальной поддержки миграций);
+- Oracle — вне (не проверялся);
 - полная, гарантированная генерация SQL из моделей — вне (best effort, решения 2–3);
 - runtime-интроспекция без файла (классы только в памяти) — возможно позже.

@@ -1,4 +1,4 @@
-"""Интроспекция схемы PostgreSQL (этап 2 миграций pony).
+"""Интроспекция схемы БД (этап 2 миграций pony).
 
 - `db.introspect()` — достраивает объявленные entity-классы атрибутами,
   выводимыми из каталога БД, и генерирует маппинг; после вызова работают
@@ -6,9 +6,11 @@
 - `db.introspect(out='entities.py')` — отладочный режим: пишет в файл
   описания сущностей, выведенные из схемы БД (классы при этом не трогает).
 
-Диалект этапа — PostgreSQL. Sync.
+Диалекты: PostgreSQL (каталог pg_catalog), MySQL/MariaDB (information_schema),
+SQLite (PRAGMA). Sync.
 """
 
+from collections import namedtuple
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -73,6 +75,71 @@ PG_TYPE_MAP = {
     "_float8": "FloatArray",
 }
 
+MYSQL_TYPE_MAP = {
+    "tinyint": "int",
+    "smallint": "int",
+    "mediumint": "int",
+    "int": "int",
+    "integer": "int",
+    "bigint": "int",
+    "year": "int",
+    "bit": "int",
+    "decimal": "Decimal",
+    "numeric": "Decimal",
+    "float": "float",
+    "double": "float",
+    "real": "float",
+    "char": "str",
+    "varchar": "str",
+    "text": "str",
+    "tinytext": "str",
+    "mediumtext": "str",
+    "longtext": "str",
+    "enum": "str",
+    "set": "str",
+    "date": "date",
+    "time": "time",
+    "datetime": "datetime",
+    "timestamp": "datetime",
+    "json": "Json",
+    "binary": "bytes",
+    "varbinary": "bytes",
+    "blob": "bytes",
+    "tinyblob": "bytes",
+    "mediumblob": "bytes",
+    "longblob": "bytes",
+}
+
+SQLITE_TYPE_MAP = {
+    "INT": "int",
+    "INTEGER": "int",
+    "BIGINT": "int",
+    "SMALLINT": "int",
+    "TINYINT": "int",
+    "MEDIUMINT": "int",
+    "BOOL": "bool",
+    "BOOLEAN": "bool",
+    "VARCHAR": "str",
+    "CHAR": "str",
+    "TEXT": "str",
+    "CLOB": "str",
+    "NCHAR": "str",
+    "NVARCHAR": "str",
+    "REAL": "float",
+    "FLOAT": "float",
+    "DOUBLE": "float",
+    "DECIMAL": "Decimal",
+    "NUMERIC": "Decimal",
+    "DATE": "date",
+    "TIME": "time",
+    "DATETIME": "datetime",
+    "TIMESTAMP": "datetime",
+    "BLOB": "bytes",
+    "JSON": "Json",
+}
+
+FKInfo = namedtuple("FKInfo", "col pschema ptable ptype deltype ncols")
+
 
 def _q(db, sql, params):
     return db.select(sql, params)
@@ -84,18 +151,64 @@ def _qualified_name(table_name):
     return "%s.%s" % table_name
 
 
-def _type_name(typname, typtype):
+def _type_name(db, typname, typtype=None):
     """Имя python-типа для колонки; None — неизвестный тип."""
-    mapped = PG_TYPE_MAP.get(typname)
-    if mapped is not None:
-        return mapped
-    if typtype == "e":  # user-defined enum
-        return "str"
-    return None
+    dialect = db.provider.dialect
+    if dialect == "PostgreSQL":
+        mapped = PG_TYPE_MAP.get(typname)
+        if mapped is not None:
+            return mapped
+        if typtype == "e":  # user-defined enum
+            return "str"
+        return None
+    if dialect == "MySQL":
+        if typtype == "bool":  # tinyint(1)
+            return "bool"
+        return MYSQL_TYPE_MAP.get(typname)
+    return SQLITE_TYPE_MAP.get(typname)  # SQLite
+
+
+def _py_type_from_sql(db, typname, typtype=None):
+    name = _type_name(db, typname, typtype)
+    return TYPE_PY.get(name, int) if name else int
+
+
+def _table_exists(db, table_name):
+    dialect = db.provider.dialect
+    if dialect == "PostgreSQL":
+        rows = _q(db, "SELECT to_regclass($q)", {"q": _qualified_name(table_name)})
+        return bool(rows and rows[0] is not None)
+    if dialect == "MySQL":
+        schema_name, base_name = db.provider.split_table_name(table_name)
+        rows = _q(
+            db,
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = $s AND LOWER(table_name) = LOWER($t)",
+            {"s": schema_name, "t": base_name},
+        )
+        return bool(rows and rows[0])
+    rows = _q(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name = $t COLLATE NOCASE",
+        {"t": table_name},
+    )
+    return bool(rows)
 
 
 def table_info(db, table_name):
-    """Читает каталог для одной таблицы: колонки, PK, unique, индексы, FK."""
+    """Читает каталог для одной таблицы: колонки, PK, unique, индексы, FK.
+    Возвращает единый словарь для всех диалектов."""
+    dialect = db.provider.dialect
+    if dialect == "PostgreSQL":
+        return _table_info_postgres(db, table_name)
+    if dialect == "MySQL":
+        return _table_info_mysql(db, table_name)
+    return _table_info_sqlite(db, table_name)
+
+
+def _table_info_postgres(db, table_name):
+    """Каталог PostgreSQL (pg_catalog) для одной таблицы."""
     qname = _qualified_name(table_name)
     rows = _q(
         db,
@@ -186,13 +299,183 @@ def table_info(db, table_name):
         "ORDER BY a.attname",
         {"q": qname},
     ):
-        fks[row.col] = row
+        fks[row.col] = FKInfo(
+            row.col, row.pschema, row.ptable, row.ptype, row.deltype, row.ncols
+        )
 
     return {
         "columns": columns,
         "column_list": column_list,
         "pk": list(pk),
         "pk_name": pk_name,
+        "uniques": uniques,
+        "indexes": indexes,
+        "fks": fks,
+    }
+
+
+def _table_info_mysql(db, table_name):
+    """Каталог MySQL/MariaDB (information_schema) для одной таблицы."""
+    schema_name, base_name = db.provider.split_table_name(table_name)
+    normalize_name = db.provider.normalize_name
+    rows = _q(
+        db,
+        "SELECT COLUMN_NAME AS name, DATA_TYPE AS type, COLUMN_TYPE AS coltype, "
+        "IS_NULLABLE AS nullable, COLUMN_KEY AS colkey, EXTRA AS extra, "
+        "COLUMN_DEFAULT AS default_expr "
+        "FROM information_schema.columns "
+        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t "
+        "ORDER BY ORDINAL_POSITION",
+        {"s": schema_name, "t": base_name},
+    )
+    columns = {}
+    column_list = []
+    for row in rows:
+        is_bool = row.type == "tinyint" and row.coltype == "tinyint(1)"
+        auto = "auto_increment" in (row.extra or "")
+        default_expr = row.default_expr
+        name = normalize_name(row.name)
+        info = {
+            "type": row.type,
+            "typtype": "bool" if is_bool else None,
+            "notnull": row.nullable == "NO",
+            "identity": None,
+            "auto": auto,
+            "default": default_expr,
+        }
+        columns[name] = info
+        column_list.append((name, info))
+
+    pk_rows = _q(
+        db,
+        "SELECT COLUMN_NAME AS name FROM information_schema.columns "
+        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND COLUMN_KEY = 'PRI' "
+        "ORDER BY ORDINAL_POSITION",
+        {"s": schema_name, "t": base_name},
+    )
+    pk = [normalize_name(row.name) for row in pk_rows]
+    constraint_rows = _q(
+        db,
+        "SELECT CONSTRAINT_NAME AS name FROM information_schema.table_constraints "
+        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND CONSTRAINT_TYPE = 'PRIMARY KEY'",
+        {"s": schema_name, "t": base_name},
+    )
+    pk_name = constraint_rows[0] if constraint_rows else None
+
+    uniques = {}
+    indexes = {}
+    for row in _q(
+        db,
+        "SELECT COLUMN_NAME AS col, INDEX_NAME AS idxname, NON_UNIQUE AS nonunique, "
+        "COUNT(*) OVER (PARTITION BY INDEX_NAME) AS ncols "
+        "FROM information_schema.statistics "
+        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND INDEX_NAME != 'PRIMARY'",
+        {"s": schema_name, "t": base_name},
+    ):
+        col = normalize_name(row.col)
+        if row.ncols != 1:
+            continue
+        if row.nonunique == 0:
+            uniques[col] = row.idxname
+        else:
+            indexes[col] = row.idxname
+
+    fks = {}
+    for row in _q(
+        db,
+        "SELECT kcu.COLUMN_NAME AS col, kcu.REFERENCED_TABLE_SCHEMA AS pschema, "
+        "kcu.REFERENCED_TABLE_NAME AS ptable, pc.DATA_TYPE AS ptype, "
+        "rc.DELETE_RULE AS deltype, "
+        "COUNT(*) OVER (PARTITION BY kcu.CONSTRAINT_NAME) AS ncols "
+        "FROM information_schema.key_column_usage kcu "
+        "JOIN information_schema.referential_constraints rc "
+        "  ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA "
+        " AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME "
+        "JOIN information_schema.columns pc "
+        "  ON pc.TABLE_SCHEMA = kcu.REFERENCED_TABLE_SCHEMA "
+        " AND pc.TABLE_NAME = kcu.REFERENCED_TABLE_NAME "
+        " AND pc.COLUMN_NAME = kcu.REFERENCED_COLUMN_NAME "
+        "WHERE kcu.TABLE_SCHEMA = $s AND kcu.TABLE_NAME = $t "
+        "AND kcu.REFERENCED_TABLE_NAME IS NOT NULL",
+        {"s": schema_name, "t": base_name},
+    ):
+        col = normalize_name(row.col)
+        fks[col] = FKInfo(
+            col, row.pschema, row.ptable, row.ptype, row.deltype, row.ncols
+        )
+
+    return {
+        "columns": columns,
+        "column_list": column_list,
+        "pk": pk,
+        "pk_name": pk_name,
+        "uniques": uniques,
+        "indexes": indexes,
+        "fks": fks,
+    }
+
+
+def _table_info_sqlite(db, table_name):
+    """Каталог SQLite (pragma_* table-valued functions) для одной таблицы."""
+    rows = _q(db, "SELECT * FROM pragma_table_info($t)", {"t": table_name})
+    columns = {}
+    column_list = []
+    for row in rows:
+        raw_type = (row.type or "").split("(", 1)[0].strip().upper()
+        info = {
+            "type": raw_type,
+            "typtype": None,
+            "notnull": bool(row.notnull),
+            "identity": None,
+            "auto": False,
+            "default": row.dflt_value,
+            "pk": row.pk,
+        }
+        columns[row.name] = info
+        column_list.append((row.name, info))
+
+    pk = [name for name, info in column_list if info["pk"]]
+    # INTEGER PRIMARY KEY (одна колонка) — rowid-алиас, значения генерируются
+    if len(pk) == 1 and columns[pk[0]]["type"] == "INTEGER":
+        columns[pk[0]]["auto"] = True
+
+    uniques = {}
+    indexes = {}
+    for idx in _q(db, "SELECT * FROM pragma_index_list($t)", {"t": table_name}):
+        if idx.origin == "pk":
+            continue
+        cols = _q(db, "SELECT * FROM pragma_index_info($n)", {"n": idx.name})
+        col_names = [c.name for c in cols]
+        if len(col_names) != 1:
+            continue
+        col = col_names[0]
+        if idx.unique:
+            uniques[col] = idx.name
+        else:
+            indexes[col] = idx.name
+
+    fks = {}
+    fk_rows = _q(db, "SELECT * FROM pragma_foreign_key_list($t)", {"t": table_name})
+    fk_counts = {}
+    for row in fk_rows:
+        fk_counts[row.id] = fk_counts.get(row.id, 0) + 1
+    for row in fk_rows:
+        ncols = fk_counts[row.id]
+        col = getattr(row, "from")
+        fks[col] = FKInfo(
+            col,
+            None,
+            row.table,
+            columns.get(col, {}).get("type", "INTEGER"),
+            row.on_delete,
+            ncols,
+        )
+
+    return {
+        "columns": columns,
+        "column_list": column_list,
+        "pk": pk,
+        "pk_name": None,
         "uniques": uniques,
         "indexes": indexes,
         "fks": fks,
@@ -212,12 +495,7 @@ def _create_referenced_entities(db):
                 missing.append(py_type)
     for name in missing:
         table_name = db.provider.normalize_name(name)
-        rows = _q(
-            db,
-            "SELECT to_regclass($q)",
-            {"q": _qualified_name(table_name)},
-        )
-        if not rows or rows[0] is None:
+        if not _table_exists(db, table_name):
             raise IntrospectionError(
                 "Entity %s is referenced by the model but not declared, "
                 "and table %r does not exist" % (name, table_name)
@@ -265,10 +543,10 @@ def introspect(db, out=None):
     с out='файл' — пишет выведенные описания сущностей в файл (отладка)."""
     if db.provider is None:
         raise IntrospectionError("Database object is not bound with a provider yet")
-    if db.provider.dialect != "PostgreSQL":
+    if db.provider.dialect not in ("PostgreSQL", "MySQL", "SQLite"):
         raise IntrospectionError(
-            "Introspection supports only PostgreSQL for now (got %s)"
-            % db.provider.dialect
+            "Introspection supports PostgreSQL, MySQL/MariaDB and SQLite "
+            "(got %s)" % db.provider.dialect
         )
     if db.schema is not None:
         raise IntrospectionError("Mapping was already generated")
@@ -293,7 +571,10 @@ def introspect(db, out=None):
             table_name = entity._table_ or db.provider.get_default_entity_table_name(
                 entity
             )
-            table_map[_qualified_name(table_name)] = entity
+            qname = _qualified_name(table_name)
+            table_map[qname] = entity
+            # case-insensitive fallback: имена таблиц в SQLite/MySQL регистронезависимы
+            table_map.setdefault(qname.lower(), entity)
         for entity in entities:
             table_name = entity._table_ or db.provider.get_default_entity_table_name(
                 entity
@@ -334,7 +615,7 @@ def _fill_entity(db, entity, table_name, table_map, info):
     for name, cinfo in info["column_list"]:
         if name in covered:
             continue
-        type_name = _type_name(cinfo["type"], cinfo["typtype"])
+        type_name = _type_name(db, cinfo["type"], cinfo.get("typtype"))
         py_type = TYPE_PY.get(type_name) if type_name else None
         notnull = bool(cinfo["notnull"])
         is_pk = name in pk
@@ -342,7 +623,12 @@ def _fill_entity(db, entity, table_name, table_map, info):
 
         if fk is not None and fk.ncols == 1 and not is_pk:
             parent_key = "%s.%s" % (fk.pschema, fk.ptable)
-            parent_entity = table_map.get(parent_key) or table_map.get(fk.ptable)
+            parent_entity = (
+                table_map.get(parent_key)
+                or table_map.get(fk.ptable)
+                or table_map.get((parent_key or "").lower())
+                or table_map.get((fk.ptable or "").lower())
+            )
             attr_name = _attr_name_for_fk(name)
             kwargs = {}
             if normalize_name(attr_name) != normalize_name(name):
@@ -356,7 +642,7 @@ def _fill_entity(db, entity, table_name, table_map, info):
                 _add_attr(entity, attr_name, attr)
                 continue
             if py_type is None:
-                py_type = TYPE_PY.get(PG_TYPE_MAP.get(fk.ptype, "int"), int)
+                py_type = _py_type_from_sql(db, fk.ptype)
             attr = (Required if notnull else Optional)(py_type, **kwargs)
             if not notnull:
                 attr.nullable = True
@@ -368,7 +654,9 @@ def _fill_entity(db, entity, table_name, table_map, info):
 
         if is_pk and len(pk) == 1:
             kwargs = {"name": info["pk_name"]}
-            if cinfo["identity"] in ("a", "d"):
+            if cinfo.get("auto"):
+                kwargs["auto"] = True
+            elif cinfo["identity"] in ("a", "d"):
                 kwargs["auto"] = "identity"
             elif cinfo["default"] and cinfo["default"].startswith("nextval("):
                 kwargs["auto"] = True
@@ -392,19 +680,40 @@ def _entity_name(table):
     return "".join(part.capitalize() for part in table.split("_"))
 
 
-def _dump_declarations(db, out):
+def _list_tables(db):
+    """Список таблиц для debug-дампа: [(schema_or_None, table), ...]."""
+    dialect = db.provider.dialect
+    if dialect == "PostgreSQL":
+        rows = _q(
+            db,
+            "SELECT schemaname, tablename FROM pg_tables "
+            "WHERE schemaname = current_schema() ORDER BY tablename",
+            {},
+        )
+        return [(row.schemaname, row.tablename) for row in rows]
+    if dialect == "MySQL":
+        rows = _q(
+            db,
+            "SELECT TABLE_NAME AS name FROM information_schema.tables "
+            "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
+            {},
+        )
+        return [(None, row.name) for row in rows]
     rows = _q(
         db,
-        "SELECT schemaname, tablename FROM pg_tables "
-        "WHERE schemaname = current_schema() ORDER BY tablename",
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
         {},
     )
-    tables = [(row.schemaname, row.tablename) for row in rows]
+    return [(None, row) for row in rows]
+
+
+def _dump_declarations(db, out):
+    tables = _list_tables(db)
     infos = {}
     children = {}
     for schema, table in tables:
         key = (schema, table)
-        infos[key] = table_info(db, key)
+        infos[key] = table_info(db, table)
     for key, info in infos.items():
         for col, fk in info["fks"].items():
             if fk.ncols != 1:
@@ -414,19 +723,19 @@ def _dump_declarations(db, out):
     lines = ["from pony.orm import *", "", ""]
     for schema, table in tables:
         key = (schema, table)
-        lines.extend(_dump_entity(key, infos[key], children.get(key, [])))
+        lines.extend(_dump_entity(db, key, infos[key], children.get(key, [])))
     with open(out, "w") as f:
         f.write("\n".join(lines))
         f.write("\n")
     return out
 
 
-def _dump_entity(key, info, child_list):
+def _dump_entity(db, key, info, child_list):
     schema, table = key
     lines = []
     cls = _entity_name(table)
     lines.append("class %s(db.Entity):" % cls)
-    if schema != "public":
+    if schema and schema != "public":
         lines.append("    _table_ = (%r, %r)" % (schema, table))
     elif table != table.lower():
         lines.append("    _table_ = %r" % table)
@@ -446,7 +755,7 @@ def _dump_entity(key, info, child_list):
                 "    %s = %s(%s)" % (attr_name, kind, ", ".join(args))
             )
             continue
-        type_name = _type_name(cinfo["type"], cinfo["typtype"])
+        type_name = _type_name(db, cinfo["type"], cinfo.get("typtype"))
         if type_name is None:
             type_name = "str"
             comment = "  # unknown type: %s" % cinfo["type"]
@@ -456,11 +765,14 @@ def _dump_entity(key, info, child_list):
             comment = ""
         if name in pk and len(pk) == 1:
             args = ["%s" % type_name]
-            if cinfo["identity"] in ("a", "d"):
+            if cinfo.get("auto"):
+                args.append("auto=True")
+            elif cinfo["identity"] in ("a", "d"):
                 args.append("auto='identity'")
             elif cinfo["default"] and cinfo["default"].startswith("nextval("):
                 args.append("auto=True")
-            args.append("name=%r" % info["pk_name"])
+            if info["pk_name"]:
+                args.append("name=%r" % info["pk_name"])
             lines.append(
                 "    %s = PrimaryKey(%s)%s" % (name, ", ".join(args), comment)
             )

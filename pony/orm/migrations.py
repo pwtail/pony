@@ -41,7 +41,6 @@ import os
 import re
 import sys
 from collections import namedtuple
-from datetime import datetime, timezone
 
 from pony.orm import core
 from pony.orm.core import Database, db_session
@@ -163,13 +162,16 @@ class MigrationsFacade:
         return merge_migration(self.db, directory, name=name, app=app)
 
 
+SUPPORTED_DIALECTS = ("PostgreSQL", "MySQL", "SQLite")
+
+
 def _check_supported(db):
     if db.provider is None:
         raise MigrationError("Database object is not bound with a provider yet")
-    if db.provider.dialect != "PostgreSQL":
+    if db.provider.dialect not in SUPPORTED_DIALECTS:
         raise MigrationError(
-            "Migrations are supported only with PostgreSQL for now (got %s)"
-            % db.provider.dialect
+            "Migrations are supported only with PostgreSQL, MySQL/MariaDB and "
+            "SQLite (got %s)" % db.provider.dialect
         )
 
 
@@ -315,15 +317,23 @@ def _registered_apps(db):
     return [""] + sorted(db._apps.keys())
 
 
+def _table_app(table):
+    """Имя app, которому принадлежит таблица (по entities/m2m), или '' (без app)."""
+    for entity in table.entities:
+        app = getattr(entity, "_app_", None)
+        if app is not None:
+            return app.name
+    for attr in table.m2m:
+        app = getattr(attr.entity, "_app_", None)
+        if app is not None:
+            return app.name
+    return ""
+
+
 def _tables_for_scope(db, app):
     if app in (None, ""):
-        return [t for t in db.schema.tables.values() if isinstance(t.name, str)]
-    schema_name = db._apps[app].schema_name
-    return [
-        t
-        for t in db.schema.tables.values()
-        if isinstance(t.name, tuple) and t.name[0] == schema_name
-    ]
+        return [t for t in db.schema.tables.values() if _table_app(t) == ""]
+    return [t for t in db.schema.tables.values() if _table_app(t) == app]
 
 
 def _cross_app_depends(db, directory, app):
@@ -331,17 +341,16 @@ def _cross_app_depends(db, directory, app):
     FK-таблицы этого app (для авто-`-- depends:` в шапке)."""
     if app in (None, ""):
         return ""
-    schema_name = db._apps[app].schema_name
+    app_tables = {id(t) for t in _tables_for_scope(db, app)}
     referenced = set()
-    for table in db.schema.tables.values():
-        if isinstance(table.name, tuple) and table.name[0] == schema_name:
-            for fk in table.foreign_keys.values():
-                parent = fk.parent_table.name
-                if isinstance(parent, tuple) and parent[0] != schema_name:
-                    for other_name, other in db._apps.items():
-                        if other.schema_name == parent[0]:
-                            referenced.add(other_name)
-                            break
+    for table in _tables_for_scope(db, app):
+        for fk in table.foreign_keys.values():
+            parent_table = fk.parent_table
+            if id(parent_table) in app_tables:
+                continue
+            other_app = _table_app(parent_table)
+            if other_app:
+                referenced.add(other_app)
     parts = []
     for other_name in sorted(referenced):
         graph = MigrationGraph(directory, other_name)
@@ -422,24 +431,53 @@ def add_named_migration(db, directory, file_name, app=None):
 
 
 def ensure_migrations_table(db):
+    dialect = db.provider.dialect
+    if dialect == "PostgreSQL":
+        applied_at = "timestamptz NOT NULL DEFAULT now()"
+    elif dialect == "MySQL":
+        applied_at = "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    else:  # SQLite
+        applied_at = "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
     sql = (
         "CREATE TABLE IF NOT EXISTS %s ("
-        "app varchar(255) NOT NULL DEFAULT '', "
-        "name varchar(255) NOT NULL, "
-        "sha256 varchar(64) NOT NULL, "
-        "applied_at timestamptz NOT NULL DEFAULT now(), "
-        "PRIMARY KEY (app, name))" % MIGRATIONS_TABLE
+        "app %s NOT NULL DEFAULT '', "
+        "name %s NOT NULL, "
+        "sha256 %s NOT NULL, "
+        "applied_at %s, "
+        "PRIMARY KEY (app, name))"
+        % (MIGRATIONS_TABLE, _char_type(dialect), _char_type(dialect),
+           _char_type(dialect), applied_at)
     )
     with db_session(ddl=True):
         db.execute(sql)
 
 
+def _char_type(dialect):
+    if dialect == "SQLite":
+        return "TEXT"
+    return "varchar(255)"
+
+
 def _migrations_table_exists(db):
+    dialect = db.provider.dialect
     with db_session:
+        if dialect == "PostgreSQL":
+            rows = db.select(
+                "SELECT to_regclass($t) AS oid", {"t": MIGRATIONS_TABLE}
+            )
+            return rows[0] is not None
+        if dialect == "MySQL":
+            rows = db.select(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name = $t",
+                {"t": MIGRATIONS_TABLE},
+            )
+            return bool(rows and rows[0])
         rows = db.select(
-            "SELECT to_regclass($t) AS oid", {"t": MIGRATIONS_TABLE}
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = $t",
+            {"t": MIGRATIONS_TABLE},
         )
-        return rows[0] is not None
+        return bool(rows)
 
 
 def applied_migrations(db, app=""):
@@ -455,26 +493,35 @@ def applied_migrations(db, app=""):
 
 
 def _record(db, app, name, sha256):
-    db.insert(
-        MIGRATIONS_TABLE,
-        app=app,
-        name=name,
-        sha256=sha256,
-        applied_at=datetime.now(timezone.utc),
-    )
+    # applied_at заполняется default'ом БД (now() / CURRENT_TIMESTAMP) —
+    # так тип/значение не зависят от диалекта и tz-aware datetime
+    db.insert(MIGRATIONS_TABLE, app=app, name=name, sha256=sha256)
 
 
 def _apply_sql(db, app, name, path, sha256):
     with open(path) as f:
         sql = f.read()
     with db_session(ddl=True):
-        if _strip_sql_comments(sql).strip():
-            db.execute(sql)
+        if db.provider.dialect == "PostgreSQL":
+            # psycopg3 исполняет несколько операторов одним запросом
+            if _strip_sql_comments(sql).strip():
+                db.execute(sql)
+        else:
+            # SQLite/MySQL: один оператор на execute; режем по ';' (best effort)
+            for statement in _split_sql_statements(sql):
+                db.execute(statement)
         _record(db, app, name, sha256)
 
 
 def _strip_sql_comments(sql):
     return re.sub(r"--[^\n]*", "", sql)
+
+
+def _split_sql_statements(sql):
+    """Режет SQL-миграцию на операторы по ';' (best effort: не учитывает
+    ';' внутри строковых литералов/триггеров)."""
+    sql = _strip_sql_comments(sql)
+    return [s.strip() for s in sql.split(";") if s.strip()]
 
 
 def _apply_py(db, app, name, path, sha256):
@@ -517,10 +564,20 @@ def make_migration_database(db):
     if provider is None:
         raise MigrationError("Database object is not bound with a provider yet")
     pool = getattr(provider, "pool", None)
-    args = getattr(pool, "args", ())
-    kwargs = dict(getattr(pool, "kwargs", {}))
     migration_db = Database()
-    migration_db.bind(type(provider), *args, **kwargs)
+    if provider.dialect == "SQLite":
+        # SQLitePool не хранит args (переопределён _init_context); имя файла —
+        # в pool.filename. Для :memory:/:sharedmemory: это свежая отдельная БД —
+        # дата-миграции осмысленны только против файловой БД.
+        filename = getattr(pool, "filename", None)
+        if filename is None:
+            raise MigrationError("Cannot determine the SQLite database filename")
+        kwargs = dict(getattr(pool, "kwargs", {}))
+        migration_db.bind(type(provider), filename, **kwargs)
+    else:
+        args = getattr(pool, "args", ())
+        kwargs = dict(getattr(pool, "kwargs", {}))
+        migration_db.bind(type(provider), *args, **kwargs)
     return migration_db
 
 

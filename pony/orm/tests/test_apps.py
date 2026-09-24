@@ -45,7 +45,11 @@ class TestAppAPI(unittest.TestCase):
 
         db.generate_mapping(check_tables=False, create_tables=False)
         default = db.provider.get_default_entity_table_name(Account)
-        self.assertEqual(Account._table_, (myapp.schema_name, default))
+        if db.provider.dialect == "PostgreSQL":
+            self.assertEqual(Account._table_, (myapp.schema_name, default))
+        else:
+            # MySQL/SQLite: app — логическая группировка, имя таблицы обычное
+            self.assertEqual(Account._table_, default)
 
     def test_entity_string_table_gets_qualified(self):
         db = self.db
@@ -56,8 +60,12 @@ class TestAppAPI(unittest.TestCase):
             name = Required(str)
 
         db.generate_mapping(check_tables=False, create_tables=False)
-        self.assertEqual(Account._table_, ("myapp", "acc"))
+        if db.provider.dialect == "PostgreSQL":
+            self.assertEqual(Account._table_, ("myapp", "acc"))
+        else:
+            self.assertEqual(Account._table_, "acc")
 
+    @only_for("postgres")
     def test_entity_tuple_table_overrides_app(self):
         db = self.db
         myapp = db.app("myapp")
@@ -222,6 +230,82 @@ class TestAppMigrations(unittest.TestCase):
             self._applied(),
             [("accounts", "0001_initial.sql"), ("orders", "0001_initial.sql")],
         )
+
+
+@only_for("sqlite")
+class TestAppMigrationsSQLite(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        dbfile = os.path.join(self.tmp, "test.db")
+        self.db = Database("sqlite", dbfile, create_db=True)
+        self.dir = os.path.join(self.tmp, "migrations")
+        os.makedirs(self.dir)
+
+    def tearDown(self):
+        teardown_database(self.db)
+        shutil.rmtree(self.tmp)
+
+    def _make_db(self):
+        db = self.db
+        accounts = db.app("accounts")
+        orders = db.app("orders")
+
+        class Customer(accounts.Entity):
+            name = Required(str)
+
+        class Order(orders.Entity):
+            customer = Required(Customer)
+
+        db.generate_mapping(check_tables=False, create_tables=False)
+        return db, accounts, orders, Customer, Order
+
+    def _applied(self):
+        with db_session:
+            rows = self.db.select(
+                "SELECT app, name FROM pony_migrations ORDER BY app, name"
+            )
+            return [(app, name) for app, name in rows]
+
+    def test_add_per_app_initial_sql(self):
+        db, accounts, orders, Customer, Order = self._make_db()
+        p1 = accounts.migrations.add(self.dir)
+        p2 = orders.migrations.add(self.dir)
+        self.assertTrue(p1.endswith(os.path.join("accounts", "0001_initial.sql")))
+        self.assertTrue(p2.endswith(os.path.join("orders", "0001_initial.sql")))
+        with open(p1) as f:
+            accounts_sql = f.read()
+        with open(p2) as f:
+            orders_sql = f.read()
+        self.assertNotIn("depends", accounts_sql)
+        self.assertIn("-- depends: accounts/0001_initial.sql", orders_sql)
+        self.assertIn('CREATE TABLE "Customer"', accounts_sql)
+        self.assertNotIn('"Order"', accounts_sql)
+        self.assertIn('REFERENCES "Customer"', orders_sql)
+
+    def test_apply_aggregate_in_order(self):
+        db, accounts, orders, Customer, Order = self._make_db()
+        accounts.migrations.add(self.dir)
+        orders.migrations.add(self.dir)
+        self.assertEqual(
+            db.migrations.apply(self.dir),
+            ["accounts/0001_initial.sql", "orders/0001_initial.sql"],
+        )
+        self.assertEqual(
+            self._applied(),
+            [("accounts", "0001_initial.sql"), ("orders", "0001_initial.sql")],
+        )
+        with db_session:
+            c = Customer(name="a")
+            Order(customer=c)
+            self.assertEqual(Order.select().first().customer.name, "a")
+
+    def test_per_app_apply_requires_cross_app_dep(self):
+        db, accounts, orders, Customer, Order = self._make_db()
+        accounts.migrations.add(self.dir)
+        orders.migrations.add(self.dir)
+        with self.assertRaises(migrations.MigrationError) as ctx:
+            orders.migrations.apply(self.dir)
+        self.assertIn("accounts/0001_initial.sql", str(ctx.exception))
 
 
 if __name__ == "__main__":
