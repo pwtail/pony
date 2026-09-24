@@ -1,16 +1,15 @@
-"""Точка входа миграций pony: `python -m pony.migrate` и команда `pony-migrate`.
+"""Точка входа миграций pony: `python -m pony.migrations` и команда `pony migrations`.
 
 Реализация — в `pony.orm.migrations`. Миграция данных — это `.py`-скрипт,
-который исполняется раннером (как `__main__`, внутри `db_session`); текущая
-база доступна так::
+который исполняется раннером (как `__main__`, внутри `db_session`); свежую
+базу к той же БД скрипт создаёт сам::
 
-    from pony.migrate import db
+    from pony.orm import Database
+
+    db = Database.instance().new()
 
     if __name__ == '__main__':
         ...
-
-Атрибут `db` выставляет раннер на время применения миграции; вне применения
-он равен ``None``.
 """
 
 import sys
@@ -37,14 +36,11 @@ __all__ = [
     "add_named_migration",
     "applied_migrations",
     "apply_migrations",
-    "db",
     "list_migrations",
     "main",
     "merge_migration",
     "plan_migrations",
 ]
-
-db = None
 
 
 if __name__ == "__main__":

@@ -641,17 +641,69 @@ class TestAsyncAPI(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_global_db_session_inside_scoped_is_noop(self):
-        """глобальный db_session внутри async with db: — no-op"""
+    def test_global_db_session_inside_scoped_grants_all(self):
+        # глобальный db_session внутри async with db: разрешает использовать всё
+        other, OtherDept = self._make_other_db()
 
         async def scenario():
             async with self.db:
                 async with db_session:
+                    OtherDept(name="other")
                     self.Dept(name="IT")
             async with db_session:
+                self.assertEqual(await select(x for x in OtherDept).count(), 1)
                 self.assertEqual(await select(x for x in self.Dept).count(), 1)
 
         asyncio.run(scenario())
+
+    def test_with_db_nested_other_db(self):
+        # async with db2: внутри async with db: разрешён; разрешения копятся
+        other, OtherDept = self._make_other_db()
+
+        async def scenario():
+            async with self.db:
+                async with other:
+                    OtherDept(name="other")
+                    self.Dept(name="IT")
+                # разрешение на other живёт до конца внешнего скоупа
+                OtherDept(name="other-2")
+            async with db_session:
+                self.assertEqual(await select(x for x in OtherDept).count(), 2)
+                self.assertEqual(await select(x for x in self.Dept).count(), 1)
+
+        asyncio.run(scenario())
+
+    def test_db_scoped_inside_global_grants_all(self):
+        # async with db2: внутри db_session: — доступно всё
+        other, OtherDept = self._make_other_db()
+
+        async def scenario():
+            async with db_session:
+                async with other:
+                    OtherDept(name="other")
+                    self.Dept(name="IT")
+            async with db_session:
+                self.assertEqual(await select(x for x in OtherDept).count(), 1)
+                self.assertEqual(await select(x for x in self.Dept).count(), 1)
+
+        asyncio.run(scenario())
+
+    def _make_other_db(self):
+        other = Database("postgres_async", DSN)
+
+        class OtherDept(other.Entity):
+            name = Required(str)
+
+        other.generate_mapping(create_tables=True)
+
+        def drop():
+            conn = psycopg.connect(DSN)
+            conn.autocommit = True
+            conn.cursor().execute("DROP TABLE IF EXISTS otherdept CASCADE")
+            conn.close()
+
+        self.addCleanup(drop)
+        return other, OtherDept
 
     def test_db_session_kwargs(self):
         """async with db.session(immediate=True): ≡ db_session(immediate=True)"""

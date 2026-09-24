@@ -3,8 +3,9 @@
 - `db.introspect()` — достраивает объявленные entity-классы атрибутами,
   выводимыми из каталога БД, и генерирует маппинг; после вызова работают
   обычные `db_session` и ORM-запросы.
-- `db.introspect(out='entities.py')` — отладочный режим: пишет в файл
-  описания сущностей, выведенные из схемы БД (классы при этом не трогает).
+- `db.introspect('Person', 'Book')` — отладочный режим: возвращает строку
+  с описаниями указанных сущностей, выведенными из схемы БД (классы при
+  этом не трогает).
 
 Диалекты: PostgreSQL (каталог pg_catalog), MySQL/MariaDB (information_schema),
 SQLite (PRAGMA). Sync.
@@ -22,6 +23,15 @@ from pony.orm.ormtypes import FloatArray, IntArray, Json, StrArray
 
 class IntrospectionError(core.OrmError):
     pass
+
+
+class _DumpResult(str):
+    # в консоли/ноутбуке показывается как код, а не как repr строки
+    def __repr__(self):
+        return str(self)
+
+    def _repr_pretty_(self, p, cycle):
+        p.text(str(self))
 
 
 TYPE_PY = {
@@ -482,25 +492,51 @@ def _table_info_sqlite(db, table_name):
     }
 
 
+def _entity_table_name(db, entity):
+    root = entity._root_
+    if root is not entity:
+        entity = root
+    table_name = entity._table_
+    if table_name is None:
+        table_name = db.provider.get_default_entity_table_name(entity)
+    app = getattr(entity, "_app_", None)
+    if (
+        app is not None
+        and db.provider.dialect == "PostgreSQL"
+        and isinstance(table_name, str)
+    ):
+        table_name = (app.schema_name, table_name)
+    return table_name
+
+
 def _create_referenced_entities(db):
     """Создаёт entity-классы для упомянутых в декларациях, но не объявленных
-    сущностей, если в схеме есть таблица по конвенции имени."""
+    сущностей, если в схеме есть таблица по конвенции имени; в том же
+    application, что и ссылающаяся сущность."""
     missing = []
+    seen = set()
     for entity in list(db.entities.values()):
         if entity._root_ is not entity:
             continue
         for attr in entity._new_attrs_:
             py_type = attr.py_type
             if isinstance(py_type, str) and py_type not in db.entities:
-                missing.append(py_type)
-    for name in missing:
+                app = getattr(entity, "_app_", None)
+                key = (py_type, app)
+                if key not in seen:
+                    seen.add(key)
+                    missing.append(key)
+    for name, app in missing:
         table_name = db.provider.normalize_name(name)
+        if app is not None and db.provider.dialect == "PostgreSQL":
+            table_name = (app.schema_name, table_name)
         if not _table_exists(db, table_name):
             raise IntrospectionError(
                 "Entity %s is referenced by the model but not declared, "
                 "and table %r does not exist" % (name, table_name)
             )
-        core.EntityMeta(name, (db.Entity,), {})
+        base = app.Entity if app is not None else db.Entity
+        core.EntityMeta(name, (base,), {})
 
 
 def _add_attr(entity, name, attr):
@@ -538,9 +574,9 @@ def _attr_name_for_fk(column):
     return column
 
 
-def introspect(db, out=None):
-    """db.introspect(out=None): заполняет классы из схемы БД и строит маппинг;
-    с out='файл' — пишет выведенные описания сущностей в файл (отладка)."""
+def introspect(db, *entities):
+    """db.introspect(*entities): без имён заполняет классы из схемы БД и
+    строит маппинг; с именами — возвращает описания указанных сущностей."""
     if db.provider is None:
         raise IntrospectionError("Database object is not bound with a provider yet")
     if db.provider.dialect not in ("PostgreSQL", "MySQL", "SQLite"):
@@ -550,16 +586,21 @@ def introspect(db, out=None):
         )
     if db.schema is not None:
         raise IntrospectionError("Mapping was already generated")
-    if out is None and not any(
+    if entities:
+        with core.db_session:
+            return _dump_declarations(db, entities)
+    if not db._pending_entities and not any(
         entity._root_ is entity for entity in db.entities.values()
     ):
         raise IntrospectionError(
             "No entities are declared: declare the entity classes you need "
             "(even empty ones) before db.introspect()"
         )
-    with core.db_session(ddl=True):
-        if out is not None:
-            return _dump_declarations(db, out)
+    # интроспекция выполняется: флаг снимается, ленивый триггер больше
+    # не срабатывает (в т.ч. на внутренних запросах)
+    db._is_empty = False
+    with core.db_session:
+        _create_pending_entities(db)
         _create_referenced_entities(db)
         entities = [
             entity
@@ -568,17 +609,13 @@ def introspect(db, out=None):
         ]
         table_map = {}
         for entity in entities:
-            table_name = entity._table_ or db.provider.get_default_entity_table_name(
-                entity
-            )
+            table_name = _entity_table_name(db, entity)
             qname = _qualified_name(table_name)
             table_map[qname] = entity
             # case-insensitive fallback: имена таблиц в SQLite/MySQL регистронезависимы
             table_map.setdefault(qname.lower(), entity)
         for entity in entities:
-            table_name = entity._table_ or db.provider.get_default_entity_table_name(
-                entity
-            )
+            table_name = _entity_table_name(db, entity)
             info = table_info(db, table_name)
             _fill_entity(db, entity, table_name, table_map, info)
     db.generate_mapping(check_tables=False)
@@ -684,11 +721,14 @@ def _list_tables(db):
     """Список таблиц для debug-дампа: [(schema_or_None, table), ...]."""
     dialect = db.provider.dialect
     if dialect == "PostgreSQL":
+        schemas = sorted({app.schema_name for app in db._apps.values()})
         rows = _q(
             db,
             "SELECT schemaname, tablename FROM pg_tables "
-            "WHERE schemaname = current_schema() ORDER BY tablename",
-            {},
+            "WHERE schemaname = current_schema() "
+            "OR schemaname = ANY($schemas) "
+            "ORDER BY schemaname, tablename",
+            {"schemas": schemas},
         )
         return [(row.schemaname, row.tablename) for row in rows]
     if dialect == "MySQL":
@@ -707,33 +747,189 @@ def _list_tables(db):
     return [(None, row) for row in rows]
 
 
-def _dump_declarations(db, out):
+def _declared_entities(db, tables):
+    declared = {}
+    for entity in db.entities.values():
+        if entity._root_ is not entity:
+            continue
+        table_name = entity._table_
+        if isinstance(table_name, tuple):
+            key = (table_name[0], table_name[1])
+            if key in tables:
+                declared[key] = entity
+            continue
+        if not isinstance(table_name, str):
+            table_name = db.provider.get_default_entity_table_name(entity)
+        for schema, table in tables:
+            if table.lower() == table_name.lower():
+                declared[(schema, table)] = entity
+                break
+    return declared
+
+
+def _declared_sets(children, declared):
+    result = {}
+    for parent_key, entity in declared.items():
+        for attr in entity._new_attrs_:
+            if not attr.is_collection:
+                continue
+            target = attr.py_type
+            target_name = target.__name__ if isinstance(target, type) else str(target)
+            for child_key, fk_col in children.get(parent_key, []):
+                child = declared.get(child_key)
+                if (
+                    _entity_name(child_key[1]) == target_name
+                    or (child is not None and child.__name__ == target_name)
+                ):
+                    result[(child_key, fk_col)] = attr.name
+    return result
+
+
+def _declared_attr_name(entity, column):
+    if entity is None:
+        return None
+    for attr in entity._new_attrs_:
+        if attr.is_collection:
+            continue
+        columns = attr.columns if attr.columns else [attr.name]
+        if any(c.lower() == column.lower() for c in columns):
+            return attr.name
+    return None
+
+
+def _resolve_names(db, tables, names):
+    by_name = {}
+    for schema, table in tables:
+        by_name.setdefault(_entity_name(table).lower(), []).append((schema, table))
+
+    def catalog_key(table_name):
+        if isinstance(table_name, tuple):
+            schema, table = table_name
+            for key in tables:
+                if key == (schema, table):
+                    return key
+        else:
+            for key in tables:
+                if key[1].lower() == table_name.lower():
+                    return key
+        return None
+
+    def entity_key(entity):
+        key = catalog_key(_entity_table_name(db, entity))
+        if key is None:
+            raise IntrospectionError(
+                "Entity %s is not mapped to a table" % entity.__name__
+            )
+        return key
+
+    resolved = []
+    for ref in names:
+        if isinstance(ref, core.EntityMeta):
+            resolved.append((ref.__name__, entity_key(ref)))
+            continue
+        if not isinstance(ref, str):
+            raise IntrospectionError(
+                "Entity reference must be a string or an entity class, got %r"
+                % (ref,)
+            )
+        if "." in ref:
+            app_name, entity_name = ref.split(".", 1)
+            app = db._apps.get(app_name)
+            if app is None:
+                raise IntrospectionError(
+                    "Unknown application %r in entity reference %r"
+                    % (app_name, ref)
+                )
+            entity = db.entities.get(entity_name)
+            if entity is not None and getattr(entity, "_app_", None) is app:
+                resolved.append((entity_name, entity_key(entity)))
+                continue
+            table_name = db.provider.normalize_name(entity_name)
+            if db.provider.dialect == "PostgreSQL":
+                table_name = (app.schema_name, table_name)
+            key = catalog_key(table_name)
+            if key is None:
+                raise IntrospectionError(
+                    "Unknown entity %r: table %r does not exist"
+                    % (ref, _qualified_name(table_name))
+                )
+            resolved.append((entity_name, key))
+            continue
+        entity = db.entities.get(ref)
+        if entity is not None:
+            resolved.append((ref, entity_key(entity)))
+            continue
+        matched = by_name.get(ref.lower())
+        if not matched:
+            available = sorted(
+                set(db.entities) | {_entity_name(table) for _, table in tables}
+            )
+            raise IntrospectionError(
+                "Unknown entity %r; expected one of: %s"
+                % (ref, ", ".join(available))
+            )
+        for key in matched:
+            item = (ref, key)
+            if item not in resolved:
+                resolved.append(item)
+    return resolved
+
+
+def _create_pending_entities(db):
+    for name, key in db._pending_entities:
+        if name in db.entities:
+            continue
+        schema, table = key
+        attrs = {}
+        default = db.provider.normalize_name(name)
+        if schema and schema != "public":
+            attrs["_table_"] = (schema, table)
+        elif default != table:
+            attrs["_table_"] = table
+        type(name, (db.Entity,), attrs)
+
+
+def _dump_declarations(db, names=()):
     tables = _list_tables(db)
+    resolved = _resolve_names(db, tables, names) if names else []
+    if db._is_empty:
+        db._pending_entities = list(resolved)
     infos = {}
     children = {}
     for schema, table in tables:
         key = (schema, table)
-        infos[key] = table_info(db, table)
+        table_name = key if schema else table
+        infos[key] = table_info(db, table_name)
     for key, info in infos.items():
         for col, fk in info["fks"].items():
             if fk.ncols != 1:
                 continue
             parent_key = (fk.pschema, fk.ptable)
             children.setdefault(parent_key, []).append((key, col))
+    declared = _declared_entities(db, tables)
+    declared_sets = _declared_sets(children, declared)
+    if names:
+        selected = list(dict.fromkeys(key for _name, key in resolved))
+    else:
+        selected = tables
     lines = ["from pony.orm import *", "", ""]
-    for schema, table in tables:
+    for schema, table in selected:
         key = (schema, table)
-        lines.extend(_dump_entity(db, key, infos[key], children.get(key, [])))
-    with open(out, "w") as f:
-        f.write("\n".join(lines))
-        f.write("\n")
-    return out
+        lines.extend(
+            _dump_entity(
+                db, key, infos[key], children.get(key, []), declared, declared_sets
+            )
+        )
+    return _DumpResult("\n".join(lines))
 
 
-def _dump_entity(db, key, info, child_list):
+def _dump_entity(db, key, info, child_list, declared=None, declared_sets=None):
     schema, table = key
+    declared = declared or {}
+    declared_sets = declared_sets or {}
+    entity = declared.get(key)
     lines = []
-    cls = _entity_name(table)
+    cls = entity.__name__ if entity is not None else _entity_name(table)
     lines.append("class %s(db.Entity):" % cls)
     if schema and schema != "public":
         lines.append("    _table_ = (%r, %r)" % (schema, table))
@@ -744,13 +940,17 @@ def _dump_entity(db, key, info, child_list):
     for name, cinfo in info["column_list"]:
         fk = fk_cols.get(name)
         if fk is not None and name not in pk:
-            attr_name = _attr_name_for_fk(name)
+            attr_name = _declared_attr_name(
+                declared.get(key), name
+            ) or _attr_name_for_fk(name)
             parent = _entity_name(fk.ptable)
             kind = "Optional" if not cinfo["notnull"] else "Required"
             args = ["%r" % parent]
             if attr_name != name:
                 args.append("column=%r" % name)
-            args.append("reverse=%r" % (table + "_set"))
+            args.append(
+                "reverse=%r" % declared_sets.get((key, name), table + "_set")
+            )
             lines.append(
                 "    %s = %s(%s)" % (attr_name, kind, ", ".join(args))
             )
@@ -798,9 +998,13 @@ def _dump_entity(db, key, info, child_list):
         )
     for (child_key, fk_col) in sorted(child_list):
         child_table = child_key[1]
+        set_name = declared_sets.get((child_key, fk_col), child_table + "_set")
+        fk_name = _declared_attr_name(
+            declared.get(child_key), fk_col
+        ) or _attr_name_for_fk(fk_col)
         lines.append(
             "    %s = Set(%r, reverse=%r)"
-            % (child_table + "_set", _entity_name(child_table), _attr_name_for_fk(fk_col))
+            % (set_name, _entity_name(child_table), fk_name)
         )
     lines.append("")
     return lines

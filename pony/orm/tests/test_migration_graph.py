@@ -14,6 +14,7 @@ from pony.orm.tests import db_params, only_for, teardown_database
 class TestMigrationGraph(unittest.TestCase):
     def setUp(self):
         self.db = Database(**db_params)
+        self.app = self.db.application("main", schema="public")
         self.dir = tempfile.mkdtemp()
         with db_session(ddl=True):
             rows = self.db.select(
@@ -28,7 +29,9 @@ class TestMigrationGraph(unittest.TestCase):
         shutil.rmtree(self.dir)
 
     def _write(self, name, content):
-        path = os.path.join(self.dir, name)
+        app_dir = os.path.join(self.dir, "main")
+        os.makedirs(app_dir, exist_ok=True)
+        path = os.path.join(app_dir, name)
         with open(path, "w") as f:
             f.write(content)
         return path
@@ -57,7 +60,7 @@ class TestMigrationGraph(unittest.TestCase):
             "0004_merge.txt",
             "-- depends: 0002_a.sql, 0003_b.sql\n--\n-- merge\n",
         )
-        graph = migrations.MigrationGraph(self.dir)
+        graph = migrations.MigrationGraph(self.dir, "main")
         self.assertEqual(
             graph.order,
             [
@@ -68,7 +71,7 @@ class TestMigrationGraph(unittest.TestCase):
             ],
         )
         self.assertEqual(graph.heads, ["0004_merge.txt"])
-        infos = migrations.plan_migrations(db, self.dir)
+        infos = migrations.plan_migrations(db, self.dir, app="main")
         self.assertEqual(
             [info.name for info in infos],
             [
@@ -93,7 +96,7 @@ class TestMigrationGraph(unittest.TestCase):
             "0003_b.sql",
             '-- depends: 0001_initial.sql\nCREATE TABLE "t3" (id integer)',
         )
-        graph = migrations.MigrationGraph(self.dir)
+        graph = migrations.MigrationGraph(self.dir, "main")
         self.assertEqual(graph.dependencies["0001_initial.sql"], [])
         self.assertEqual(
             graph.dependencies["0002_a.sql"], ["0001_initial.sql"]
@@ -111,14 +114,14 @@ class TestMigrationGraph(unittest.TestCase):
             "depends = ['0001_initial.sql']\n\ndef up(db):\n    pass\n",
         )
         with self.assertRaises(migrations.MigrationError) as ctx:
-            migrations.plan_migrations(db, self.dir)
+            migrations.plan_migrations(db, self.dir, app="main")
         self.assertIn("# depends", str(ctx.exception))
 
     def test_missing_dependency_is_an_error(self):
         db = self.db
         self._write("0001_a.sql", "-- depends: 0099_x.sql\nSELECT 1")
         with self.assertRaises(migrations.MigrationError) as ctx:
-            migrations.plan_migrations(db, self.dir)
+            migrations.plan_migrations(db, self.dir, app="main")
         self.assertIn("0099_x.sql", str(ctx.exception))
 
     def test_cycle_is_an_error(self):
@@ -126,7 +129,7 @@ class TestMigrationGraph(unittest.TestCase):
         self._write("0001_a.sql", "-- depends: 0002_b.sql\nSELECT 1")
         self._write("0002_b.sql", "-- depends: 0001_a.sql\nSELECT 1")
         with self.assertRaises(migrations.MigrationError) as ctx:
-            migrations.plan_migrations(db, self.dir)
+            migrations.plan_migrations(db, self.dir, app="main")
         self.assertIn("->", str(ctx.exception))
 
     def test_multiple_heads_are_an_error(self):
@@ -141,13 +144,13 @@ class TestMigrationGraph(unittest.TestCase):
             '-- depends: 0001_initial.sql\nCREATE TABLE "t3" (id integer)',
         )
         with self.assertRaises(migrations.MigrationError) as ctx:
-            migrations.plan_migrations(db, self.dir)
+            migrations.plan_migrations(db, self.dir, app="main")
         message = str(ctx.exception)
         self.assertIn("0002_a.sql", message)
         self.assertIn("0003_b.sql", message)
         self.assertIn("merge", message)
         with self.assertRaises(migrations.MigrationError):
-            migrations.apply_migrations(db, self.dir)
+            migrations.apply_migrations(db, self.dir, app="main")
 
     def test_txt_merge_migration_is_noop(self):
         db = self.db
@@ -165,7 +168,7 @@ class TestMigrationGraph(unittest.TestCase):
             "-- depends: 0002_a.sql, 0003_b.sql\n--\n-- merge\n",
         )
         self.assertEqual(
-            migrations.apply_migrations(db, self.dir),
+            migrations.apply_migrations(db, self.dir, app="main"),
             [
                 "0001_initial.sql",
                 "0002_a.sql",
@@ -186,7 +189,7 @@ class TestMigrationGraph(unittest.TestCase):
             "0003_b.sql",
             '-- depends: 0001_initial.sql\nCREATE TABLE "t3" (id integer)',
         )
-        path = migrations.merge_migration(db, self.dir)
+        path = migrations.merge_migration(db, self.dir, app="main")
         self.assertEqual(os.path.basename(path), "0004_merge.txt")
         with open(path) as f:
             content = f.read()
@@ -213,7 +216,7 @@ class TestMigrationGraph(unittest.TestCase):
         self.assertLess(head_line, tail_line)
         # граф закрыт: одна голова, миграции применяются
         self.assertEqual(
-            migrations.apply_migrations(db, self.dir),
+            migrations.apply_migrations(db, self.dir, app="main"),
             [
                 "0001_initial.sql",
                 "0002_a.sql",
@@ -225,7 +228,7 @@ class TestMigrationGraph(unittest.TestCase):
     def test_merge_with_single_head_does_nothing(self):
         db = self.db
         self._write("0001_initial.sql", 'CREATE TABLE "t1" (id integer)')
-        self.assertIsNone(migrations.merge_migration(db, self.dir))
+        self.assertIsNone(migrations.merge_migration(db, self.dir, app="main"))
 
     def test_merge_with_three_heads_is_an_error(self):
         db = self.db
@@ -236,7 +239,7 @@ class TestMigrationGraph(unittest.TestCase):
                 '-- depends: 0001_initial.sql\nSELECT 1',
             )
         with self.assertRaises(migrations.MigrationError):
-            migrations.merge_migration(db, self.dir)
+            migrations.merge_migration(db, self.dir, app="main")
 
     def test_cli_plan_merge_and_no_dry_run(self):
         db = self.db
@@ -254,24 +257,25 @@ class TestMigrationGraph(unittest.TestCase):
                 '-- depends: 0001_initial.sql\nCREATE TABLE "t3" (id integer)',
             )
             code = migrations.main(
-                ["plan", "--db", module.__name__ + ":db", "--dir", self.dir]
+                ["migrations", "plan", "--db", module.__name__ + ":db", "--dir", self.dir]
             )
             self.assertEqual(code, 1)  # две головы — ошибка
             code = migrations.main(
-                ["merge", "--db", module.__name__ + ":db", "--dir", self.dir]
+                ["migrations", "merge", "--db", module.__name__ + ":db", "--dir", self.dir]
             )
             self.assertEqual(code, 0)
             code = migrations.main(
-                ["plan", "--db", module.__name__ + ":db", "--dir", self.dir]
+                ["migrations", "plan", "--db", module.__name__ + ":db", "--dir", self.dir]
             )
             self.assertEqual(code, 0)
             code = migrations.main(
-                ["apply", "--db", module.__name__ + ":db", "--dir", self.dir]
+                ["migrations", "apply", "--db", module.__name__ + ":db", "--dir", self.dir]
             )
             self.assertEqual(code, 0)
             with self.assertRaises(SystemExit):
                 migrations.main(
                     [
+                        "migrations",
                         "apply",
                         "--db",
                         module.__name__ + ":db",

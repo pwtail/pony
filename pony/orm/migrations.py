@@ -1,39 +1,41 @@
-"""Миграции pony ORM, этапы 1 и 3, с поддержкой приложений (app).
+"""Миграции pony ORM, этапы 1 и 3, с поддержкой приложений (application).
 
 - `db.migrations.add()` — `0001_initial.sql` из деклараций моделей
   (вместо `generate_mapping(create_tables=True)`);
-- `db.migrations.apply()` — применить неприменённые миграции (все app);
+- `db.migrations.apply()` — применить неприменённые миграции (все applications);
 - `db.migrations.plan()` — вычисленный порядок применения;
 - `db.migrations.merge()` — миграция слияния для двух разошедшихся веток;
-- `myapp.migrations.add()/apply()/plan()/merge()` — то же для одного app.
+- `myapplication.migrations.add()/apply()/plan()/merge()` — то же для одного
+  application.
 
-Миграции приложений лежат в `migrations/<app>/`, без app — в корне `migrations/`.
-Трекинг — общая таблица `pony_migrations(app, name, sha256, applied_at)`.
+Миграции лежат в `migrations/<application>/`; корня нет — без application
+команды идут по всем applications. Трекинг — общая таблица
+`pony_migrations(app, name, sha256, applied_at)`.
 
 Файлы миграций:
 
 - `.sql` — миграция схемы (применяется целиком);
 - `.py` — миграция данных: исполняется **как скрипт** внутри `db_session`,
-  с `__name__ == '__main__'`; текущая база — `from pony.migrate import db`;
+  с `__name__ == '__main__'`; свежая база — `db = Database.instance().new()`;
 - `.txt` — миграция слияния (no-op, только запись в `pony_migrations`).
 
 Зависимости объявляются в первых строках файла: `-- depends: a.sql, b.py`
-(или `# depends:` для `.py`). Голое имя — та же папка (свой app), `app/имя` —
-миграция другого app (`depends: 003.sql, myapp/0002.sql`). Порядок применения —
-топологическая сортировка с лексикографическим tie-break; у графа каждого app
-должна быть ровно одна голова.
+(или `# depends:` для `.py`). Голое имя — та же папка (свой application),
+`application/имя` — миграция другого application (`depends: 003.sql,
+myapplication/0002.sql`). Порядок применения — топологическая сортировка с
+лексикографическим tie-break; у графа каждого application должна быть ровно
+одна голова.
 
 CLI::
 
-    pony-migrate add --db myapp.models:db
-    pony-migrate apply --db myapp.models:db [--fake]
-    pony-migrate plan --db myapp.models:db
-    pony-migrate merge --db myapp.models:db [--name NAME]
-    pony-migrate <app> apply --db myapp.models:db
+    pony migrations make --db myapp.models:db
+    pony migrations apply --db myapp.models:db [--fake]
+    pony migrations plan --db myapp.models:db
+    pony migrations merge --db myapp.models:db [--name NAME]
+    pony migrations <application> make --db myapp.models:db
 """
 
 import argparse
-import configparser
 import hashlib
 import heapq
 import importlib
@@ -75,12 +77,12 @@ def _node_str(node):
 
 
 class MigrationGraph:
-    """Граф зависимостей миграций одной папки (одного app).
+    """Граф зависимостей миграций одной папки (одного application).
 
     Зависимости — только явные: `-- depends:` / `# depends:` в первых строках
     файла; миграция без директивы — корень. Голое имя — зависимость в той же
-    папке, `app/имя` — зависимость от миграции другого app (хранится отдельно
-    в `cross_dependencies` и в топосорт не входит).
+    папке, `application/имя` — зависимость от миграции другого application
+    (хранится отдельно в `cross_dependencies` и в топосорт не входит).
     """
 
     def __init__(self, directory, app=""):
@@ -130,10 +132,10 @@ class MigrationGraph:
 
 
 class MigrationsFacade:
-    """Объект db.migrations / myapp.migrations: программный интерфейс миграций.
+    """Объект db.migrations / myapplication.migrations: интерфейс миграций.
 
-    `app=None` — уровень базы (aggregate: apply/plan по всем app, add/merge — по
-    корню без app); `app='имя'` — один app.
+    `app=None` — уровень базы (aggregate: только applications); `app='имя'` —
+    один application.
     """
 
     def __init__(self, db, app=None):
@@ -143,10 +145,9 @@ class MigrationsFacade:
     def add(self, directory="migrations", name=None):
         """Без имени — 0001_initial.sql из деклараций моделей;
         `add('some.py')` — следующая по номеру дата-миграция."""
-        app = "" if self.app is None else self.app
         if name:
-            return add_named_migration(self.db, directory, name, app=app)
-        return add_migration(self.db, directory, app=app)
+            return add_named_migration(self.db, directory, name, app=self.app)
+        return add_migration(self.db, directory, app=self.app)
 
     def apply(self, directory="migrations", fake=False):
         """Применяет неприменённые миграции в порядке графа."""
@@ -158,8 +159,7 @@ class MigrationsFacade:
 
     def merge(self, directory="migrations", name="merge"):
         """Создаёт .txt-миграцию слияния для двух голов графа."""
-        app = "" if self.app is None else self.app
-        return merge_migration(self.db, directory, name=name, app=app)
+        return merge_migration(self.db, directory, name=name, app=self.app)
 
 
 SUPPORTED_DIALECTS = ("PostgreSQL", "MySQL", "SQLite")
@@ -277,15 +277,14 @@ def ensure_single_head(graph):
         raise MigrationError(
             "Multiple migration heads: %s. Declare `-- depends: <head>` "
             "(or `# depends:` for .py) on the new migration, or close the "
-            "branch with a merge migration: pony-migrate merge"
+            "branch with a merge migration: pony migrations merge"
             % ", ".join(graph.heads)
         )
 
 
 def _global_nodes(directory, apps):
-    """Глобальный граф по всем app: узлы (app, name) → зависимости (app, name).
-
-    apps — список имён app ('' = корень). Кросс-app зависимости разрешаются
+    """Глобальный граф по всем applications: узлы (application, name) →
+    зависимости (application, name). Кросс-application зависимости разрешаются
     здесь и становятся обычными рёбрами топосорта.
     """
     nodes = {}
@@ -314,11 +313,11 @@ def _global_nodes(directory, apps):
 
 
 def _registered_apps(db):
-    return [""] + sorted(db._apps.keys())
+    return sorted(db._apps.keys())
 
 
 def _table_app(table):
-    """Имя app, которому принадлежит таблица (по entities/m2m), или '' (без app)."""
+    """Имя application, которому принадлежит таблица (по entities/m2m), или ''."""
     for entity in table.entities:
         app = getattr(entity, "_app_", None)
         if app is not None:
@@ -337,8 +336,8 @@ def _tables_for_scope(db, app):
 
 
 def _cross_app_depends(db, directory, app):
-    """Зависимости `0001_initial.sql` от других app, на которые ссылаются
-    FK-таблицы этого app (для авто-`-- depends:` в шапке)."""
+    """Зависимости `0001_initial.sql` от других applications, на которые
+    ссылаются FK-таблицы этого application (авто-`-- depends:` в шапке)."""
     if app in (None, ""):
         return ""
     app_tables = {id(t) for t in _tables_for_scope(db, app)}
@@ -370,8 +369,14 @@ def file_sha256(path):
 
 def add_migration(db, directory, name="0001_initial.sql", app=None):
     """Вместо generate_mapping(create_tables=True): пишет 0001_initial.sql
-    из деклараций моделей. Для app — только таблицы его схемы + авто-зависимости
-    от app, на которые идут FK."""
+    из деклараций моделей. Для application — только его таблицы + авто-зависимости
+    от applications, на которые идут FK. Без application — по всем applications,
+    список путей."""
+    if app is None:
+        return [
+            add_migration(db, directory, name, application)
+            for application in _registered_apps(db)
+        ]
     _check_supported(db)
     if db.schema is None:
         db.generate_mapping(check_tables=False, create_tables=False)
@@ -395,7 +400,13 @@ def add_named_migration(db, directory, file_name, app=None):
     """Создаёт следующую по номеру миграцию с указанным именем:
     `add some_name.py` → `000N_some_name.py` (дата-миграция-скрипт),
     `add some_name.sql` → `000N_some_name.sql` (заготовка SQL-миграции).
-    В шапку подставляется текущая голова графа app (`-- depends:` / `# depends:`)."""
+    В шапку подставляется текущая голова графа application (`-- depends:` /
+    `# depends:`). Без application — по всем applications, список путей."""
+    if app is None:
+        return [
+            add_named_migration(db, directory, file_name, application)
+            for application in _registered_apps(db)
+        ]
     base, ext = os.path.splitext(file_name)
     if ext not in (".py", ".sql"):
         raise MigrationError(
@@ -419,7 +430,9 @@ def add_named_migration(db, directory, file_name, app=None):
     if ext == ".py":
         if lines:
             lines.append("")
-        lines.append("from pony.migrate import db")
+        lines.append("from pony.orm import Database")
+        lines.append("")
+        lines.append("db = Database.instance().new()")
         lines.append("")
         lines.append("if __name__ == '__main__':")
         lines.append("    pass")
@@ -527,58 +540,39 @@ def _split_sql_statements(sql):
 def _apply_py(db, app, name, path, sha256):
     """Исполняет .py-миграцию как скрипт (`__main__`) внутри db_session.
 
-    Миграция получает **свежую Database**, привязанную к той же БД, но без
-    моделей приложения: модели в миграции определяются интроспекцией
-    (`db.introspect()`); текущая база доступна как
-    `from pony.migrate import db`.
+    Скрипт сам создаёт свежую Database к той же БД без моделей приложения:
+    `db = Database.instance().new()`; дальше модели определяются интроспекцией
+    (`db.introspect()`).
     """
-    from pony import migrate as pony_migrate
-
     with open(path) as f:
         source = f.read()
     module_globals = {
         "__name__": "__main__",
         "__file__": path,
     }
-    migration_db = make_migration_database(db)
+    Database._instance = db
 
     def run():
-        pony_migrate.db = migration_db
-        try:
-            exec(compile(source, path, "exec"), module_globals)
-        finally:
-            pony_migrate.db = None
+        exec(compile(source, path, "exec"), module_globals)
+        migration_db = Database.instance()
+        if migration_db is db:
+            raise MigrationError(
+                "Data migration %s must create its own database: "
+                "db = Database.instance().new()" % name
+            )
+        # всё, что миграция реально использовала, уже интроспектировано;
+        # запись в pony_migrations сама по себе интроспекцию не запускает
+        migration_db._is_empty = False
         _record(migration_db, app, name, sha256)
 
     try:
-        with db_session(ddl=True):
+        with db_session:
             run()
     finally:
-        migration_db.disconnect()
-
-
-def make_migration_database(db):
-    """Свежая Database к той же БД, что и db, но без моделей приложения:
-    в миграции модели определяются интроспекцией."""
-    provider = db.provider
-    if provider is None:
-        raise MigrationError("Database object is not bound with a provider yet")
-    pool = getattr(provider, "pool", None)
-    migration_db = Database()
-    if provider.dialect == "SQLite":
-        # SQLitePool не хранит args (переопределён _init_context); имя файла —
-        # в pool.filename. Для :memory:/:sharedmemory: это свежая отдельная БД —
-        # дата-миграции осмысленны только против файловой БД.
-        filename = getattr(pool, "filename", None)
-        if filename is None:
-            raise MigrationError("Cannot determine the SQLite database filename")
-        kwargs = dict(getattr(pool, "kwargs", {}))
-        migration_db.bind(type(provider), filename, **kwargs)
-    else:
-        args = getattr(pool, "args", ())
-        kwargs = dict(getattr(pool, "kwargs", {}))
-        migration_db.bind(type(provider), *args, **kwargs)
-    return migration_db
+        migration_db = Database.instance()
+        Database._instance = db
+        if migration_db is not db:
+            migration_db.disconnect()
 
 
 def _apply_txt(db, app, name, sha256):
@@ -589,7 +583,7 @@ def _apply_txt(db, app, name, sha256):
 def plan_migrations(db, directory, app=None):
     """Порядок применения миграций с отметками применённых.
 
-    `app=None` — по всем app (aggregate); `app='имя'` — один app."""
+    `app=None` — по всем applications (aggregate); `app='имя'` — один application."""
     _check_supported(db)
     if app is None:
         apps = _registered_apps(db)
@@ -625,8 +619,8 @@ def apply_migrations(db, directory, fake=False, app=None):
     Каждая миграция — в своей транзакции; после успеха записывается
     в pony_migrations (app, name, sha256, applied_at).
 
-    `app=None` — все app (aggregate); `app='имя'` — один app (кросс-app
-    зависимости проверяются как уже применённые)."""
+    `app=None` — все applications (aggregate); `app='имя'` — один application
+    (кросс-application зависимости проверяются как уже применённые)."""
     _check_supported(db)
     ensure_migrations_table(db)
     if app is None:
@@ -738,8 +732,18 @@ def _render_history(merge_name, left_names, right_names, common_names):
 
 
 def merge_migration(db, directory, name="merge", app=None):
-    """Создаёт .txt-миграцию слияния для двух голов графа app.
-    Возвращает путь нового файла; None, если сливать нечего."""
+    """Создаёт .txt-миграцию слияния для двух голов графа application.
+    Возвращает путь нового файла; None, если сливать нечего.
+    Без application — по всем applications, список путей."""
+    if app is None:
+        return [
+            path
+            for path in (
+                merge_migration(db, directory, name=name, app=application)
+                for application in _registered_apps(db)
+            )
+            if path is not None
+        ]
     graph = MigrationGraph(directory, app or "")
     heads = graph.heads
     if not heads:
@@ -770,16 +774,6 @@ def merge_migration(db, directory, name="merge", app=None):
         f.write("\n".join(lines))
         f.write("\n")
     return path
-
-
-def _read_config(path):
-    if path is None or not os.path.exists(path):
-        return {}
-    parser = configparser.ConfigParser()
-    parser.read(path)
-    if not parser.has_section("pony-migrate"):
-        return {}
-    return dict(parser.items("pony-migrate"))
 
 
 def _load_db(spec):
@@ -828,37 +822,34 @@ def main(argv=None):
         argv = sys.argv[1:]
     else:
         argv = list(argv)
-    app = None
+    if argv and argv[0] == "migrations":
+        argv = argv[1:]
+    application = None
     if (
         argv
         and not argv[0].startswith("-")
-        and argv[0] not in ("add", "apply", "plan", "merge")
+        and argv[0] not in ("make", "apply", "plan", "merge")
     ):
-        app = argv.pop(0)
+        application = argv.pop(0)
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--db", help="database object as <module>:<attr> (e.g. myapp.models:db)"
     )
     common.add_argument(
-        "--config",
-        default="pony_migrate.ini",
-        help="config file with [pony-migrate] db=/migrations_dir= (default: pony_migrate.ini)",
-    )
-    common.add_argument(
         "--dir",
         dest="directory",
         help="migrations directory (default: migrations)",
     )
-    parser = argparse.ArgumentParser(prog="pony-migrate")
+    parser = argparse.ArgumentParser(prog="pony migrations")
     sub = parser.add_subparsers(dest="command", required=True)
-    add_parser = sub.add_parser(
-        "add",
+    make_parser = sub.add_parser(
+        "make",
         parents=[common],
         help="generate 0001_initial.sql from the model declarations, "
         "or create the next numbered migration from a name",
     )
-    add_parser.add_argument(
+    make_parser.add_argument(
         "name",
         nargs="?",
         default=None,
@@ -890,43 +881,55 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
-        config = _read_config(args.config)
-        spec = args.db or config.get("db")
+        spec = args.db
         if not spec:
             raise MigrationError(
-                "Database is not specified: use --db <module>:<attr> "
-                "or [pony-migrate] db = ... in the config file"
+                "Database is not specified: use --db <module>:<attr>"
             )
         db = _load_db(spec)
-        directory = args.directory or config.get("migrations_dir") or "migrations"
-        if app is not None and app not in db._apps:
+        directory = args.directory or "migrations"
+        if application is not None and application not in db._apps:
             raise MigrationError(
-                "Unknown app %r. Registered apps: %s"
-                % (app, ", ".join(sorted(db._apps)) or "none")
+                "Unknown application %r. Registered applications: %s"
+                % (application, ", ".join(sorted(db._apps)) or "none")
             )
-        if args.command == "add":
+        if args.command == "make":
             if args.name:
-                path = add_named_migration(db, directory, args.name, app=app)
+                paths = add_named_migration(
+                    db, directory, args.name, app=application
+                )
             else:
-                path = add_migration(db, directory, app=app)
-            print("created %s" % path)
+                paths = add_migration(db, directory, app=application)
+            if not isinstance(paths, list):
+                paths = [paths]
+            if not paths:
+                print("no applications registered")
+            for path in paths:
+                print("created %s" % path)
         elif args.command == "plan":
-            _print_plan(db, directory, app=app)
+            _print_plan(db, directory, app=application)
         elif args.command == "merge":
-            path = merge_migration(db, directory, name=args.name, app=app)
-            if path is None:
+            paths = merge_migration(
+                db, directory, name=args.name, app=application
+            )
+            if not isinstance(paths, list):
+                paths = [paths]
+            paths = [path for path in paths if path is not None]
+            if not paths:
                 print("nothing to merge: the graph has a single head")
-            else:
+            for path in paths:
                 print("created %s" % path)
         else:
-            pending = apply_migrations(db, directory, fake=args.fake, app=app)
+            pending = apply_migrations(
+                db, directory, fake=args.fake, app=application
+            )
             if not pending:
                 print("nothing to migrate")
             else:
                 for name in pending:
                     print("applied %s" % name)
     except (MigrationError, core.OrmError) as e:
-        print("pony-migrate: error: %s" % e, file=sys.stderr)
+        print("pony migrations: error: %s" % e, file=sys.stderr)
         return 1
     return 0
 

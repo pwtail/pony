@@ -37,12 +37,14 @@ references: [pony-session-scope]
    async-сессия** (`local.async_db_context`), а не «мы внутри корутины»: вне async-сессии
    синхронный код разрешён и в корутине — это осознанный блокирующий вызов (поэтому
    sync-ячейки Jupyter, исполняемые внутри задачи ядра, работают как раньше).
-6. **`with db:` / `async with db:` / `db.session` — per-database скоуп.**
-   `Database` получает собственный скоуп сессии, привязанный к этой базе: на выходе
-   коммитится/откатывается только её кэш, обращение к другой базе внутри —
-   `TransactionError`. Глобальный `db_session` не меняется. Контракт, вложенность
-   и guard'ы — в `pony-session-scope`. Имя `session` резервируется —
-   `db.app('session')` даёт `MappingError`.
+6. **`with db:` / `async with db:` / `db.session` — сессия с разрешением на базу.**
+   `Database` получает точку входа в сессию, привязанную к этой базе: скоуп
+   разрешает обращения к ней, глобальный `db_session` — ко всем базам; разрешения
+   складываются (вложенный `with db2:` добавляет db2) и действуют до конца внешнего
+   скоупа, там же — commit/rollback по всем затронутым базам. Глобальный
+   `db_session` не меняется. Контракт, вложенность и проверки — в
+   `pony-session-scope`. Имя `session` резервируется — `db.application('session')` даёт
+   `MappingError`.
 
 # Требования
 
@@ -53,8 +55,8 @@ references: [pony-session-scope]
   flush + commit, при исключении — rollback. Async-функцию можно декорировать
   `@db_session`: на вызов открывается сессия, на выходе commit, при исключении rollback,
   `retry`/`retry_exceptions` поддержаны; `ddl` для корутин запрещён (schema-операции
-  синхронные). Per-database скоуп (решение 6, `pony-session-scope`):
-  `async with db:` / `db.session(...)` — та же сессия, но привязанная к этой базе;
+  синхронные). Сессия с разрешением на базу (решение 6, `pony-session-scope`):
+  `async with db:` / `db.session(...)` — та же сессия с разрешением на эту базу;
   sync-аналоги — `with db:` / `with db.session(...)`.
 - **F2. Запросы.** `await select(...)` / `await Entity.select(...)` возвращают список;
   `async for` — итерация; фильтры, джойны, `order_by`; агрегаты
@@ -133,8 +135,9 @@ references: [pony-session-scope]
 «сырые» колонки), bulk-удаление, m2m-мутации, явные
 `await flush()/commit()/rollback()` (плюс `async_flush/async_commit/async_rollback`),
 `prefetch()`, `load()` обратной стороны связи «один к одному», `@db_session` на
-корутинах (commit/rollback/retry), per-database скоуп `with db:` / `async with db:` /
-`db.session` (решение 6, `pony-session-scope`: guard чужой базы и вложенность;
-sync-тесты в `test_db_session.py`, async-тесты в `test_async_api.py`),
+корутинах (commit/rollback/retry), сессии с разрешением на базу `with db:` /
+`async with db:` / `db.session` (решение 6, `pony-session-scope`: накопление
+разрешений и вложенность; sync-тесты в `test_db_session.py`, async-тесты в
+`test_async_api.py`),
 а также понятные `TransactionError` вместо
 `None`/`TypeError` на sync-only путях.

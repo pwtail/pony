@@ -575,8 +575,11 @@ class Local(ContextLocal):
         self.db2cache = {}
         self.db_context_counter = 0
         self.async_db_context = 0
-        self.scoped_db = None
-        self.scoped_db_counter = 0
+        # Разрешения сессии: per-db скоупы копят свои базы в allowed_dbs,
+        # глобальный db_session выставляет allow_all. Сбрасываются в конце
+        # внешнего скоупа (см. pony-session-scope).
+        self.allowed_dbs = set()
+        self.allow_all = False
         self.db_session = None
         self.prefetch_context_stack = []
         self.current_user = None
@@ -859,17 +862,16 @@ class DBSessionContextManager:
 
     async def _async_exit(self, exc_type=None, exc=None, tb=None):
         """Выход из сессии: commit/rollback и освобождение соединения."""
-        if self.database is not None:
-            local.scoped_db_counter -= 1
-            if not local.scoped_db_counter:
-                assert local.scoped_db is self.database
-                local.scoped_db = None
         local.db_context_counter -= 1
         try:
             if not local.db_context_counter:
                 assert local.db_session is self
                 await self._async_commit_or_rollback(exc_type, exc, tb)
         finally:
+            if not local.db_context_counter:
+                # разрешения per-db скоупов живут до конца внешнего скоупа
+                local.allowed_dbs.clear()
+                local.allow_all = False
             local.async_db_context -= 1
             if self.sql_debug is not None:
                 local.pop_debug_state()
@@ -924,17 +926,16 @@ class DBSessionContextManager:
             local.push_debug_state(self.sql_debug, self.show_values)
 
     def __exit__(self, exc_type=None, exc=None, tb=None):
-        if self.database is not None:
-            local.scoped_db_counter -= 1
-            if not local.scoped_db_counter:
-                assert local.scoped_db is self.database
-                local.scoped_db = None
         local.db_context_counter -= 1
         try:
             if not local.db_context_counter:
                 assert local.db_session is self
                 self._commit_or_rollback(exc_type, exc, tb)
         finally:
+            if not local.db_context_counter:
+                # разрешения per-db скоупов живут до конца внешнего скоупа
+                local.allowed_dbs.clear()
+                local.allow_all = False
             if self.sql_debug is not None:
                 local.pop_debug_state()
 
@@ -971,23 +972,12 @@ class DBSessionContextManager:
 
     def _begin(self):
         if self.database is not None:
-            self._enter_scoped()
-        else:
-            self._enter()
-
-    def _enter_scoped(self):
-        db = self.database
-        if local.scoped_db is not None and local.scoped_db is not db:
-            throw(
-                TransactionError,
-                "per-database session cannot be nested inside a per-database "
-                "session for another database; use a global db_session to work "
-                "with several databases",
-            )
-        if local.scoped_db is None:
-            local.scoped_db = db
-        local.scoped_db_counter += 1
+            self.database._maybe_introspect()
         self._enter()
+        if self.database is None:
+            local.allow_all = True
+        else:
+            local.allowed_dbs.add(self.database)
 
     def _wrap_function(self, func):
         def new_func(func, *args, **kwargs):
@@ -1165,10 +1155,10 @@ class DBSessionContextManager:
                 assert not local.db_context_counter and not local.db2cache
                 local.db_context_counter = 1
                 local.db_session = self
-                if self.database is not None:
-                    assert local.scoped_db is None
-                    local.scoped_db = self.database
-                    local.scoped_db_counter = 1
+                if self.database is None:
+                    local.allow_all = True
+                else:
+                    local.allowed_dbs.add(self.database)
                 local.db2cache.update(db2cache_copy)
                 db2cache_copy.clear()
                 if self.sql_debug is not None:
@@ -1202,9 +1192,8 @@ class DBSessionContextManager:
                     local.db2cache.clear()
                     local.db_context_counter = 0
                     local.db_session = None
-                    if self.database is not None:
-                        local.scoped_db = None
-                        local.scoped_db_counter = 0
+                    local.allowed_dbs.clear()
+                    local.allow_all = False
 
             gen = gen_func(*args, **kwargs)
             iterator = gen.__await__() if hasattr(gen, "__await__") else iter(gen)
@@ -1376,6 +1365,16 @@ class Application:
         entity_base._app_ = self
         self.Entity = entity_base
 
+    def __getattr__(self, name):
+        database = self.__dict__.get("_database")
+        if database is not None:
+            entity = database.entities.get(name)
+            if entity is not None and getattr(entity, "_app_", None) is self:
+                return entity
+        raise AttributeError(
+            "%r object has no attribute %r" % (type(self).__name__, name)
+        )
+
     def __repr__(self):
         return "<Application(%s)>" % self.name
 
@@ -1387,6 +1386,16 @@ class Application:
 
 
 class Database:
+    _instance = None
+
+    @classmethod
+    def instance(cls):
+        """Последняя привязанная база: в приложении она одна; дата-миграция
+        получает свежую копию через `Database.instance().new()`."""
+        if cls._instance is None:
+            throw(BindingError, "Database instance is not defined")
+        return cls._instance
+
     def __deepcopy__(self, memo):
         return self  # Database cannot be cloned by deepcopy()
 
@@ -1403,6 +1412,10 @@ class Database:
         self.entities = {}
         self._apps = {}
         self.schema = None
+        # Ленивая интроспекция: пустая база (db.new()) достраивает маппинг
+        # на входе в per-db скоуп (with db:).
+        self._is_empty = False
+        self._pending_entities = []
         self.Entity = type.__new__(EntityMeta, "Entity", (Entity,), {})
         self.Entity._database_ = self
 
@@ -1418,7 +1431,7 @@ class Database:
             self._bind(*args, **kwargs)
 
     @cut_traceback
-    def app(self, name, schema=None):
+    def application(self, name, schema=None):
         app = self._apps.get(name)
         if app is not None:
             return app
@@ -1462,8 +1475,7 @@ class Database:
     @property
     def session(self):
         # per-database скоуп: DBSessionContextManager, привязанный к этой базе.
-        # db.session(...) принимает те же флаги, что db_session(...), но скоуп
-        # ограничен этой базой (коммитится только её кэш).
+        # db.session(...) принимает те же флаги, что db_session(...).
         scoped = self.__dict__.get("_session")
         if scoped is None:
             scoped = self.__dict__["_session"] = DBSessionContextManager(database=self)
@@ -1528,6 +1540,7 @@ class Database:
             provider_cls = provider_module.provider_cls
         kwargs["pony_call_on_connect"] = self.call_on_connect
         self.provider = provider_cls(self, *args, **kwargs)
+        Database._instance = self
 
     @property
     def migrations(self):
@@ -1539,14 +1552,46 @@ class Database:
             facade = self._migrations_facade = migrations.MigrationsFacade(self)
         return facade
 
+    def _maybe_introspect(self):
+        if not self._is_empty:
+            return
+        if not self._pending_entities and not any(
+            entity._root_ is entity for entity in self.entities.values()
+        ):
+            return
+        self.introspect()
+
     @cut_traceback
-    def introspect(self, out=None):
-        """Этап 2 миграций: достроить entity-классы атрибутами из схемы БД
-        и сгенерировать маппинг (PostgreSQL). `out='файл.py'` — отладочный
-        режим: записать выведенные описания сущностей в файл."""
+    def new(self):
+        provider = self.provider
+        if provider is None:
+            throw(MappingError, "Database object is not bound with a provider yet")
+        new_db = Database()
+        pool = getattr(provider, "pool", None)
+        if provider.dialect == "SQLite":
+            # SQLitePool не хранит args (переопределён _init_context); имя файла —
+            # в pool.filename. Для :memory:/:sharedmemory: это свежая отдельная БД —
+            # дата-миграции осмысленны только против файловой БД.
+            filename = getattr(pool, "filename", None)
+            if filename is None:
+                throw(MappingError, "Cannot determine the SQLite database filename")
+            kwargs = dict(getattr(pool, "kwargs", {}))
+            new_db.bind(type(provider), filename, **kwargs)
+        else:
+            args = getattr(pool, "args", ())
+            kwargs = dict(getattr(pool, "kwargs", {}))
+            new_db.bind(type(provider), *args, **kwargs)
+        new_db._is_empty = True
+        return new_db
+
+    @cut_traceback
+    def introspect(self, *entities):
+        """Этап 2 миграций: без имён — достроить entity-классы атрибутами из
+        схемы БД и сгенерировать маппинг; с именами сущностей — вернуть строку
+        с их описаниями, выведенными из схемы (отладочный режим)."""
         from pony.orm import introspection
 
-        return introspection.introspect(self, out=out)
+        return introspection.introspect(self, *entities)
 
     @property
     def last_sql(self):
@@ -1635,11 +1680,15 @@ class Database:
                 TransactionError,
                 "db_session is required when working with the database",
             )
-        if local.scoped_db is not None and local.scoped_db is not self:
+        if (
+            local.db_context_counter
+            and not local.allow_all
+            and self not in local.allowed_dbs
+        ):
             throw(
                 TransactionError,
-                "Cannot access another database inside a per-database session; "
-                "use 'with db:' for this database or a global db_session",
+                "Cannot access this database inside a per-database session; "
+                "use 'with db:' for it or a global db_session",
             )
         if local.async_db_context:
             if not hasattr(self.provider, "async_pool"):

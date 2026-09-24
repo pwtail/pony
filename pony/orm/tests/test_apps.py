@@ -20,25 +20,25 @@ class TestAppAPI(unittest.TestCase):
 
     def test_app_accessible_via_db_attr(self):
         db = self.db
-        myapp = db.app("myapp")
+        myapp = db.application("myapp")
         self.assertIs(db.myapp, myapp)
         self.assertEqual(myapp.schema_name, "myapp")
 
     def test_schema_override_and_idempotent(self):
         db = self.db
-        finances = db.app("accounts", schema="finances")
+        finances = db.application("accounts", schema="finances")
         self.assertEqual(finances.schema_name, "finances")
-        self.assertIs(db.app("accounts"), finances)
+        self.assertIs(db.application("accounts"), finances)
 
     def test_name_collision_guard(self):
         db = self.db
         for bad in ("schema", "Entity", "bind", "my-app", "class"):
             with self.assertRaises((MappingError, TypeError)):
-                db.app(bad)
+                db.application(bad)
 
     def test_entity_gets_schema_qualified_table(self):
         db = self.db
-        myapp = db.app("myapp")
+        myapp = db.application("myapp")
 
         class Account(myapp.Entity):
             name = Required(str)
@@ -53,7 +53,7 @@ class TestAppAPI(unittest.TestCase):
 
     def test_entity_string_table_gets_qualified(self):
         db = self.db
-        myapp = db.app("myapp")
+        myapp = db.application("myapp")
 
         class Account(myapp.Entity):
             _table_ = "acc"
@@ -68,7 +68,7 @@ class TestAppAPI(unittest.TestCase):
     @only_for("postgres")
     def test_entity_tuple_table_overrides_app(self):
         db = self.db
-        myapp = db.app("myapp")
+        myapp = db.application("myapp")
 
         class Account(myapp.Entity):
             _table_ = ("other", "acc")
@@ -109,8 +109,8 @@ class TestAppMigrations(unittest.TestCase):
 
     def _make_db(self):
         db = self.db
-        accounts = db.app("accounts")
-        orders = db.app("orders")
+        accounts = db.application("accounts")
+        orders = db.application("orders")
 
         class Customer(accounts.Entity):
             name = Required(str)
@@ -210,18 +210,18 @@ class TestAppMigrations(unittest.TestCase):
         try:
             self.assertEqual(
                 migrations.main(
-                    ["accounts", "add", "--db", module.__name__ + ":db", "--dir", self.dir]
+                    ["migrations", "accounts", "make", "--db", module.__name__ + ":db", "--dir", self.dir]
                 ),
                 0,
             )
             self.assertEqual(
                 migrations.main(
-                    ["orders", "add", "--db", module.__name__ + ":db", "--dir", self.dir]
+                    ["migrations", "orders", "make", "--db", module.__name__ + ":db", "--dir", self.dir]
                 ),
                 0,
             )
             self.assertEqual(
-                migrations.main(["apply", "--db", module.__name__ + ":db", "--dir", self.dir]),
+                migrations.main(["migrations", "apply", "--db", module.__name__ + ":db", "--dir", self.dir]),
                 0,
             )
         finally:
@@ -247,8 +247,8 @@ class TestAppMigrationsSQLite(unittest.TestCase):
 
     def _make_db(self):
         db = self.db
-        accounts = db.app("accounts")
-        orders = db.app("orders")
+        accounts = db.application("accounts")
+        orders = db.application("orders")
 
         class Customer(accounts.Entity):
             name = Required(str)

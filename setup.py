@@ -137,7 +137,7 @@ if __name__ == "__main__":
         python_requires=">=3.10,<3.15",
         entry_points={
             "console_scripts": [
-                "pony-migrate=pony.migrate:main",
+                "pony=pony.migrations:main",
             ],
         },
     )

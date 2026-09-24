@@ -520,15 +520,24 @@ class TestDBSession(unittest.TestCase):
     def test_app_name_session_reserved(self):
         # имя 'session' зарезервировано property Database.session
         with self.assertRaises(MappingError):
-            self.db.app("session")
+            self.db.application("session")
 
-    def test_db_global_inside_scoped_is_noop(self):
-        # глобальный db_session внутри per-db скоупа — no-op (граница не расширяется)
+    def test_db_global_inside_scoped_grants_all(self):
+        # глобальный db_session внутри per-db скоупа разрешает использовать всё
+        other = Database()
+
+        class Y(other.Entity):
+            c = PrimaryKey(int)
+
+        setup_database(other)
+        self.addCleanup(teardown_database, other)
         with self.db:
             with db_session:
                 self.X(a=3, b=3)
+                Y(c=1)
         with db_session:
             self.assertEqual(count(x for x in self.X), 3)
+            self.assertEqual(count(y for y in Y), 1)
 
     def test_db_cross_db_access_raises(self):
         # обращение к другой базе внутри with db: — TransactionError
@@ -542,18 +551,57 @@ class TestDBSession(unittest.TestCase):
             with self.db:
                 Y(c=1)
 
-    def test_db_scoped_nesting_different_db_raises(self):
-        # with db2: внутри with db: (другая база) — TransactionError
+    def test_db_scoped_nesting_different_db(self):
+        # with db2: внутри with db: разрешён; разрешения копятся до конца сессии
         other = Database()
 
         class Y(other.Entity):
             c = PrimaryKey(int)
 
         setup_database(other)
+        self.addCleanup(teardown_database, other)
+        with self.db:
+            with other:
+                Y(c=1)
+                self.X(a=3, b=3)
+            # разрешение на other живёт до конца внешнего скоупа
+            Y(c=2)
+        with db_session:
+            self.assertEqual(count(y for y in Y), 2)
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_scoped_inside_global_grants_all(self):
+        # with db2: внутри db_session: — доступно всё
+        other = Database()
+
+        class Y(other.Entity):
+            c = PrimaryKey(int)
+
+        setup_database(other)
+        self.addCleanup(teardown_database, other)
+        with db_session:
+            with other:
+                Y(c=1)
+                self.X(a=3, b=3)
+        with db_session:
+            self.assertEqual(count(y for y in Y), 1)
+            self.assertEqual(count(x for x in self.X), 3)
+
+    def test_db_scoped_grants_reset_between_sessions(self):
+        # после конца скоупа разрешение на другую базу не сохраняется
+        other = Database()
+
+        class Y(other.Entity):
+            c = PrimaryKey(int)
+
+        setup_database(other)
+        self.addCleanup(teardown_database, other)
+        with self.db:
+            with other:
+                Y(c=1)
         with self.assertRaises(TransactionError):
             with self.db:
-                with other:
-                    Y(c=1)
+                Y(c=2)
 
 
 db = Database()

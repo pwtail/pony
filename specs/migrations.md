@@ -56,8 +56,8 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
    пользователя).
 7. **Версионные файлы + трекинг** (решение пользователя): `0001_<имя>.sql` /
    `0001_<имя>.py`, порядок по номеру; применённые хранятся в таблице
-   `pony_migrations` (name, sha256, applied_at); per-app scope добавляет колонку
-   `app` (PK `(app, name)`) — см. `pony-apps`; каждая миграция — в своей
+   `pony_migrations` (name, sha256, applied_at); per-application scope добавляет
+   колонку `app` (PK `(app, name)`) — см. `pony-apps`; каждая миграция — в своей
    транзакции. Явные зависимости между миграциями — этап 3.
 
    DDL `pony_migrations` зависит от диалекта: `applied_at` — `timestamptz
@@ -66,50 +66,58 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
    существования таблицы — `to_regclass` / `information_schema.tables` /
    `sqlite_master`. `applied_at` заполняется default'ом БД, а не из Python
    (так тип/значение не зависят от диалекта и tz-aware datetime).
-8. **SQL-миграция применяется целиком** (postgres — одним запросом); откат —
-   парный `0001_<имя>.down.sql`.
+8. **SQL-миграция применяется целиком** (postgres — одним запросом) в
+   ddl-сессии: на SQLite/MySQL на время схемных изменений отключаются
+   FK-проверки; откат — парный `0001_<имя>.down.sql`.
 9. **Python-миграция данных — скрипт** (решение пользователя): исполняется
-   как скрипт (`__name__ == '__main__'`) внутри `db_session`; **миграция
-   получает свежую `Database`** — к той же БД, но без моделей приложения:
-   модели в миграции определяются интроспекцией (`db.introspect()`, решения
-   4–5), а не текущими моделями приложения (которые могут быть новее
-   состояния схемы в этой точке истории); соединение закрывается после
-   миграции. Текущая база — `from pony.migrate import db` (вне миграции
-   `pony.migrate.db` — `None`); доступны ORM-запросы и `db.execute(...)`.
+   как скрипт (`__name__ == '__main__'`) внутри обычного (не ddl) `db_session` —
+   схемные права дата-миграции не нужны, FK-проверки остаются включёнными.
+   **Миграция получает свежую `Database`** — `db.new()`: клон той же БД без
+   моделей приложения. Модели в миграции определяются интроспекцией
+   (`db.introspect()`, решения 4–5; вызов не обязателен — маппинг строится
+   лениво при входе в `with db:`, см. `pony-introspection`), а не текущими
+   моделями приложения (которые могут быть новее состояния схемы в этой точке
+   истории); соединение закрывается после миграции.
+   Текущая база — `db = Database.instance().new()`: `Database.instance()` —
+   последняя привязанная база (в приложении одна), `.new()` даёт свежий клон к
+   той же БД без моделей; доступны ORM-запросы и `db.execute(...)`.
    Откат данных (`down`) не определён — вне этапов 1–3.
-10. **CLI** (решение пользователя): команда `pony-migrate` и запуск
-    `python -m pony.migrate` (модуль `pony/migrate.py`). `add` без аргумента —
-    `0001_initial.sql` из деклараций моделей; `add <имя>.py` — следующая
-    по номеру дата-миграция (заготовка: `# depends: <голова>`,
-    `from pony.migrate import db`, `if __name__ == '__main__':`);
-    `add <имя>.sql` — заготовка SQL-миграции с `-- depends:`; `apply`;
-    `plan`; `merge`.
+10. **CLI** (решение пользователя): команда `pony`, подкоманда `migrations`
+    (`pony migrations ...`) и запуск `python -m pony.migrations` (модуль
+    `pony/migrations.py`). `make` без аргумента — `0001_initial.sql` из
+    деклараций моделей; `make <имя>.py` — следующая по номеру дата-миграция
+    (заготовка: `# зависит: <голова>`, `from pony.orm import Database`,
+    `db = Database.instance().new()`,
+    `if __name__ == '__main__':`); `make <имя>.sql` — заготовка SQL-миграции
+    с `-- depends:`; `apply`; `plan`; `merge`. Application — позиционный
+    аргумент перед командой (`pony migrations myapplication make`); без него
+    команда идёт по всем applications (корня нет).
 
 # Этапы реализации
 
 1. **Начальные миграции.** Вместо `generate_mapping(create_tables=True)` —
-   генерация `0001_initial.sql` в папке `migrations/` из деклараций моделей
-   (best effort, решение 3). Применение миграций с запоминанием применённых
-   в базе (`pony_migrations`). Возможность написать любой SQL (`.sql`) либо
-   скрипт (`.py`) и применить его. Пока — без учёта порядка и зависимостей
-   миграций друг от друга.
+   генерация `0001_initial.sql` в папке `migrations/<application>/` из
+   деклараций моделей (best effort, решение 3). Применение миграций с
+   запоминанием применённых в базе (`pony_migrations`). Возможность написать
+   любой SQL (`.sql`) либо скрипт (`.py`) и применить его. Пока — без учёта
+   порядка и зависимостей миграций друг от друга.
 
-   Реализовано: `pony/orm/migrations.py`, точка входа `pony/migrate.py`
-   (`python -m pony.migrate` и команда `pony-migrate`), Python API
-   `db.migrations.add()` / `apply()`. `add` без имени — `0001_initial.sql`
-   из моделей, `add <имя>.py|.sql` — следующая по номеру миграция с шапкой
+   Реализовано: `pony/orm/migrations.py`, точка входа `pony/migrations.py`
+   (`python -m pony.migrations` и команда `pony migrations`), Python API
+   `db.migrations.add()` / `apply()`. `make` без имени — `0001_initial.sql`
+   из моделей, `make <имя>.py|.sql` — следующая по номеру миграция с шапкой
    `depends:`. `--fake` — пометить применённой. Трекинг — таблица
-   `pony_migrations` (name, sha256, applied_at); каждая миграция — в своей
-   транзакции; изменение уже применённого файла — ошибка. `.py`-миграция —
-   модуль-скрипт с `from pony.migrate import db` (внутри `db_session`);
+   `pony_migrations` (app, name, sha256, applied_at); каждая миграция — в
+   своей транзакции; изменение уже применённого файла — ошибка. `.py`-миграция —
+   модуль-скрипт с `db = Database.instance().new()` (внутри `db_session`);
    откат (`down`) — не в этом этапе.
 2. **Режим интроспекции** в пони (решения 4–5; только для миграций данных —
    `pony-introspection`).
 3. **Граф зависимостей** (`pony-migration-graph`): зависимости в шапке файла
    (`-- depends:` / `# depends:`), топосорт с ветками; граф обязан иметь ровно
-   одну голову — иначе `apply`/`plan` требуют слияния, а `pony-migrate merge`
+   одну голову — иначе `apply`/`plan` требуют слияния, а `pony migrations merge`
    создаёт `.txt` с ASCII-историей двух веток (новые миграции — сверху);
-   команда `pony-migrate plan` и `db.migrations.plan()` вместо `--dry-run`.
+   команда `pony migrations plan` и `db.migrations.plan()` вместо `--dry-run`.
 
 # Вне области (non-goals)
 
