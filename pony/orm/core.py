@@ -1592,19 +1592,28 @@ class Database:
             throw(MappingError, "Database object is not bound with a provider yet")
         new_db = Database()
         pool = getattr(provider, "pool", None)
-        if provider.dialect == "SQLite":
-            # SQLitePool не хранит args (переопределён _init_context); имя файла —
-            # в pool.filename. Для :memory:/:sharedmemory: это свежая отдельная БД —
-            # дата-миграции осмысленны только против файловой БД.
-            filename = getattr(pool, "filename", None)
-            if filename is None:
-                throw(MappingError, "Cannot determine the SQLite database filename")
-            kwargs = dict(getattr(pool, "kwargs", {}))
-            new_db.bind(type(provider), filename, **kwargs)
-        else:
-            args = getattr(pool, "args", ())
-            kwargs = dict(getattr(pool, "kwargs", {}))
-            new_db.bind(type(provider), *args, **kwargs)
+        previous_instance = Database._instance
+        try:
+            if provider.dialect == "SQLite":
+                # SQLitePool не хранит args (переопределён _init_context); имя
+                # файла — в pool.filename. Для :memory:/:sharedmemory: это свежая
+                # отдельная БД — дата-миграции осмысленны только против файловой.
+                filename = getattr(pool, "filename", None)
+                if filename is None:
+                    throw(
+                        MappingError,
+                        "Cannot determine the SQLite database filename",
+                    )
+                kwargs = dict(getattr(pool, "kwargs", {}))
+                new_db.bind(type(provider), filename, **kwargs)
+            else:
+                args = getattr(pool, "args", ())
+                kwargs = dict(getattr(pool, "kwargs", {}))
+                new_db.bind(type(provider), *args, **kwargs)
+        finally:
+            # bind() переставляет Database._instance; клонирование не должно
+            # менять «текущую» базу приложения
+            Database._instance = previous_instance
         for app in self._apps.values():
             # приложения клонируются: миграция работает со своими app
             # (class X(db.myapp.Entity) / db.introspect('myapp'))

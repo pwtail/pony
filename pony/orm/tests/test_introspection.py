@@ -498,8 +498,66 @@ class TestIntrospection(unittest.TestCase):
         self.assertIn("_table_ = ('appone', 'thing')", result)
         self.assertNotIn("class Other", result)
 
+    def test_unique_registration_and_composite_indexes(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id serial PRIMARY KEY, email text NOT NULL, "
+            "code text NOT NULL, region text NOT NULL)"
+        )
+        self._exec("CREATE UNIQUE INDEX uq_t_email ON t (email)")
+        self._exec("CREATE UNIQUE INDEX uq_t_code_region ON t (code, region)")
+        self._exec("CREATE INDEX ix_t_region_email ON t (region, email)")
+        self._exec("CREATE UNIQUE INDEX uq_t_partial ON t (code) WHERE region = 'x'")
+        self._exec("CREATE INDEX ix_t_expr ON t ((lower(email)))")
 
-class TestIntrospectionDialectGuard(unittest.TestCase):
+        class T(db.Entity):
+            pass
+
+        db.introspect()
+        # unique= прошёл через конструктор: is_part_of_unique_index выставлен
+        self.assertEqual(T.email.is_unique, "uq_t_email")
+        self.assertTrue(T.email.is_part_of_unique_index)
+        composite = {
+            (i.name, tuple(a.name for a in i.attrs), i.is_unique)
+            for i in T._indexes_
+            if not i.is_pk
+        }
+        self.assertIn(("uq_t_code_region", ("code", "region"), True), composite)
+        self.assertIn(("ix_t_region_email", ("region", "email"), False), composite)
+        # частичный и выраженческий индексы не выводятся
+        names = {i.name for i in T._indexes_}
+        self.assertNotIn("uq_t_partial", names)
+        self.assertNotIn("ix_t_expr", names)
+        self.assertFalse(T.code.is_unique)
+
+    def test_mixed_case_table(self):
+        db = self.db
+        self._exec('CREATE TABLE "MixedCase" (row_id serial PRIMARY KEY, v text)')
+
+        class MixedCase(db.Entity):
+            _table_ = "MixedCase"
+
+        db.introspect()
+        self.assertEqual([a.name for a in MixedCase._pk_attrs_], ["row_id"])
+        self.assertIn("v", MixedCase._adict_)
+
+    def test_default_cast_stripping(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id serial PRIMARY KEY, "
+            "a text DEFAULT 'new'::text, "
+            "b text DEFAULT ('x'::text || 'y'::text), "
+            "c text DEFAULT upper('x'::text))"
+        )
+
+        class T(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertEqual(T.a.sql_default, "'new'")
+        # каст внутри выражения — не трогаем
+        self.assertEqual(T.b.sql_default, "('x'::text || 'y'::text)")
+        self.assertEqual(T.c.sql_default, "upper('x'::text)")
     def test_unsupported_dialect_rejected(self):
         class FakeProvider:
             dialect = "Oracle"
@@ -945,6 +1003,138 @@ class TestIntrospectionSQLite(unittest.TestCase):
             result = f.read()
         self.assertNotIn("SqliteSequence", result)
         self.assertNotIn("sqlite_sequence", result)
+
+    def test_unique_registration_and_composite_indexes(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT NOT NULL, "
+            "code TEXT NOT NULL, region TEXT NOT NULL)"
+        )
+        self._exec("CREATE UNIQUE INDEX uq_t_email ON t (email)")
+        self._exec("CREATE UNIQUE INDEX uq_t_code_region ON t (code, region)")
+        self._exec("CREATE INDEX ix_t_region_email ON t (region, email)")
+        self._exec("CREATE UNIQUE INDEX uq_t_partial ON t (code) WHERE region = 'x'")
+        self._exec("CREATE INDEX ix_t_expr ON t (lower(email))")
+
+        class T(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertEqual(T.email.is_unique, "uq_t_email")
+        self.assertTrue(T.email.is_part_of_unique_index)
+        composite = {
+            (i.name, tuple(a.name for a in i.attrs), i.is_unique)
+            for i in T._indexes_
+            if not i.is_pk
+        }
+        self.assertIn(("uq_t_code_region", ("code", "region"), True), composite)
+        self.assertIn(("ix_t_region_email", ("region", "email"), False), composite)
+        names = {i.name for i in T._indexes_}
+        self.assertNotIn("uq_t_partial", names)
+        self.assertNotIn("ix_t_expr", names)
+        self.assertFalse(T.code.is_unique)
+        # unique-индекс есть и в схеме БД (DDL-генерация миграций)
+        schema_indexes = db.schema.tables[T._table_].indexes
+        names = {getattr(i, "name", None) for i in schema_indexes.values()}
+        self.assertIn("uq_t_email", names)
+
+    def test_composite_indexes_in_dump(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT NOT NULL, "
+            "region TEXT NOT NULL)"
+        )
+        self._exec("CREATE UNIQUE INDEX uq_t_code_region ON t (code, region)")
+        self._exec("CREATE INDEX ix_t_region_code ON t (region, code)")
+
+        class T(db.Entity):
+            pass
+
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
+        self.assertIn("unique(code, region, name='uq_t_code_region')", result)
+        self.assertIn(
+            "composite_index(region, code, name='ix_t_region_code')", result
+        )
+        # дамп пастится
+        db2 = Database("sqlite", os.path.join(self.tmp, "t2.db"), create_db=True)
+        try:
+            exec(result, {"db": db2})
+            db2.generate_mapping(check_tables=False)
+        finally:
+            db2.disconnect()
+
+    def test_fk_column_index_and_default(self):
+        db = self.db
+        self._exec("CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec(
+            "CREATE TABLE car (id INTEGER PRIMARY KEY, "
+            "owner_id INTEGER NOT NULL DEFAULT 1 REFERENCES person(id))"
+        )
+        self._exec("CREATE INDEX ix_car_owner ON car (owner_id)")
+
+        class Person(db.Entity):
+            pass
+
+        class Car(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertEqual(Car.owner.index, "ix_car_owner")
+        self.assertEqual(Car.owner.sql_default, "1")
+
+        # в дампе FK-атрибут тоже несёт index/sql_default
+        path = os.path.join(self.tmp, "models.py")
+        db2 = self.db.new()
+        try:
+            class Person(db2.Entity):
+                pass
+
+            class Car(db2.Entity):
+                pass
+
+            db2.introspect(dump=path)
+            with open(path) as f:
+                result = f.read()
+            self.assertIn(
+                "owner = Required('Person', column='owner_id', "
+                "sql_default='1', index='ix_car_owner', reverse='car_set')",
+                result,
+            )
+        finally:
+            db2.disconnect()
+
+    def test_failed_introspection_rolls_back(self):
+        db = self.db
+        self._exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, a TEXT)")
+        self._exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, b TEXT)")
+
+        class T1(db.Entity):
+            pass
+
+        class T2(db.Entity):
+            wrong = Required(str, column="no_such_column")
+
+        before = {
+            name: list(entity._new_attrs_)
+            for name, entity in db.entities.items()
+        }
+        with self.assertRaises(introspection.IntrospectionError):
+            db.introspect()
+        # откат: флаг вернулся, атрибуты не остались наполовину добавленными
+        self.assertTrue(db._is_empty)
+        self.assertIsNone(db.schema)
+        for name, entity in db.entities.items():
+            self.assertEqual(
+                [a.name for a in entity._new_attrs_],
+                [a.name for a in before[name]],
+            )
+        # повторная попытка — та же понятная ошибка, а не «name already in use»
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db.introspect()
+        self.assertIn("no_such_column", str(cm.exception))
 
     def test_async_with_db_lazy_introspection(self):
         # async with db: — триггер ленивой интроспекции (решение 14);

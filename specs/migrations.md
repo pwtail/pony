@@ -34,6 +34,9 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
   остаются синхронными (`pony-async-goal-and-requirements`).
 - Существующий API (`generate_mapping`, `create_tables`, `check_tables`, `drop_*`)
   не меняется; миграции — отдельный путь, не трогающий его поведение.
+  Единственное исключение — `CREATE SCHEMA IF NOT EXISTS` для схем
+  applications в `create_tables()`/`generate_create_script()` (сознательное
+  решение `pony-apps`, решение 4).
 
 # Принятые решения
 

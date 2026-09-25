@@ -189,32 +189,89 @@ def list_migrations(directory):
 
 
 def _read_dependencies(path, name):
-    """Зависимости из директивы-комментария в первых строках файла:
+    """Зависимости из директивы-комментария в шапке файла:
     `-- depends: a.sql, b.py` для `.sql`/`.txt` и `# depends: a.sql` для `.py`.
-    None — зависимостей нет; [] — директива есть, но список пуст."""
+    Шапка — лидирующие пустые строки и комментарии; для `.py` допускается
+    ещё и один docstring перед директивой. Директива после кода — ошибка
+    (иначе зависимость терялась бы молча). None — зависимостей нет;
+    [] — директива есть, но список пуст."""
     comment = "#" if name.endswith(".py") else "--"
     pattern = re.compile(r"^%s\s*depends:\s*(.*)$" % re.escape(comment), re.I)
     with open(path) as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped:
+        lines = f.readlines()
+    header_end = _header_end(lines, name)
+    found = None
+    for lineno, line in enumerate(lines):
+        stripped = line.strip()
+        if comment == "#" and lineno < header_end and re.match(
+            r"^depends\s*=", stripped
+        ):
+            raise MigrationError(
+                "Migration %s: dependencies in .py are declared by the "
+                "comment `# depends: ...`; a `depends` variable is not "
+                "supported" % name
+            )
+        match = pattern.match(stripped)
+        if match:
+            if lineno >= header_end:
+                raise MigrationError(
+                    "Migration %s: the `%s depends:` directive must be in the "
+                    "leading comments of the file (before any code/statements)"
+                    % (name, comment)
+                )
+            found = match
+            break
+    if found is None:
+        return None
+    return [
+        dep.strip() for dep in found.group(1).split(",") if dep.strip()
+    ]
+
+
+def _header_end(lines, name):
+    """Номер первой строки после шапки: лидирующие пустые строки и
+    комментарии (для .sql/.txt — и `/* ... */` блоки), для .py допускается
+    один docstring."""
+    is_py = name.endswith(".py")
+    comment = "#" if is_py else "--"
+    docstring_done = False
+    in_block = False
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if in_block:
+            if "*/" in stripped:
+                in_block = False
+                stripped = stripped.split("*/", 1)[1].strip()
+                if not stripped:
+                    i += 1
+                    continue
+            else:
+                i += 1
                 continue
-            if not stripped.startswith(comment):
-                if comment == "#" and re.match(r"^depends\s*=", stripped):
-                    raise MigrationError(
-                        "Migration %s: dependencies in .py are declared by the "
-                        "comment `# depends: ...`; a `depends` variable is not "
-                        "supported" % name
-                    )
-                break
-            match = pattern.match(stripped)
+        if not stripped or stripped.startswith(comment):
+            i += 1
+            continue
+        if not is_py and stripped.startswith("/*"):
+            if "*/" not in stripped[2:]:
+                in_block = True
+            i += 1
+            continue
+        if is_py and not docstring_done:
+            match = re.match(r'^[rubfRUBF]*("""|\'\'\')', stripped)
             if match:
-                return [
-                    dep.strip()
-                    for dep in match.group(1).split(",")
-                    if dep.strip()
-                ]
-    return None
+                quote = match.group(1)
+                rest = stripped[match.end():]
+                docstring_done = True
+                if quote not in rest:
+                    # многострочный docstring: пропускаем до закрывающей кавычки
+                    i += 1
+                    while i < len(lines) and quote not in lines[i]:
+                        i += 1
+                i += 1
+                continue
+        break
+    return i
 
 
 def _topological_sort(dependencies):
@@ -316,6 +373,15 @@ def _registered_apps(db):
     return sorted(db._apps.keys())
 
 
+def _require_apps(db):
+    if not _registered_apps(db):
+        raise MigrationError(
+            "No applications are registered: migrations are per-application "
+            "(db.application(...), see pony-apps); entities without an "
+            "application are not covered by migrations"
+        )
+
+
 def _table_app(table):
     """Имя application, которому принадлежит таблица (по entities/m2m), или ''."""
     for entity in table.entities:
@@ -373,6 +439,7 @@ def add_migration(db, directory, name="0001_initial.sql", app=None):
     от applications, на которые идут FK. Без application — по всем applications,
     список путей."""
     if app is None:
+        _require_apps(db)
         return [
             add_migration(db, directory, name, application)
             for application in _registered_apps(db)
@@ -403,6 +470,7 @@ def add_named_migration(db, directory, file_name, app=None):
     В шапку подставляется текущая голова графа application (`-- depends:` /
     `# depends:`). Без application — по всем applications, список путей."""
     if app is None:
+        _require_apps(db)
         return [
             add_named_migration(db, directory, file_name, application)
             for application in _registered_apps(db)
@@ -627,12 +695,13 @@ def _apply_py(db, app, name, path, sha256):
         "__name__": "__main__",
         "__file__": path,
     }
+    previous_instance = Database._instance
     Database._instance = db
 
     def run():
         exec(compile(source, path, "exec"), module_globals)
-        migration_db = Database.instance()
-        if migration_db is db:
+        migration_db = module_globals.get("db")
+        if not isinstance(migration_db, Database) or migration_db is db:
             raise MigrationError(
                 "Data migration %s must create its own database: "
                 "db = Database.instance().new()" % name
@@ -646,9 +715,9 @@ def _apply_py(db, app, name, path, sha256):
         with db_session:
             run()
     finally:
-        migration_db = Database.instance()
-        Database._instance = db
-        if migration_db is not db:
+        migration_db = module_globals.get("db")
+        Database._instance = previous_instance
+        if isinstance(migration_db, Database) and migration_db is not db:
             migration_db.disconnect()
 
 
@@ -663,6 +732,7 @@ def plan_migrations(db, directory, app=None):
     `app=None` — по всем applications (aggregate); `app='имя'` — один application."""
     _check_supported(db)
     if app is None:
+        _require_apps(db)
         apps = _registered_apps(db)
         graphs = {}
         for a in apps:
@@ -701,6 +771,7 @@ def apply_migrations(db, directory, fake=False, app=None):
     _check_supported(db)
     ensure_migrations_table(db)
     if app is None:
+        _require_apps(db)
         apps = _registered_apps(db)
         graphs = {}
         for a in apps:
@@ -813,6 +884,7 @@ def merge_migration(db, directory, name="merge", app=None):
     Возвращает путь нового файла; None, если сливать нечего.
     Без application — по всем applications, список путей."""
     if app is None:
+        _require_apps(db)
         return [
             path
             for path in (

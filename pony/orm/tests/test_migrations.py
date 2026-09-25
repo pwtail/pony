@@ -703,6 +703,94 @@ class TestSqlSplitter(unittest.TestCase):
         self.assertTrue(statements[0].startswith("CREATE TABLE `a;b`"))
 
 
+class TestReadDependencies(unittest.TestCase):
+    def _deps(self, name, content):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as f:
+            f.write(content)
+        return migrations._read_dependencies(path, name)
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+
+    def test_py_docstring_before_depends(self):
+        self.assertEqual(
+            self._deps(
+                "0002_x.py",
+                '"""Migration docstring."""\n# depends: 0001_a.sql\npass\n',
+            ),
+            ["0001_a.sql"],
+        )
+
+    def test_py_multiline_docstring_before_depends(self):
+        self.assertEqual(
+            self._deps(
+                "0002_x.py",
+                '"""\nlong\ndocstring\n"""\n\n# depends: 0001_a.sql\npass\n',
+            ),
+            ["0001_a.sql"],
+        )
+
+    def test_py_depends_after_code_is_an_error(self):
+        with self.assertRaises(migrations.MigrationError):
+            self._deps(
+                "0002_x.py", "x = 1\n# depends: 0001_a.sql\n"
+            )
+
+    def test_sql_block_comment_before_depends(self):
+        self.assertEqual(
+            self._deps(
+                "0002_x.sql",
+                "/* header ; comment */\n-- depends: 0001_a.sql\n"
+                "CREATE TABLE t (id int);\n",
+            ),
+            ["0001_a.sql"],
+        )
+
+    def test_sql_depends_after_statements_is_an_error(self):
+        with self.assertRaises(migrations.MigrationError):
+            self._deps(
+                "0002_x.sql",
+                "CREATE TABLE t (id int);\n-- depends: 0001_a.sql\n",
+            )
+
+
+class TestNoApplications(unittest.TestCase):
+    def test_aggregate_commands_without_apps_are_an_error(self):
+        db = Database("sqlite", ":memory:")
+        try:
+            for call in (
+                lambda: migrations.add_migration(db, "/tmp/unused-migs"),
+                lambda: migrations.add_named_migration(
+                    db, "/tmp/unused-migs", "x.py"
+                ),
+                lambda: migrations.apply_migrations(db, "/tmp/unused-migs"),
+                lambda: migrations.plan_migrations(db, "/tmp/unused-migs"),
+                lambda: migrations.merge_migration(db, "/tmp/unused-migs"),
+            ):
+                with self.assertRaises(migrations.MigrationError) as cm:
+                    call()
+                self.assertIn("No applications are registered", str(cm.exception))
+        finally:
+            db.disconnect()
+
+    def test_database_instance_not_clobbered_by_new(self):
+        db = Database("sqlite", ":memory:")
+        try:
+            Database._instance = db
+            clone = db.new()
+            try:
+                self.assertIs(Database.instance(), db)
+            finally:
+                clone.disconnect()
+        finally:
+            db.disconnect()
+            Database._instance = None
+
+
 def _mariadb_available():
     try:
         import mariadb

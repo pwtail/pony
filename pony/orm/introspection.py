@@ -14,13 +14,21 @@
 SQLite (PRAGMA). Sync.
 """
 
+import re
 from collections import namedtuple
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from uuid import UUID
 
 from pony.orm import core
-from pony.orm.core import Database, Optional, PrimaryKey, Required, Set
+from pony.orm.core import (
+    Database,
+    Index,
+    Optional,
+    PrimaryKey,
+    Required,
+    Set,
+)
 from pony.orm.ormtypes import FloatArray, IntArray, Json, StrArray
 
 
@@ -180,7 +188,9 @@ def _py_type_from_sql(db, typname, typtype=None):
 def _table_exists(db, table_name):
     dialect = db.provider.dialect
     if dialect == "PostgreSQL":
-        rows = _q(db, "SELECT to_regclass($q)", {"q": _qualified_name(table_name)})
+        rows = _q(
+            db, "SELECT to_regclass($q)", {"q": _pg_regclass_name(table_name)}
+        )
         return bool(rows and rows[0] is not None)
     if dialect == "MySQL":
         schema_name, base_name = db.provider.split_table_name(table_name)
@@ -211,9 +221,53 @@ def table_info(db, table_name):
     return _table_info_sqlite(db, table_name)
 
 
+def _pg_regclass_name(table_name):
+    """Имя для to_regclass: каждый компонент квотирован — mixed-case и
+    quoted идентификаторы резолвятся точно, а не case-fold'ом."""
+    if isinstance(table_name, str):
+        parts = (table_name,)
+    else:
+        parts = table_name
+    return ".".join('"%s"' % part.replace('"', '""') for part in parts)
+
+
+def _strip_outer_cast(expr):
+    """Снимает trailing ::type каст верхнего уровня ('new'::text → 'new').
+    Касты внутри скобок и строковых литералов не трогаем:
+    nextval('seq'::regclass) и ('x'::text || 'y'::text) остаются как есть."""
+    depth = 0
+    in_str = False
+    last = -1
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if in_str:
+            if ch == "'":
+                if expr[i + 1 : i + 2] == "'":
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == ":" and depth == 0 and expr[i + 1 : i + 2] == ":":
+            last = i
+            i += 1
+        i += 1
+    if last == -1:
+        return expr
+    tail = expr[last + 2 :]
+    if re.match(r'^[\w."\[\] ]+$', tail):
+        return expr[:last]
+    return expr
+
+
 def _table_info_postgres(db, table_name):
     """Каталог PostgreSQL (pg_catalog) для одной таблицы."""
-    qname = _qualified_name(table_name)
+    qname = _pg_regclass_name(table_name)
     rows = _q(
         db,
         "SELECT a.attname AS name, t.typname AS type, t.typtype AS typtype, "
@@ -232,7 +286,8 @@ def _table_info_postgres(db, table_name):
         default_expr = row.default_expr
         if default_expr and "::" in default_expr:
             # pg_get_expr добавляет каст литералов: "'new'::text" → "'new'"
-            default_expr = default_expr.rsplit("::", 1)[0]
+            # (только внешний top-level каст, см. _strip_outer_cast)
+            default_expr = _strip_outer_cast(default_expr)
         info = {
             "type": row.type,
             "typtype": row.typtype,
@@ -259,32 +314,38 @@ def _table_info_postgres(db, table_name):
     )
     pk_name = pk_name_rows[0] if pk_name_rows else None
 
+    # все не-PK индексы одним запросом; частичные (indpred) и
+    # выраженческие (indexprs) не выводим — пони не восстанавливает
+    # их предикаты (спека «Что нельзя вычислить из схемы»)
     uniques = {}
-    for row in _q(
-        db,
-        "SELECT a.attname AS col, COALESCE(c.conname, ic.relname) AS idxname "
-        "FROM pg_index i "
-        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-        "JOIN pg_class ic ON ic.oid = i.indexrelid "
-        "LEFT JOIN pg_constraint c ON c.conindid = i.indexrelid "
-        "WHERE i.indrelid = to_regclass($q) AND i.indisunique "
-        "AND NOT i.indisprimary AND cardinality(i.indkey) = 1",
-        {"q": qname},
-    ):
-        uniques[row.col] = row.idxname
-
     indexes = {}
+    composite_uniques = []
+    composite_indexes = []
+    by_index = {}
     for row in _q(
         db,
-        "SELECT a.attname AS col, ic.relname AS idxname "
+        "SELECT COALESCE(c.conname, ic.relname) AS idxname, "
+        "i.indisunique AS isunique, a.attname AS col, "
+        "array_position(i.indkey, a.attnum) AS pos "
         "FROM pg_index i "
-        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
         "JOIN pg_class ic ON ic.oid = i.indexrelid "
-        "WHERE i.indrelid = to_regclass($q) AND NOT i.indisunique "
-        "AND NOT i.indisprimary AND cardinality(i.indkey) = 1",
+        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+        "LEFT JOIN pg_constraint c ON c.conindid = i.indexrelid "
+        "WHERE i.indrelid = to_regclass($q) AND NOT i.indisprimary "
+        "AND i.indpred IS NULL AND i.indexprs IS NULL",
         {"q": qname},
     ):
-        indexes[row.col] = row.idxname
+        by_index.setdefault((row.idxname, row.isunique), []).append(
+            (row.pos, row.col)
+        )
+    for (idxname, isunique), cols in sorted(by_index.items()):
+        cols = [col for _pos, col in sorted(cols)]
+        if len(cols) == 1:
+            (uniques if isunique else indexes)[cols[0]] = idxname
+        elif isunique:
+            composite_uniques.append((idxname, cols))
+        else:
+            composite_indexes.append((idxname, cols))
 
     fks = {}
     for row in _q(
@@ -314,6 +375,8 @@ def _table_info_postgres(db, table_name):
         "pk_name": pk_name,
         "uniques": uniques,
         "indexes": indexes,
+        "composite_uniques": composite_uniques,
+        "composite_indexes": composite_indexes,
         "fks": fks,
     }
 
@@ -367,31 +430,40 @@ def _table_info_mysql(db, table_name):
     )
     pk_name = constraint_rows[0] if constraint_rows else None
 
+    # SUB_PART IS NULL: префиксные индексы (idx (col(16))) не выводим —
+    # это не полный индекс по колонке
     uniques = {}
     indexes = {}
+    composite_uniques = []
+    composite_indexes = []
+    by_index = {}
     for row in _q(
         db,
         "SELECT COLUMN_NAME AS col, INDEX_NAME AS idxname, NON_UNIQUE AS nonunique, "
-        "COUNT(*) OVER (PARTITION BY INDEX_NAME) AS ncols "
+        "SEQ_IN_INDEX AS seq "
         "FROM information_schema.statistics "
-        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND INDEX_NAME != 'PRIMARY'",
+        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND INDEX_NAME != 'PRIMARY' "
+        "AND SUB_PART IS NULL",
         {"s": schema_name, "t": base_name},
     ):
-        col = normalize_name(row.col)
-        if row.ncols != 1:
-            continue
-        if row.nonunique == 0:
-            uniques[col] = row.idxname
+        by_index.setdefault((row.idxname, row.nonunique == 0), []).append(
+            (row.seq, normalize_name(row.col))
+        )
+    for (idxname, isunique), cols in sorted(by_index.items()):
+        cols = [col for _seq, col in sorted(cols)]
+        if len(cols) == 1:
+            (uniques if isunique else indexes)[cols[0]] = idxname
+        elif isunique:
+            composite_uniques.append((idxname, cols))
         else:
-            indexes[col] = row.idxname
+            composite_indexes.append((idxname, cols))
 
     fks = {}
-    for row in _q(
+    fk_rows = _q(
         db,
         "SELECT kcu.COLUMN_NAME AS col, kcu.REFERENCED_TABLE_SCHEMA AS pschema, "
         "kcu.REFERENCED_TABLE_NAME AS ptable, pc.DATA_TYPE AS ptype, "
-        "rc.DELETE_RULE AS deltype, "
-        "COUNT(*) OVER (PARTITION BY kcu.CONSTRAINT_NAME) AS ncols "
+        "rc.DELETE_RULE AS deltype, kcu.CONSTRAINT_NAME AS conname "
         "FROM information_schema.key_column_usage kcu "
         "JOIN information_schema.referential_constraints rc "
         "  ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA "
@@ -403,10 +475,15 @@ def _table_info_mysql(db, table_name):
         "WHERE kcu.TABLE_SCHEMA = $s AND kcu.TABLE_NAME = $t "
         "AND kcu.REFERENCED_TABLE_NAME IS NOT NULL",
         {"s": schema_name, "t": base_name},
-    ):
+    )
+    fk_counts = {}
+    for row in fk_rows:
+        fk_counts[row.conname] = fk_counts.get(row.conname, 0) + 1
+    for row in fk_rows:
         col = normalize_name(row.col)
         fks[col] = FKInfo(
-            col, row.pschema, row.ptable, row.ptype, row.deltype, row.ncols
+            col, row.pschema, row.ptable, row.ptype, row.deltype,
+            fk_counts[row.conname],
         )
 
     return {
@@ -416,6 +493,8 @@ def _table_info_mysql(db, table_name):
         "pk_name": pk_name,
         "uniques": uniques,
         "indexes": indexes,
+        "composite_uniques": composite_uniques,
+        "composite_indexes": composite_indexes,
         "fks": fks,
     }
 
@@ -446,18 +525,24 @@ def _table_info_sqlite(db, table_name):
 
     uniques = {}
     indexes = {}
+    composite_uniques = []
+    composite_indexes = []
     for idx in _q(db, "SELECT * FROM pragma_index_list($t)", {"t": table_name}):
-        if idx.origin == "pk":
-            continue
+        if idx.origin == "pk" or idx.partial:
+            continue  # частичные индексы не выводим (предикат не восстанавливается)
         cols = _q(db, "SELECT * FROM pragma_index_info($n)", {"n": idx.name})
         col_names = [c.name for c in cols]
-        if len(col_names) != 1:
-            continue
-        col = col_names[0]
-        if idx.unique:
-            uniques[col] = idx.name
+        if any(name is None for name in col_names):
+            continue  # выраженческий индекс
+        if len(col_names) == 1:
+            if idx.unique:
+                uniques[col_names[0]] = idx.name
+            else:
+                indexes[col_names[0]] = idx.name
+        elif idx.unique:
+            composite_uniques.append((idx.name, col_names))
         else:
-            indexes[col] = idx.name
+            composite_indexes.append((idx.name, col_names))
 
     fks = {}
     fk_rows = _q(db, "SELECT * FROM pragma_foreign_key_list($t)", {"t": table_name})
@@ -483,6 +568,8 @@ def _table_info_sqlite(db, table_name):
         "pk_name": None,
         "uniques": uniques,
         "indexes": indexes,
+        "composite_uniques": composite_uniques,
+        "composite_indexes": composite_indexes,
         "fks": fks,
     }
 
@@ -724,6 +811,71 @@ def _resolve_apps(db, apps):
     return scope
 
 
+def _snapshot_entities(db):
+    """Состояние entity-классов до интроспекции: набор сущностей и всё,
+    что интроспекция в них мутирует (атрибуты, pk-учёт, индексы)."""
+    snapshot = {}
+    for entity in db.entities.values():
+        if entity._root_ is not entity:
+            continue
+        snapshot[entity] = (
+            list(entity._attrs_),
+            list(entity._new_attrs_),
+            dict(entity._adict_),
+            entity._pk_attrs_,
+            entity._pk_,
+            entity._pk_is_composite_,
+            list(entity._indexes_),
+            [tuple(index.attrs) for index in entity._indexes_],
+        )
+    return snapshot
+
+
+def _restore_entities(db, snapshot):
+    """Откат после упавшей интроспекции: созданные сущности убираются,
+    изменённые — возвращаются к снапшоту, флаг _is_empty восстанавливается
+    (ленивый триггер сработает снова)."""
+    for entity in list(db.entities.values()):
+        if entity._root_ is not entity:
+            continue
+        state = snapshot.get(entity)
+        if state is None:
+            # созданная интроспекцией сущность
+            del db.entities[entity.__name__]
+            if getattr(db, entity.__name__, None) is entity:
+                delattr(db, entity.__name__)
+            continue
+        (
+            attrs,
+            new_attrs,
+            adict,
+            pk_attrs,
+            pk,
+            pk_is_composite,
+            indexes,
+            index_attrs,
+        ) = state
+        for name in set(entity._adict_) - set(adict):
+            attr = entity._adict_[name]
+            if getattr(entity, name, None) is attr:
+                delattr(entity, name)
+        for name, attr in adict.items():
+            if getattr(entity, name, None) is not attr:
+                setattr(entity, name, attr)
+        entity._attrs_[:] = attrs
+        entity._new_attrs_[:] = new_attrs
+        entity._adict_.clear()
+        entity._adict_.update(adict)
+        entity._pk_attrs_ = pk_attrs
+        entity._pk_ = pk
+        entity._pk_is_composite_ = pk_is_composite
+        entity._indexes_[:] = indexes
+        for index, attrs_tuple in zip(indexes, index_attrs):
+            index.attrs = attrs_tuple
+    db.schema = None
+    db._is_empty = True
+
+
 def introspect(db, *apps, dump=None):
     """db.introspect(*apps, dump=None): достраивает объявленные entity-классы
     атрибутами из схемы БД и строит маппинг. Позиционные аргументы —
@@ -777,29 +929,34 @@ def introspect(db, *apps, dump=None):
     # интроспекция выполняется: флаг снимается, ленивый триггер больше
     # не срабатывает (в т.ч. на внутренних запросах)
     db._is_empty = False
+    snapshot = _snapshot_entities(db)
     dump_text = None
-    with core.db_session:
-        _create_referenced_entities(db)
-        entities = [
-            entity
-            for entity in sorted(db.entities.values(), key=lambda e: e._id_)
-            if entity._root_ is entity
-        ]
-        table_map = {}
-        for entity in entities:
-            table_name = _entity_table_name(db, entity)
-            qname = _qualified_name(table_name)
-            table_map[qname] = entity
-            # case-insensitive fallback: имена таблиц в SQLite/MySQL регистронезависимы
-            table_map.setdefault(qname.lower(), entity)
-        for entity in entities:
-            table_name = _entity_table_name(db, entity)
-            info = table_info(db, table_name)
-            _fill_entity(db, entity, table_name, table_map, info)
-        _link_m2m_tables(db, table_map)
-        if dump is not None:
-            dump_text = _dump_declarations(db, scope)
-    db.generate_mapping(check_tables=False)
+    try:
+        with core.db_session:
+            _create_referenced_entities(db)
+            entities = [
+                entity
+                for entity in sorted(db.entities.values(), key=lambda e: e._id_)
+                if entity._root_ is entity
+            ]
+            table_map = {}
+            for entity in entities:
+                table_name = _entity_table_name(db, entity)
+                qname = _qualified_name(table_name)
+                table_map[qname] = entity
+                # case-insensitive fallback: имена таблиц в SQLite/MySQL регистронезависимы
+                table_map.setdefault(qname.lower(), entity)
+            for entity in entities:
+                table_name = _entity_table_name(db, entity)
+                info = table_info(db, table_name)
+                _fill_entity(db, entity, table_name, table_map, info)
+            _link_m2m_tables(db, table_map)
+            if dump is not None:
+                dump_text = _dump_declarations(db, scope)
+        db.generate_mapping(check_tables=False)
+    except BaseException:
+        _restore_entities(db, snapshot)
+        raise
     if dump is not None:
         with open(dump, "w") as f:
             f.write(dump_text)
@@ -853,6 +1010,8 @@ def _fill_entity(db, entity, table_name, table_map, info):
         notnull = bool(cinfo["notnull"])
         is_pk = name in pk
         fk = info["fks"].get(name)
+        unique_name = info["uniques"].get(name)
+        index_name = info["indexes"].get(name)
 
         if fk is not None and fk.ncols == 1 and not is_pk:
             parent_entity = _lookup_table_entity(table_map, fk.pschema, fk.ptable)
@@ -860,20 +1019,23 @@ def _fill_entity(db, entity, table_name, table_map, info):
             kwargs = {}
             if normalize_name(attr_name) != normalize_name(name):
                 kwargs["column"] = name
-            if parent_entity is not None:
-                attr = (Required if notnull else Optional)(
-                    parent_entity, **kwargs
-                )
-                if not notnull:
-                    attr.nullable = True
-                _add_attr(entity, attr_name, attr)
-                continue
-            if py_type is None:
+            # unique/index/sql_default применяются и к FK-колонкам
+            if unique_name:
+                kwargs["unique"] = unique_name or True
+            if index_name:
+                kwargs["index"] = index_name or True
+            if parent_entity is None and py_type is None:
                 py_type = _py_type_from_sql(db, fk.ptype)
-            attr = (Required if notnull else Optional)(py_type, **kwargs)
+            attr = (Required if notnull else Optional)(
+                parent_entity if parent_entity is not None else py_type, **kwargs
+            )
             if not notnull:
                 attr.nullable = True
+            if cinfo["default"]:
+                attr.sql_default = cinfo["default"]
             _add_attr(entity, attr_name, attr)
+            if unique_name:
+                _add_unique_index(entity, attr, unique_name)
             continue
 
         if py_type is None:
@@ -889,18 +1051,59 @@ def _fill_entity(db, entity, table_name, table_map, info):
                 kwargs["auto"] = True
             attr = PrimaryKey(py_type, **kwargs)
         else:
+            kwargs = {}
+            if unique_name:
+                kwargs["unique"] = unique_name or True
+            if index_name:
+                kwargs["index"] = index_name or True
             if notnull:
-                attr = Required(py_type)
+                attr = Required(py_type, **kwargs)
             else:
-                attr = Optional(py_type, nullable=True)
+                attr = Optional(py_type, nullable=True, **kwargs)
 
-        if name in info["uniques"]:
-            attr.is_unique = info["uniques"][name] or True
-        if name in info["indexes"]:
-            attr.index = info["indexes"][name] or True
         if cinfo["default"] and not is_pk:
             attr.sql_default = cinfo["default"]
         _add_attr(entity, name, attr)
+        if unique_name:
+            _add_unique_index(entity, attr, unique_name)
+
+    _register_composite_indexes(entity, info)
+
+
+def _add_unique_index(entity, attr, name):
+    """Single-column UNIQUE из каталога → Index-объект сущности (как
+    EntityMeta делает для объявленных unique=True — иначе констрейнт не
+    доходит до dbschema и DDL-генерации)."""
+    index = Index(
+        attr, name=name if isinstance(name, str) else None, is_pk=False
+    )
+    index._init_(entity)
+    entity._indexes_.append(index)
+
+
+def _register_composite_indexes(entity, info):
+    """Составные UNIQUE/индексы из каталога → Index-объекты сущности."""
+    by_column = {}
+    for attr in entity._new_attrs_:
+        if attr.is_collection:
+            continue
+        columns = attr.columns or ([attr.column] if attr.column else [attr.name])
+        for column in columns:
+            by_column[column.lower()] = attr
+    pairs = [(True, item) for item in info["composite_uniques"]] + [
+        (False, item) for item in info["composite_indexes"]
+    ]
+    for is_unique, (idxname, cols) in pairs:
+        attrs = []
+        for col in cols:
+            attr = by_column.get(col.lower())
+            if attr is None:
+                break
+            attrs.append(attr)
+        else:
+            index = Index(*attrs, is_unique=is_unique, name=idxname or None)
+            index._init_(entity)
+            entity._indexes_.append(index)
 
 
 def _entity_name(table):
@@ -969,6 +1172,17 @@ def _declared_sets(children, declared):
                 ):
                     result[(child_key, fk_col)] = attr.name
     return result
+
+
+def _dump_col_name(declared_entity, fk_cols, column):
+    """Имя атрибута в дампе для колонки составного индекса:
+    объявленное имя, имя связи для FK, иначе имя колонки."""
+    name = _declared_attr_name(declared_entity, column)
+    if name is not None:
+        return name
+    if column in fk_cols:
+        return _attr_name_for_fk(column)
+    return column
 
 
 def _declared_attr_name(entity, column):
@@ -1108,6 +1322,12 @@ def _dump_entity(
             args = ["%r" % parent]
             if attr_name != name:
                 args.append("column=%r" % name)
+            if cinfo["default"]:
+                args.append("sql_default=%r" % cinfo["default"])
+            if name in info["uniques"]:
+                args.append("unique=%r" % info["uniques"][name])
+            if name in info["indexes"]:
+                args.append("index=%r" % info["indexes"][name])
             args.append(
                 "reverse=%r" % declared_sets.get((key, name), table + "_set")
             )
@@ -1156,6 +1376,12 @@ def _dump_entity(
         lines.append(
             "    PrimaryKey(%s, name=%r)" % (", ".join(pk), info["pk_name"])
         )
+    for idxname, cols in info["composite_uniques"]:
+        names = ", ".join(_dump_col_name(entity, fk_cols, col) for col in cols)
+        lines.append("    unique(%s, name=%r)" % (names, idxname))
+    for idxname, cols in info["composite_indexes"]:
+        names = ", ".join(_dump_col_name(entity, fk_cols, col) for col in cols)
+        lines.append("    composite_index(%s, name=%r)" % (names, idxname))
     for (child_key, fk_col) in sorted(child_list):
         child_table = child_key[1]
         set_name = declared_sets.get((child_key, fk_col), child_table + "_set")
