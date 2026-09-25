@@ -381,6 +381,39 @@ def _table_info_postgres(db, table_name):
     }
 
 
+def _mysql_default(default_expr, type_name):
+    """Дефолт колонки MySQL/MariaDB в виде SQL-выражения для sql_default.
+
+    MariaDB отдаёт строку 'NULL' для nullable-колонки без default (это не
+    дефолт) и уже цитированные строковые литералы ('new'); MySQL —
+    нецитированные ('new', 2020-01-01) — их нужно закавычить по типу колонки.
+    Выражения (CURRENT_TIMESTAMP, (uuid()), b'0') не трогаем."""
+    if default_expr is None:
+        return None
+    if isinstance(default_expr, str):
+        stripped = default_expr.strip()
+        if stripped.upper() == "NULL":
+            return None
+        if len(stripped) >= 2 and stripped.startswith("'") and stripped.endswith("'"):
+            return default_expr  # уже литерал (MariaDB)
+        if "(" in stripped:
+            return default_expr  # выражение/функция
+        if stripped.upper() in (
+            "CURRENT_TIMESTAMP",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+            "NOW",
+        ):
+            return default_expr
+        if stripped.startswith("b'") or stripped.startswith("B'"):
+            return default_expr  # битовый литерал
+        if type_name in ("str", "date", "time", "datetime"):
+            return "'%s'" % stripped.replace("'", "''")
+    return str(default_expr)
+
+
 def _table_info_mysql(db, table_name):
     """Каталог MySQL/MariaDB (information_schema) для одной таблицы."""
     schema_name, base_name = db.provider.split_table_name(table_name)
@@ -400,7 +433,8 @@ def _table_info_mysql(db, table_name):
     for row in rows:
         is_bool = row.type == "tinyint" and row.coltype == "tinyint(1)"
         auto = "auto_increment" in (row.extra or "")
-        default_expr = row.default_expr
+        type_name = _type_name(db, row.type, "bool" if is_bool else None)
+        default_expr = _mysql_default(row.default_expr, type_name)
         name = normalize_name(row.name)
         info = {
             "type": row.type,
@@ -422,16 +456,13 @@ def _table_info_mysql(db, table_name):
     )
     # одноколоночный select: db.select возвращает плоский список скаляров
     pk = [normalize_name(row) for row in pk_rows]
-    constraint_rows = _q(
-        db,
-        "SELECT CONSTRAINT_NAME AS name FROM information_schema.table_constraints "
-        "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND CONSTRAINT_TYPE = 'PRIMARY KEY'",
-        {"s": schema_name, "t": base_name},
-    )
-    pk_name = constraint_rows[0] if constraint_rows else None
+    # в MySQL/MariaDB PK-констрейнт всегда зовётся PRIMARY — это не
+    # пользовательское имя, хранить/дампть его нечего
+    pk_name = None
 
     # SUB_PART IS NULL: префиксные индексы (idx (col(16))) не выводим —
-    # это не полный индекс по колонке
+    # это не полный индекс по колонке; COLUMN_NAME IS NULL —
+    # функциональные индексы MySQL 8 (выражение, а не колонка)
     uniques = {}
     indexes = {}
     composite_uniques = []
@@ -443,7 +474,7 @@ def _table_info_mysql(db, table_name):
         "SEQ_IN_INDEX AS seq "
         "FROM information_schema.statistics "
         "WHERE TABLE_SCHEMA = $s AND TABLE_NAME = $t AND INDEX_NAME != 'PRIMARY' "
-        "AND SUB_PART IS NULL",
+        "AND SUB_PART IS NULL AND COLUMN_NAME IS NOT NULL",
         {"s": schema_name, "t": base_name},
     ):
         by_index.setdefault((row.idxname, row.nonunique == 0), []).append(
@@ -1168,7 +1199,10 @@ def _entity_name(table):
 
 
 def _list_tables(db):
-    """Список таблиц для debug-дампа: [(schema_or_None, table), ...]."""
+    """Список таблиц для debug-дампа: [(schema_or_None, table), ...].
+    Служебная pony_migrations в дамп не попадает."""
+    from pony.orm.migrations import MIGRATIONS_TABLE
+
     dialect = db.provider.dialect
     if dialect == "PostgreSQL":
         schemas = sorted({app.schema_name for app in db._apps.values()})
@@ -1180,7 +1214,11 @@ def _list_tables(db):
             "ORDER BY schemaname, tablename",
             {"schemas": schemas},
         )
-        return [(row.schemaname, row.tablename) for row in rows]
+        return [
+            (row.schemaname, row.tablename)
+            for row in rows
+            if row.tablename != MIGRATIONS_TABLE
+        ]
     if dialect == "MySQL":
         rows = _q(
             db,
@@ -1189,14 +1227,14 @@ def _list_tables(db):
             {},
         )
         # одноколоночный select: db.select возвращает плоский список скаляров
-        return [(None, row) for row in rows]
+        return [(None, row) for row in rows if row != MIGRATIONS_TABLE]
     rows = _q(
         db,
         "SELECT name FROM sqlite_master WHERE type = 'table' "
         "AND name NOT LIKE 'sqlite_%' ORDER BY name",
         {},
     )
-    return [(None, row) for row in rows]
+    return [(None, row) for row in rows if row != MIGRATIONS_TABLE]
 
 
 def _declared_entities(db, tables):

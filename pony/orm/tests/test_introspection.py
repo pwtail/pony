@@ -558,6 +558,51 @@ class TestIntrospection(unittest.TestCase):
         # каст внутри выражения — не трогаем
         self.assertEqual(T.b.sql_default, "('x'::text || 'y'::text)")
         self.assertEqual(T.c.sql_default, "upper('x'::text)")
+
+
+class TestMySQLDefaultNormalization(unittest.TestCase):
+    """Дефолты MySQL/MariaDB в sql_default (без сервера: чистые значения из
+    information_schema)."""
+
+    def _default(self, value, type_name):
+        return introspection._mysql_default(value, type_name)
+
+    def test_no_default(self):
+        self.assertIsNone(self._default(None, "str"))
+        # MariaDB: строка 'NULL' — это отсутствие default, а не дефолт
+        self.assertIsNone(self._default("NULL", "str"))
+
+    def test_mariadb_already_quoted(self):
+        self.assertEqual(self._default("'new'", "str"), "'new'")
+        self.assertEqual(
+            self._default("'2020-01-01'", "date"), "'2020-01-01'"
+        )
+
+    def test_mysql_unquoted_literals_are_quoted_by_type(self):
+        self.assertEqual(self._default("new", "str"), "'new'")
+        self.assertEqual(
+            self._default("2020-01-01", "date"), "'2020-01-01'"
+        )
+        self.assertEqual(self._default("it's", "str"), "'it''s'")
+        # числовые/прочие типы не цитируются
+        self.assertEqual(self._default("5", "int"), "5")
+        self.assertEqual(self._default("1.5", "Decimal"), "1.5")
+
+    def test_expressions_kept_as_is(self):
+        self.assertEqual(
+            self._default("current_timestamp()", "datetime"),
+            "current_timestamp()",
+        )
+        self.assertEqual(
+            self._default("CURRENT_TIMESTAMP", "datetime"),
+            "CURRENT_TIMESTAMP",
+        )
+        self.assertEqual(self._default("CURRENT_DATE", "date"), "CURRENT_DATE")
+        self.assertEqual(self._default("(uuid())", "str"), "(uuid())")
+        self.assertEqual(self._default("b'0'", "int"), "b'0'")
+
+
+class TestIntrospectionDialectGuard(unittest.TestCase):
     def test_unsupported_dialect_rejected(self):
         class FakeProvider:
             dialect = "Oracle"

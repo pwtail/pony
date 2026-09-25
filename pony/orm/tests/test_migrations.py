@@ -932,7 +932,132 @@ class TestMigrationsMariaDB(unittest.TestCase):
         self.assertEqual(os.path.basename(path), "0001_initial.sql")
         with open(path) as f:
             self.assertIn("CREATE TABLE `person`", f.read())
-        self.assertEqual(migrations.apply_migrations(db, self.dir), ["0001_initial.sql"])
+        self.assertEqual(
+            migrations.apply_migrations(db, self.dir), ["main/0001_initial.sql"]
+        )
+
+    def test_introspection_fill_and_dump(self):
+        db = self.db
+        with db_session(ddl=True):
+            db.execute(
+                "CREATE TABLE person (person_id int AUTO_INCREMENT PRIMARY KEY, "
+                "name varchar(50) NOT NULL)"
+            )
+            db.execute(
+                "CREATE TABLE tag (tag_id int AUTO_INCREMENT PRIMARY KEY, "
+                "label varchar(50))"
+            )
+            db.execute(
+                "CREATE TABLE person_tag (person_id int NOT NULL, tag_id int NOT NULL, "
+                "PRIMARY KEY (person_id, tag_id), "
+                "CONSTRAINT fk_pt_person FOREIGN KEY (person_id) REFERENCES person(person_id), "
+                "CONSTRAINT fk_pt_tag FOREIGN KEY (tag_id) REFERENCES tag(tag_id))"
+            )
+            db.execute(
+                "CREATE TABLE car (id int AUTO_INCREMENT PRIMARY KEY, make varchar(50), "
+                "status varchar(10) DEFAULT 'new', "
+                "owner_id int NOT NULL, "
+                "CONSTRAINT fk_car_owner FOREIGN KEY (owner_id) REFERENCES person(person_id))"
+            )
+            db.execute("CREATE UNIQUE INDEX uq_person_name ON person (name)")
+            db.execute("CREATE INDEX ix_car_owner ON car (owner_id)")
+            # префиксный индекс — не полный индекс по колонке, не выводится
+            db.execute("CREATE INDEX ix_car_make_prefix ON car (make(5))")
+            db.execute(
+                "CREATE UNIQUE INDEX uq_car_make_owner ON car (make, owner_id)"
+            )
+
+        new = db.new()
+
+        class Person(new.main.Entity):
+            pass
+
+        class Tag(new.main.Entity):
+            pass
+
+        class Car(new.main.Entity):
+            pass
+
+        new.introspect()
+        P = new.entities["Person"]
+        C = new.entities["Car"]
+        # PK не id + AUTO_INCREMENT
+        self.assertEqual([a.name for a in P._pk_attrs_], ["person_id"])
+        self.assertTrue(P._pk_.auto)
+        # unique доходит и до атрибута, и до схемы
+        self.assertEqual(P.name.is_unique, "uq_person_name")
+        self.assertTrue(P.name.is_part_of_unique_index)
+        schema_indexes = new.schema.tables[P._table_].indexes
+        self.assertIn(
+            "uq_person_name",
+            {getattr(i, "name", None) for i in schema_indexes.values()},
+        )
+        # индекс на FK-колонке
+        self.assertEqual(C.owner.index, "ix_car_owner")
+        # строковый дефолт закавычен
+        self.assertEqual(C.status.sql_default, "'new'")
+        # префиксный индекс не выводится
+        self.assertIsNone(C.make.index)
+        self.assertNotIn("ix_car_make_prefix", {i.name for i in C._indexes_})
+        # составной UNIQUE
+        self.assertIn(
+            ("uq_car_make_owner", ("make", "owner"), True),
+            {
+                (i.name, tuple(a.name for a in i.attrs), i.is_unique)
+                for i in C._indexes_
+                if not i.is_pk
+            },
+        )
+        # связочная таблица → пара Set, без entity
+        self.assertNotIn("PersonTag", new.entities)
+        self.assertIs(P.tag_set.py_type, Tag)
+        with db_session:
+            p = P(name="ann")
+            t = Tag(label="x")
+            t.person_set.add(p)
+        with db_session:
+            self.assertEqual([x.label for x in P[p.person_id].tag_set], ["x"])
+
+        # дамп: без служебного имени PK, без sql_default='NULL',
+        # без pony_migrations
+        path = os.path.join(self.dir, "models.py")
+        dump_db = db.new()
+
+        class Person(dump_db.main.Entity):
+            pass
+
+        class Tag(dump_db.main.Entity):
+            pass
+
+        class Car(dump_db.main.Entity):
+            pass
+
+        dump_db.introspect(dump=path)
+        with open(path) as f:
+            content = f.read()
+        self.assertNotIn("name='PRIMARY'", content)
+        self.assertNotIn("sql_default='NULL'", content)
+        self.assertNotIn("PonyMigrations", content)
+        self.assertIn("person_id = PrimaryKey(int, auto=True)", content)
+        self.assertIn("name = Required(str, unique='uq_person_name')", content)
+        self.assertIn(
+            "unique(make, owner, name='uq_car_make_owner')", content
+        )
+        self.assertIn(
+            "tag_set = Set('Tag', table='person_tag', column='tag_id', "
+            "reverse='person_set')",
+            content,
+        )
+        # дамп пастится и маппится
+        paste_db = Database("sqlite", os.path.join(self.dir, "paste.db"), create_db=True)
+        try:
+            exec(content, {"db": paste_db})
+            paste_db.generate_mapping(check_tables=False)
+            self.assertEqual(
+                paste_db.entities["Person"].tag_set.table, "person_tag"
+            )
+        finally:
+            paste_db.disconnect()
 
 
 if __name__ == "__main__":
