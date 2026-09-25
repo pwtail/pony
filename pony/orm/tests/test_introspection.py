@@ -1106,6 +1106,78 @@ class TestIntrospectionSQLite(unittest.TestCase):
         finally:
             db2.disconnect()
 
+    def test_entity_name_preserves_mixed_case(self):
+        db = self.db
+        self._exec("CREATE TABLE mixedCase (id INTEGER PRIMARY KEY, v TEXT)")
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
+        self.assertIn("class MixedCase(db.Entity):", result)
+
+    def test_sqlite_composite_pk_order_in_dump(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE pair (a INTEGER NOT NULL, b INTEGER NOT NULL, "
+            "PRIMARY KEY (b, a))"
+        )
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
+        # порядок колонок ключа, а не таблицы; без шумного name=None
+        self.assertIn("PrimaryKey(b, a)", result)
+        self.assertNotIn("name=None", result)
+
+    def test_declared_contract_checks_type_and_nullability(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+            "note TEXT, score INTEGER)"
+        )
+
+        class T(db.Entity):
+            name = Required(int)  # поверх TEXT — несовпадение типа
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db.introspect()
+        self.assertIn("type int", str(cm.exception))
+
+        db2 = self.db.new()
+
+        class T2(db2.Entity):
+            _table_ = "t"
+            name = Optional(str)  # поверх NOT NULL
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db2.introspect()
+        self.assertIn("NOT NULL", str(cm.exception))
+        db2.disconnect()
+
+        db3 = self.db.new()
+
+        class T3(db3.Entity):
+            _table_ = "t"
+            note = Required(str)  # поверх nullable
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db3.introspect()
+        self.assertIn("nullable", str(cm.exception))
+        db3.disconnect()
+
+        # кастомный python-тип контрактом не проверяется (нельзя вычислить)
+        class Money:
+            pass
+
+        attr = Required(Money)
+        attr._init_(T, "score")
+        introspection._check_declared_matches_schema(
+            db,
+            attr,
+            "score",
+            {"type": "INTEGER", "typtype": None, "notnull": True},
+        )  # тип не проверяется, nullability совпадает — не падает
+
     def test_failed_introspection_rolls_back(self):
         db = self.db
         self._exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, a TEXT)")

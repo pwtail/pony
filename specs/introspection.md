@@ -41,8 +41,11 @@ entity-классы, так что в моделях можно оставить
    при маппинге: в PostgreSQL имя схемы добавляется из application
    (`(schema_name, table)`), в MySQL/SQLite — без квалификации (см. `pony-apps`).
 4. **Класс — контракт, схема дополняет** (решение пользователя): объявленное
-   сверяется со схемой (несовпадение — ошибка); всё, что есть в схеме и не
-   объявлено, добавляется автоматически.
+   сверяется со схемой (несовпадение — ошибка): колонка обязана существовать,
+   а для встроенных python-типов сверяются ещё тип и nullability
+   (Required/Optional против NOT NULL); кастомные python-типы и колонки
+   неизвестного пони типа не проверяются (контракт нельзя вычислить).
+   Всё, что есть в схеме и не объявлено, добавляется автоматически.
 5. Диалекты — **PostgreSQL** (`pg_catalog`), **MySQL/MariaDB** (`information_schema`),
    **SQLite** (`pragma_table_info` / `pragma_index_list` / `pragma_foreign_key_list`).
    Oracle — вне (из `pony-migrations`).
@@ -124,7 +127,8 @@ entity-классы, так что в моделях можно оставить
   | date/time/timestamp(tz) | `date`/`time`/`datetime` |
   | uuid | `UUID` |
   | json/jsonb | `Json` |
-  | массив | `Array` |
+  | массив int/text/float | `IntArray`/`StrArray`/`FloatArray` |
+  | прочие массивы | `str` (best effort — других Array-типов в pony нет) |
   | bytea | `bytes` |
   | enum | `str` (с комментарием) |
 

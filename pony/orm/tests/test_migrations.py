@@ -261,9 +261,10 @@ class TestMigrations(unittest.TestCase):
         self.assertEqual(os.path.basename(path), "0001_some_name.py")
         with open(path) as f:
             content = f.read()
-        self.assertIn("from pony.orm import Database", content)
+        self.assertIn("from pony.orm import Database, db_session", content)
         self.assertIn("db = Database.instance().new()", content)
         self.assertIn("if __name__ == '__main__':", content)
+        self.assertIn("with db_session:", content)
         self.assertNotIn("depends", content)
         path2 = migrations.add_named_migration(db, self.dir, "second.py", app="main")
         self.assertEqual(os.path.basename(path2), "0002_second.py")
@@ -647,6 +648,72 @@ class TestMigrationsSQLite(unittest.TestCase):
             )
             self.assertTrue({"Person", "pony_migrations"} <= tables)
 
+    def test_apply_fails_on_deleted_applied_migration(self):
+        db = self.db
+        path = self._write("0001_a.sql", 'CREATE TABLE "t1" (id integer)')
+        migrations.apply_migrations(db, self.dir)
+        os.remove(path)
+        with self.assertRaises(migrations.MigrationError) as cm:
+            migrations.apply_migrations(db, self.dir)
+        self.assertIn("missing from the directory", str(cm.exception))
+
+    def test_inner_db_session_does_not_commit_early(self):
+        # сессию владеет раннер: вложенная with db_session: не коммитит сама,
+        # падение в конце миграции откатывает и данные, и запись в pony_migrations
+        db = self.db
+        self._write(
+            "0001_x.sql", "CREATE TABLE t (id integer PRIMARY KEY, v text)"
+        )
+        self._write(
+            "0002_bad.py",
+            "# depends: 0001_x.sql\n"
+            "from pony.orm import Database, db_session\n\n"
+            "db = Database.instance().new()\n\n"
+            "if __name__ == '__main__':\n"
+            "    with db_session:\n"
+            "        db.execute(\"INSERT INTO t VALUES (1, 'x')\")\n"
+            "    raise RuntimeError('boom')\n",
+        )
+        with self.assertRaises(RuntimeError):
+            migrations.apply_migrations(db, self.dir)
+        with db_session:
+            self.assertEqual(list(db.select("SELECT id FROM t")), [])
+        self.assertEqual(self._applied_names(), ["0001_x.sql"])
+
+    def test_py_migration_imports_sibling_module(self):
+        db = self.db
+        # соседние модули — подпакетом: свободный .py в каталоге миграций
+        # сам был бы миграцией
+        helper_dir = os.path.join(self.dir, "main", "mighelpers")
+        os.makedirs(helper_dir)
+        with open(os.path.join(helper_dir, "__init__.py"), "w") as f:
+            f.write("VALUE = 'from-helper'\n")
+        self._write(
+            "0001_x.py",
+            "from pony.orm import Database\n\n"
+            "db = Database.instance().new()\n\n"
+            "import mighelpers\n"
+            "db.execute('CREATE TABLE sh (v text)')\n"
+            "db.execute(\"INSERT INTO sh VALUES ('%s')\" % mighelpers.VALUE)\n",
+        )
+        migrations.apply_migrations(db, self.dir)
+        with db_session:
+            self.assertEqual(list(db.select("SELECT v FROM sh")), ["from-helper"])
+
+    def test_cli_accepts_db_before_subcommand(self):
+        db = self.db
+        module = types.ModuleType("pony_fake_app_cli")
+        module.db = db
+        sys.modules[module.__name__] = module
+        try:
+            self._write("0001_a.sql", 'CREATE TABLE "t1" (id integer)')
+            rc = migrations.main(
+                ["--db", "%s:db" % module.__name__, "--dir", self.dir, "plan"]
+            )
+            self.assertEqual(rc, 0)
+        finally:
+            del sys.modules[module.__name__]
+
     def test_sql_with_literals_and_trigger(self):
         # ';' и '--' внутри строковых литералов, CREATE TRIGGER ... BEGIN..END
         db = self.db
@@ -777,6 +844,26 @@ class TestNoApplications(unittest.TestCase):
         finally:
             db.disconnect()
 
+    def test_py_migration_against_memory_sqlite_is_an_error(self):
+        db = Database("sqlite", ":memory:")
+        db.application("main", schema="public")
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "main"))
+        with open(os.path.join(tmp, "main", "0001_x.py"), "w") as f:
+            f.write(
+                "from pony.orm import Database\n\n"
+                "db = Database.instance().new()\n\n"
+                "db.execute('CREATE TABLE t (id integer)')\n"
+            )
+        try:
+            with self.assertRaises(migrations.MigrationError) as cm:
+                migrations.apply_migrations(db, tmp)
+            self.assertIn("in-memory", str(cm.exception))
+        finally:
+            db.disconnect()
+
     def test_database_instance_not_clobbered_by_new(self):
         db = Database("sqlite", ":memory:")
         try:
@@ -789,7 +876,6 @@ class TestNoApplications(unittest.TestCase):
         finally:
             db.disconnect()
             Database._instance = None
-
 
 def _mariadb_available():
     try:

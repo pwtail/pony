@@ -15,8 +15,9 @@
 Файлы миграций:
 
 - `.sql` — миграция схемы (применяется целиком);
-- `.py` — миграция данных: исполняется **как скрипт** внутри `db_session`,
-  с `__name__ == '__main__'`; свежая база — `db = Database.instance().new()`;
+- `.py` — миграция данных: исполняется **как скрипт**
+  (`runpy.run_path` с `__name__ == '__main__'`) внутри внешней `db_session`
+  раннера; свежая база — `db = Database.instance().new()`;
 - `.txt` — миграция слияния (no-op, только запись в `pony_migrations`).
 
 Зависимости объявляются в первых строках файла: `-- depends: a.sql, b.py`
@@ -41,6 +42,7 @@ import heapq
 import importlib
 import os
 import re
+import runpy
 import sys
 from collections import namedtuple
 
@@ -498,12 +500,13 @@ def add_named_migration(db, directory, file_name, app=None):
     if ext == ".py":
         if lines:
             lines.append("")
-        lines.append("from pony.orm import Database")
+        lines.append("from pony.orm import Database, db_session")
         lines.append("")
         lines.append("db = Database.instance().new()")
         lines.append("")
         lines.append("if __name__ == '__main__':")
-        lines.append("    pass")
+        lines.append("    with db_session:")
+        lines.append("        pass")
     elif not lines:
         lines.append("-- migration has no dependencies")
     with open(path, "w") as f:
@@ -687,24 +690,30 @@ def _apply_py(db, app, name, path, sha256):
 
     Скрипт сам создаёт свежую Database к той же БД без моделей приложения:
     `db = Database.instance().new()`; дальше модели определяются интроспекцией
-    (`db.introspect()`).
+    (`db.introspect()`). Сессия — внешняя, раннера: и изменения данных
+    миграции, и запись в `pony_migrations` попадают в одну транзакцию.
     """
-    with open(path) as f:
-        source = f.read()
-    module_globals = {
-        "__name__": "__main__",
-        "__file__": path,
-    }
     previous_instance = Database._instance
     Database._instance = db
+    # миграция может импортировать соседние модули из своего каталога
+    migration_dir = os.path.dirname(os.path.abspath(path))
+    sys.path.insert(0, migration_dir)
+    module_globals = {}
 
     def run():
-        exec(compile(source, path, "exec"), module_globals)
+        module_globals.update(runpy.run_path(path, run_name="__main__"))
         migration_db = module_globals.get("db")
         if not isinstance(migration_db, Database) or migration_db is db:
             raise MigrationError(
                 "Data migration %s must create its own database: "
                 "db = Database.instance().new()" % name
+            )
+        filename = getattr(getattr(migration_db.provider, "pool", None), "filename", None)
+        if filename == ":memory:":
+            # клон :memory: — отдельная пустая БД: миграция молча ничего бы не сделала
+            raise MigrationError(
+                "Data migration %s cannot run against an in-memory SQLite "
+                "database: db.new() creates a separate empty database" % name
             )
         # всё, что миграция реально использовала, уже интроспектировано;
         # запись в pony_migrations сама по себе интроспекцию не запускает
@@ -715,6 +724,8 @@ def _apply_py(db, app, name, path, sha256):
         with db_session:
             run()
     finally:
+        if sys.path and sys.path[0] == migration_dir:
+            sys.path.pop(0)
         migration_db = module_globals.get("db")
         Database._instance = previous_instance
         if isinstance(migration_db, Database) and migration_db is not db:
@@ -813,6 +824,22 @@ def apply_migrations(db, directory, fake=False, app=None):
                         "Migration %s depends on %s, which is not applied yet; "
                         "apply it first" % (_display(a, name), _display(dep_app, dep_name))
                     )
+
+    # применённые в БД, но исчезнувшие из каталога — ошибка (как и
+    # изменение применённого файла)
+    scope_graphs = graphs if app is None else {app: g}
+    stale = []
+    for a, graph in scope_graphs.items():
+        if a not in applied_cache:
+            applied_cache[a] = applied_migrations(db, a)
+        for applied_name in applied_cache[a]:
+            if applied_name not in graph.names:
+                stale.append(_display(a, applied_name))
+    if stale:
+        raise MigrationError(
+            "Previously applied migrations are missing from the directory: %s"
+            % ", ".join(sorted(stale))
+        )
 
     for a, name, path, sha256 in pending:
         if fake:
@@ -953,7 +980,12 @@ def _print_plan(db, directory, app=None):
         )
         print("  [%s] %s%s" % (mark, display, deps))
     applied = sum(1 for info in infos if info.applied)
-    print("head: %s" % _display(infos[-1].app, infos[-1].name))
+    # голова каждого application — последняя его миграция в порядке
+    heads = {}
+    for info in infos:
+        heads[info.app] = info.name
+    for a, head_name in heads.items():
+        print("head: %s" % _display(a, head_name))
     print("applied %d of %d" % (applied, len(infos)))
     known = {(info.app, info.name) for info in infos}
     scopes = _registered_apps(db) if app is None else [app]
@@ -981,16 +1013,21 @@ def main(argv=None):
     ):
         application = argv.pop(0)
 
+    # default=SUPPRESS: значение, указанное на любом уровне (до или после
+    # подкоманды), не затирается дефолтом другого парсера
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--db", help="database object as <module>:<attr> (e.g. myapp.models:db)"
+        "--db",
+        default=argparse.SUPPRESS,
+        help="database object as <module>:<attr> (e.g. myapp.models:db)",
     )
     common.add_argument(
         "--dir",
         dest="directory",
+        default=argparse.SUPPRESS,
         help="migrations directory (default: migrations)",
     )
-    parser = argparse.ArgumentParser(prog="pony migrations")
+    parser = argparse.ArgumentParser(prog="pony migrations", parents=[common])
     sub = parser.add_subparsers(dest="command", required=True)
     make_parser = sub.add_parser(
         "make",
@@ -1030,13 +1067,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
-        spec = args.db
+        spec = getattr(args, "db", None)
         if not spec:
             raise MigrationError(
                 "Database is not specified: use --db <module>:<attr>"
             )
         db = _load_db(spec)
-        directory = args.directory or "migrations"
+        directory = getattr(args, "directory", None) or "migrations"
         if application is not None and application not in db._apps:
             raise MigrationError(
                 "Unknown application %r. Registered applications: %s"

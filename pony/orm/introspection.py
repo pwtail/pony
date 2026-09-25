@@ -518,7 +518,15 @@ def _table_info_sqlite(db, table_name):
         columns[row.name] = info
         column_list.append((row.name, info))
 
-    pk = [name for name, info in column_list if info["pk"]]
+    # pk-поле pragma — 1-based позиция колонки в ключе: порядок составного
+    # PK берём из него, а не из порядка колонок таблицы
+    pk = [
+        name
+        for name, _info in sorted(
+            ((name, info) for name, info in column_list if info["pk"]),
+            key=lambda item: item[1]["pk"],
+        )
+    ]
     # INTEGER PRIMARY KEY (одна колонка) — rowid-алиас, значения генерируются
     if len(pk) == 1 and columns[pk[0]]["type"] == "INTEGER":
         columns[pk[0]]["auto"] = True
@@ -890,6 +898,15 @@ def introspect(db, *apps, dump=None):
             "Introspection supports PostgreSQL, MySQL/MariaDB and SQLite "
             "(got %s)" % db.provider.dialect
         )
+    if db.provider.dialect == "PostgreSQL":
+        # каталожные запросы используют attidentity (PG 10+)
+        with core.db_session:
+            rows = _q(db, "SELECT current_setting('server_version_num')", {})
+        if int(rows[0]) < 100000:
+            raise IntrospectionError(
+                "Introspection on PostgreSQL requires version 10 or later "
+                "(server reports %s)" % rows[0]
+            )
     if db.schema is not None:
         raise IntrospectionError("Mapping was already generated")
     scope = _resolve_apps(db, apps)
@@ -973,13 +990,16 @@ def _fill_entity(db, entity, table_name, table_map, info):
             continue  # неявные атрибуты (авто-id) не считаются контрактом
         attr_columns = attr.columns if attr.columns else [attr.name]
         for column in attr_columns:
-            if normalize_name(column) not in columns:
+            cinfo = columns.get(normalize_name(column))
+            if cinfo is None:
                 raise IntrospectionError(
                     "Declared attribute %s column %r does not exist in table %s "
                     "(declare the actual column via column=...)"
                     % (attr, column, table_name)
                 )
             covered.add(normalize_name(column))
+            if not attr.is_relation and not attr.is_pk:
+                _check_declared_matches_schema(db, attr, column, cinfo)
 
     if not info["column_list"]:
         raise IntrospectionError(
@@ -1070,6 +1090,41 @@ def _fill_entity(db, entity, table_name, table_map, info):
     _register_composite_indexes(entity, info)
 
 
+def _check_declared_matches_schema(db, attr, column, cinfo):
+    """Класс — контракт (решение 4): объявленные тип и nullability сверяются
+    со схемой. Неизвестный пони тип колонки и кастомные python-типы не
+    проверяются (контракт нельзя вычислить)."""
+    type_name = _type_name(db, cinfo["type"], cinfo.get("typtype"))
+    mapped = TYPE_PY.get(type_name) if type_name else None
+    builtin_types = set(TYPE_PY.values())
+    if (
+        mapped is not None
+        and attr.py_type in builtin_types
+        and attr.py_type is not mapped
+    ):
+        raise IntrospectionError(
+            "Declared attribute %s has type %s, but column %r has type %s "
+            "(mapped to %s)"
+            % (
+                attr,
+                attr.py_type.__name__,
+                column,
+                cinfo["type"],
+                mapped.__name__,
+            )
+        )
+    if cinfo["notnull"] and isinstance(attr, Optional):
+        raise IntrospectionError(
+            "Declared attribute %s is Optional, but column %r is NOT NULL"
+            % (attr, column)
+        )
+    if not cinfo["notnull"] and isinstance(attr, Required) and not attr.is_pk:
+        raise IntrospectionError(
+            "Declared attribute %s is Required, but column %r is nullable"
+            % (attr, column)
+        )
+
+
 def _add_unique_index(entity, attr, name):
     """Single-column UNIQUE из каталога → Index-объект сущности (как
     EntityMeta делает для объявленных unique=True — иначе констрейнт не
@@ -1107,7 +1162,9 @@ def _register_composite_indexes(entity, info):
 
 
 def _entity_name(table):
-    return "".join(part.capitalize() for part in table.split("_"))
+    # первая буква части — заглавная, остальное как есть: MixedCase не
+    # превращается в Mixedcase
+    return "".join(part[:1].upper() + part[1:] for part in table.split("_"))
 
 
 def _list_tables(db):
@@ -1373,9 +1430,12 @@ def _dump_entity(
                 "    %s = %s(%s)%s" % (name, kind, ", ".join(args), comment)
             )
     if len(pk) > 1:
-        lines.append(
-            "    PrimaryKey(%s, name=%r)" % (", ".join(pk), info["pk_name"])
-        )
+        if info["pk_name"]:
+            lines.append(
+                "    PrimaryKey(%s, name=%r)" % (", ".join(pk), info["pk_name"])
+            )
+        else:
+            lines.append("    PrimaryKey(%s)" % ", ".join(pk))
     for idxname, cols in info["composite_uniques"]:
         names = ", ".join(_dump_col_name(entity, fk_cols, col) for col in cols)
         lines.append("    unique(%s, name=%r)" % (names, idxname))
