@@ -1,4 +1,4 @@
-# poney unreleased
+# poney release 0.8.1 (2026-09-25)
 
 ## Breaking changes
 
