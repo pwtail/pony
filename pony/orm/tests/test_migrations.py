@@ -647,6 +647,61 @@ class TestMigrationsSQLite(unittest.TestCase):
             )
             self.assertTrue({"Person", "pony_migrations"} <= tables)
 
+    def test_sql_with_literals_and_trigger(self):
+        # ';' и '--' внутри строковых литералов, CREATE TRIGGER ... BEGIN..END
+        db = self.db
+        self._write(
+            "0001_a.sql",
+            "-- комментарий с ; разделителем\n"
+            "CREATE TABLE t1 (id integer PRIMARY KEY, v text);\n"
+            "INSERT INTO t1 VALUES (1, 'a--b');\n"
+            "INSERT INTO t1 VALUES (2, 'x;y');\n"
+            'INSERT INTO t1 VALUES (3, "dq;z");\n'
+            "CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN\n"
+            "    UPDATE t1 SET v = v || ';' WHERE id = new.id;\n"
+            "END;\n"
+            "INSERT INTO t1 VALUES (4, 'trigger;test');\n",
+        )
+        self.assertEqual(
+            migrations.apply_migrations(db, self.dir), ["main/0001_a.sql"]
+        )
+        with db_session:
+            rows = list(db.select("SELECT id, v FROM t1 ORDER BY id"))
+        self.assertEqual(
+            rows,
+            [(1, "a--b"), (2, "x;y"), (3, "dq;z"), (4, "trigger;test;")],
+        )
+
+
+class TestSqlSplitter(unittest.TestCase):
+    def test_mysql_backslash_escapes(self):
+        sql = "INSERT INTO t VALUES ('a\\';b');\nINSERT INTO t VALUES ('c');\n"
+        statements = migrations._split_sql_statements(sql, "MySQL")
+        self.assertEqual(len(statements), 2)
+        self.assertIn("'a\\';b'", statements[0])
+
+    def test_comment_only_statements_are_skipped(self):
+        sql = (
+            "-- depends: nothing\n"
+            "/* block ; comment */\n"
+            "CREATE TABLE a (id int);\n"
+            "-- just a comment ;\n"
+            "CREATE TABLE b (id int);\n"
+        )
+        statements = migrations._split_sql_statements(sql, "MySQL")
+        # лидирующие комментарии прилипают к оператору (безвредны),
+        # кусок из одних комментариев оператором не становится
+        self.assertEqual(len(statements), 2)
+        self.assertTrue(statements[0].endswith("CREATE TABLE a (id int)"))
+        self.assertTrue(statements[1].endswith("CREATE TABLE b (id int)"))
+        self.assertIn("-- just a comment", statements[1])
+
+    def test_mysql_backticks_and_hash_comments(self):
+        sql = "CREATE TABLE `a;b` (id int); # comment ;\nINSERT INTO `a;b` VALUES (1);"
+        statements = migrations._split_sql_statements(sql, "MySQL")
+        self.assertEqual(len(statements), 2)
+        self.assertTrue(statements[0].startswith("CREATE TABLE `a;b`"))
+
 
 def _mariadb_available():
     try:

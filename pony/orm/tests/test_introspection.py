@@ -18,6 +18,7 @@ def _drop_schema(db, name):
 class TestIntrospection(unittest.TestCase):
     def setUp(self):
         self.db = Database(**db_params)
+        self.dir = tempfile.mkdtemp()
         with db_session(ddl=True):
             rows = self.db.select(
                 "SELECT tablename FROM pg_tables "
@@ -28,6 +29,7 @@ class TestIntrospection(unittest.TestCase):
 
     def tearDown(self):
         teardown_database(self.db)
+        shutil.rmtree(self.dir)
 
     def _exec(self, sql):
         with db_session(ddl=True):
@@ -190,23 +192,19 @@ class TestIntrospection(unittest.TestCase):
             )
             """
         )
-        result = db.introspect("Author", "Book")
-        self.assertIsInstance(result, str)
-        # красивый repr: в консоли/ноутбуке видно код, а не repr строки
-        self.assertEqual(repr(result), str(result))
+        path = os.path.join(self.dir, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
         self.assertIn("class Author(db.Entity):", result)
         self.assertIn("id = PrimaryKey(int, auto=True, name='author_pkey')", result)
         self.assertIn("name = Required(str)", result)
         self.assertIn("author = Required('Author', column='author_id', reverse='book_set')", result)
         self.assertIn("book_set = Set('Book', reverse='author')", result)
         self.assertIn("class Book(db.Entity):", result)
-        # отбор только указанных сущностей
-        only_book = db.introspect("book")
-        self.assertIn("class Book(db.Entity):", only_book)
-        self.assertNotIn("class Author(db.Entity):", only_book)
         with self.assertRaises(introspection.IntrospectionError):
-            db.introspect("NoSuchEntity")
-        # dump-режим не трогает классы
+            db.introspect("NoSuchApp")
+        # dump без объявленных классов пассивен: маппинг не строится
         self.assertEqual(db.schema, None)
 
     def test_referenced_entity_is_created(self):
@@ -371,15 +369,27 @@ class TestIntrospection(unittest.TestCase):
         class Person(app.Entity):
             cars1 = Set("Car")
 
-        by_name = db.introspect("Person")
-        by_qualified = db.introspect("intros.Person")
-        by_class = db.introspect(app.Person)
-        self.assertEqual(str(by_name), str(by_class))
-        self.assertEqual(str(by_qualified), str(by_class))
-        self.assertIn("class Person(db.Entity):", by_class)
-        self.assertIn("cars1 = Set('Car', reverse='owner')", by_class)
-        self.assertIn("_table_ = ('intros', 'person')", by_class)
-        self.assertIsNone(db.schema)
+        # приложение можно передать строкой и объектом — дамп одинаковый
+        path1 = os.path.join(self.dir, "m1.py")
+        path2 = os.path.join(self.dir, "m2.py")
+        db.introspect("intros", dump=path1)
+        with open(path1) as f:
+            by_name = f.read()
+        db2 = db.new()
+
+        class Person(db2.intros.Entity):
+            cars1 = Set("Car")
+
+        db2.introspect(db2.intros, dump=path2)
+        with open(path2) as f:
+            by_obj = f.read()
+        self.assertEqual(by_name, by_obj)
+        self.assertIn("class Person(db.Entity):", by_name)
+        self.assertIn("cars1 = Set('Car', reverse='owner')", by_name)
+        self.assertIn("_table_ = ('intros', 'person')", by_name)
+        # файл + маппинг: после вызова схема построена
+        self.assertIsNotNone(db.schema)
+        db2.disconnect()
 
     def test_dump_declarations_uses_declared_attrs(self):
         db = self.db
@@ -400,16 +410,19 @@ class TestIntrospection(unittest.TestCase):
         class Car(db.Entity):
             renter = Required("Person", column="owner_id")
 
-        result = db.introspect("Person", "Car")
+        path = os.path.join(self.dir, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
         self.assertIn("cars1 = Set('Car', reverse='renter')", result)
         self.assertIn(
             "renter = Required('Person', column='owner_id', reverse='cars1')",
             result,
         )
         self.assertNotIn("car_set", result)
-        self.assertEqual(db.schema, None)
+        self.assertIsNotNone(db.schema)
 
-    def test_lazy_entity_access_after_named_dump(self):
+    def test_lazy_entity_access(self):
         db = self.db
         self._exec(
             """
@@ -422,17 +435,17 @@ class TestIntrospection(unittest.TestCase):
             """
         )
         new_db = db.new()
-        new_db.introspect("Person", "Car")
-        # дамп пассивный: ни классов, ни маппинга, ленивый режим вооружён
-        self.assertIsNone(new_db.schema)
+
+        class Person(new_db.Entity):
+            pass
+
+        class Car(new_db.Entity):
+            pass
+
+        # вне with db: (и в глобальном db_session) интроспекция не запускается
         self.assertTrue(new_db._is_empty)
-        self.assertNotIn("Person", new_db.__dict__)
-        # вне with db: (и в глобальном db_session) доступа к db.Person нет
-        with self.assertRaises(AttributeError):
-            new_db.Person
         with db_session:
-            with self.assertRaises(AttributeError):
-                new_db.Person
+            self.assertTrue(new_db._is_empty)
         # внутри with db: срабатывает ленивая интроспекция
         with new_db:
             person = new_db.Person(name="ann")
@@ -441,6 +454,49 @@ class TestIntrospection(unittest.TestCase):
             self.assertEqual([p.name for p in new_db.Person.select()], ["ann"])
             self.assertEqual([c.make for c in new_db.Car.select()], ["bmw"])
         new_db.disconnect()
+
+    def test_introspect_scope_restricts_to_apps(self):
+        db = self.db
+        _drop_schema(db, "appone")
+        _drop_schema(db, "apptwo")
+        self._exec("CREATE SCHEMA appone")
+        self._exec("CREATE SCHEMA apptwo")
+        self._exec(
+            "CREATE TABLE appone.thing (id serial PRIMARY KEY, v text)"
+        )
+        self._exec(
+            "CREATE TABLE apptwo.other (id serial PRIMARY KEY, v text)"
+        )
+        self.addCleanup(_drop_schema, db, "appone")
+        self.addCleanup(_drop_schema, db, "apptwo")
+        app1 = db.application("appone")
+        db.application("apptwo")
+
+        class Thing(app1.Entity):
+            pass
+
+        # сущность чужого приложения в скоупе — ошибка
+        db2 = db.new()
+
+        class Thing2(db2.appone.Entity):
+            pass
+
+        class Other2(db2.apptwo.Entity):
+            pass
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db2.introspect("appone")
+        self.assertIn("apptwo", str(cm.exception))
+        db2.disconnect()
+
+        # без чужих сущностей — интроспекция и дамп только своей схемы
+        path = os.path.join(self.dir, "models.py")
+        db.introspect("appone", dump=path)
+        with open(path) as f:
+            result = f.read()
+        self.assertIn("class Thing(db.Entity):", result)
+        self.assertIn("_table_ = ('appone', 'thing')", result)
+        self.assertNotIn("class Other", result)
 
 
 class TestIntrospectionDialectGuard(unittest.TestCase):
@@ -541,9 +597,10 @@ class TestIntrospectionSQLite(unittest.TestCase):
             "author_id INTEGER NOT NULL REFERENCES author(id))"
         )
 
-        result = db.introspect("Author", "Book")
-        # красивый repr: в консоли/ноутбуке видно код, а не repr строки
-        self.assertEqual(repr(result), str(result))
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
         self.assertIn("class Author(db.Entity):", result)
         self.assertIn("name = Required(str)", result)
         self.assertIn(
@@ -551,12 +608,9 @@ class TestIntrospectionSQLite(unittest.TestCase):
             result,
         )
         self.assertIn("book_set = Set('Book', reverse='author')", result)
-        # отбор только указанных сущностей
-        only_book = db.introspect("book")
-        self.assertIn("class Book(db.Entity):", only_book)
-        self.assertNotIn("class Author(db.Entity):", only_book)
         with self.assertRaises(introspection.IntrospectionError):
-            db.introspect("NoSuchEntity")
+            db.introspect("NoSuchApp")
+        # dump без объявленных классов пассивен: маппинг не строится
         self.assertEqual(db.schema, None)
 
     def test_referenced_entity_is_created(self):
@@ -621,13 +675,25 @@ class TestIntrospectionSQLite(unittest.TestCase):
         class Person(app.Entity):
             cars1 = Set("Car")
 
-        by_name = db.introspect("Person")
-        by_qualified = db.introspect("intros.Person")
-        by_class = db.introspect(app.Person)
-        self.assertEqual(str(by_name), str(by_class))
-        self.assertEqual(str(by_qualified), str(by_class))
-        self.assertIn("cars1 = Set('Car', reverse='owner')", by_class)
-        self.assertIsNone(db.schema)
+        # приложение можно передать строкой и объектом — дамп одинаковый
+        path1 = os.path.join(self.tmp, "m1.py")
+        path2 = os.path.join(self.tmp, "m2.py")
+        db.introspect("intros", dump=path1)
+        with open(path1) as f:
+            by_name = f.read()
+        db2 = db.new()
+
+        class Person(db2.intros.Entity):
+            cars1 = Set("Car")
+
+        db2.introspect(db2.intros, dump=path2)
+        with open(path2) as f:
+            by_obj = f.read()
+        self.assertEqual(by_name, by_obj)
+        self.assertIn("cars1 = Set('Car', reverse='owner')", by_name)
+        # файл + маппинг: после вызова схема построена
+        self.assertIsNotNone(db.schema)
+        db2.disconnect()
 
     def test_dump_declarations_uses_declared_attrs(self):
         db = self.db
@@ -643,16 +709,19 @@ class TestIntrospectionSQLite(unittest.TestCase):
         class Car(db.Entity):
             renter = Required("Person", column="owner_id")
 
-        result = db.introspect("Person", "Car")
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
         self.assertIn("cars1 = Set('Car', reverse='renter')", result)
         self.assertIn(
             "renter = Required('Person', column='owner_id', reverse='cars1')",
             result,
         )
         self.assertNotIn("car_set", result)
-        self.assertEqual(db.schema, None)
+        self.assertIsNotNone(db.schema)
 
-    def test_lazy_entity_access_after_named_dump(self):
+    def test_lazy_entity_access(self):
         db = self.db
         self._exec("CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         self._exec(
@@ -660,17 +729,17 @@ class TestIntrospectionSQLite(unittest.TestCase):
             "owner_id INTEGER NOT NULL REFERENCES person(id))"
         )
         new_db = db.new()
-        new_db.introspect("Person", "Car")
-        # дамп пассивный: ни классов, ни маппинга, ленивый режим вооружён
-        self.assertIsNone(new_db.schema)
+
+        class Person(new_db.Entity):
+            pass
+
+        class Car(new_db.Entity):
+            pass
+
+        # вне with db: (и в глобальном db_session) интроспекция не запускается
         self.assertTrue(new_db._is_empty)
-        self.assertNotIn("Person", new_db.__dict__)
-        # вне with db: (и в глобальном db_session) доступа к db.Person нет
-        with self.assertRaises(AttributeError):
-            new_db.Person
         with db_session:
-            with self.assertRaises(AttributeError):
-                new_db.Person
+            self.assertTrue(new_db._is_empty)
         # внутри with db: срабатывает ленивая интроспекция
         with new_db:
             person = new_db.Person(name="ann")
@@ -678,6 +747,222 @@ class TestIntrospectionSQLite(unittest.TestCase):
         with db_session:
             self.assertEqual([p.name for p in new_db.Person.select()], ["ann"])
             self.assertEqual([c.make for c in new_db.Car.select()], ["bmw"])
+        new_db.disconnect()
+
+    def test_introspect_scope_restricts_to_apps(self):
+        db = self.db
+        self._exec("CREATE TABLE thing (id INTEGER PRIMARY KEY, v TEXT)")
+        self._exec("CREATE TABLE other (id INTEGER PRIMARY KEY, v TEXT)")
+        app1 = db.application("appone")
+        db.application("apptwo")
+
+        class Thing(app1.Entity):
+            pass
+
+        # сущность чужого приложения в скоупе — ошибка
+        db2 = db.new()
+
+        class Thing2(db2.appone.Entity):
+            pass
+
+        class Other2(db2.apptwo.Entity):
+            pass
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db2.introspect("appone")
+        self.assertIn("apptwo", str(cm.exception))
+        db2.disconnect()
+
+        # MySQL/SQLite: таблицы приложения известны по его сущностям —
+        # в дамп попадает только скоуп
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect("appone", dump=path)
+        with open(path) as f:
+            result = f.read()
+        self.assertIn("class Thing(db.Entity):", result)
+        self.assertNotIn("class Other", result)
+
+    def test_pk_column_not_named_id(self):
+        # PK с именем, отличным от 'id', замещает неявный авто-id
+        db = self.db
+        self._exec(
+            "CREATE TABLE person (person_id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+        )
+        self._exec("INSERT INTO person VALUES (7, 'alice')")
+
+        class Person(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertEqual([a.name for a in Person._pk_attrs_], ["person_id"])
+        self.assertIs(Person._pk_, Person.person_id)
+        self.assertNotIn("id", Person._adict_)
+        self.assertFalse(hasattr(Person, "id"))
+        with db_session:
+            self.assertEqual(Person[7].name, "alice")
+            Person(name="bob")  # auto: rowid генерируется
+        with db_session:
+            self.assertEqual(Person.select().count(), 2)
+
+    def test_composite_pk_guard(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE pair (a INTEGER NOT NULL, b INTEGER NOT NULL, "
+            "PRIMARY KEY (a, b))"
+        )
+
+        class Pair(db.Entity):
+            pass
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db.introspect()
+        self.assertIn("Composite primary key", str(cm.exception))
+
+    def test_table_without_pk_guard(self):
+        db = self.db
+        self._exec("CREATE TABLE nopk (x TEXT)")
+
+        class Nopk(db.Entity):
+            pass
+
+        with self.assertRaises(introspection.IntrospectionError) as cm:
+            db.introspect()
+        self.assertIn("no primary key", str(cm.exception))
+
+    def test_m2m_link_table_fill(self):
+        # связочная таблица -> пара Set, entity для неё не создаётся
+        db = self.db
+        self._exec("CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec("CREATE TABLE tag (id INTEGER PRIMARY KEY, label TEXT)")
+        self._exec(
+            "CREATE TABLE person_tag ("
+            "person_id INTEGER NOT NULL REFERENCES person(id), "
+            "tag_id INTEGER NOT NULL REFERENCES tag(id), "
+            "PRIMARY KEY (person_id, tag_id))"
+        )
+
+        class Person(db.Entity):
+            pass
+
+        class Tag(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertNotIn("PersonTag", db.entities)
+        self.assertIs(Person.tag_set.py_type, Tag)
+        self.assertIs(Tag.person_set.py_type, Person)
+        self.assertEqual(Person.tag_set.table, "person_tag")
+        with db_session:
+            # разные id у сторон: перепутанные FK-колонки видны сразу
+            p = Person(id=7, name="ann")
+            t = Tag(id=3, label="x")
+            t.person_set.add(p)
+        with db_session:
+            self.assertEqual([t.label for t in Person[7].tag_set], ["x"])
+        with db_session:
+            t2 = Tag(id=4, label="y")
+            Person[7].tag_set.add(t2)
+        with db_session:
+            labels = sorted(t.label for t in Person[7].tag_set)
+            self.assertEqual(labels, ["x", "y"])
+            self.assertEqual(Tag[3].person_set.select().first().name, "ann")
+
+    def test_m2m_link_table_with_extra_column_is_entity(self):
+        # доп. колонка — уже не связочная: составной PK требует объявления
+        db = self.db
+        self._exec("CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec("CREATE TABLE tag (id INTEGER PRIMARY KEY, label TEXT)")
+        self._exec(
+            "CREATE TABLE person_tag ("
+            "person_id INTEGER NOT NULL REFERENCES person(id), "
+            "tag_id INTEGER NOT NULL REFERENCES tag(id), "
+            "note TEXT, "
+            "PRIMARY KEY (person_id, tag_id))"
+        )
+
+        class Person(db.Entity):
+            pass
+
+        class Tag(db.Entity):
+            pass
+
+        db.introspect()
+        self.assertFalse(hasattr(Person, "tag_set"))
+
+    def test_m2m_link_table_dump(self):
+        db = self.db
+        self._exec("CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        self._exec("CREATE TABLE tag (id INTEGER PRIMARY KEY, label TEXT)")
+        self._exec(
+            "CREATE TABLE person_tag ("
+            "person_id INTEGER NOT NULL REFERENCES person(id), "
+            "tag_id INTEGER NOT NULL REFERENCES tag(id), "
+            "PRIMARY KEY (person_id, tag_id))"
+        )
+
+        class Person(db.Entity):
+            pass
+
+        class Tag(db.Entity):
+            pass
+
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
+        self.assertNotIn("class PersonTag", result)
+        self.assertNotIn("person_tag_set", result)
+        self.assertIn(
+            "tag_set = Set('Tag', table='person_tag', column='tag_id', "
+            "reverse='person_set')",
+            result,
+        )
+        self.assertIn(
+            "person_set = Set('Person', column='person_id', reverse='tag_set')",
+            result,
+        )
+        # дамп пастится: свежая база принимает его как декларации
+        db2 = Database(
+            "sqlite", os.path.join(self.tmp, "t2.db"), create_db=True
+        )
+        try:
+            exec(result, {"db": db2})
+            db2.generate_mapping(check_tables=False)
+            self.assertEqual(
+                db2.entities["Person"].tag_set.table, "person_tag"
+            )
+        finally:
+            db2.disconnect()
+
+    def test_dump_skips_sqlite_sequence(self):
+        db = self.db
+        self._exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
+        )
+        path = os.path.join(self.tmp, "models.py")
+        db.introspect(dump=path)
+        with open(path) as f:
+            result = f.read()
+        self.assertNotIn("SqliteSequence", result)
+        self.assertNotIn("sqlite_sequence", result)
+
+    def test_async_with_db_lazy_introspection(self):
+        # async with db: — триггер ленивой интроспекции (решение 14);
+        # интроспекция sync и выполняется до входа в async-контекст
+        import asyncio
+
+        db = self.db
+        self._exec("CREATE TABLE person (person_id INTEGER PRIMARY KEY, name TEXT)")
+        new_db = db.new()
+
+        class Person(new_db.Entity):
+            pass
+
+        async def go():
+            async with new_db:
+                return [a.name for a in new_db.entities["Person"]._pk_attrs_]
+
+        self.assertEqual(asyncio.run(go()), ["person_id"])
         new_db.disconnect()
 
 

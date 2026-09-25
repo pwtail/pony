@@ -856,6 +856,17 @@ class DBSessionContextManager:
                 "async db_session cannot be used inside a sync db_session: "
                 "mixing the two modes is not supported, use 'with db_session:'",
             )
+        database = self.database
+        if database is not None and database._needs_introspect():
+            # интроспекция — sync по дизайну; запускаем до того, как открыт
+            # async-контекст (sync db_session внутри async запрещён)
+            if local.db_context_counter or local.async_db_context:
+                throw(
+                    TransactionError,
+                    "lazy introspection of an empty database cannot run inside "
+                    "an open session: enter 'async with db:' at the top level",
+                )
+            database._maybe_introspect()
         local.async_db_context += 1
         try:
             self._begin()
@@ -1428,7 +1439,6 @@ class Database:
         # Ленивая интроспекция: пустая база (db.new()) достраивает маппинг
         # на входе в per-db скоуп (with db:).
         self._is_empty = False
-        self._pending_entities = []
         self.Entity = type.__new__(EntityMeta, "Entity", (Entity,), {})
         self.Entity._database_ = self
 
@@ -1565,12 +1575,13 @@ class Database:
             facade = self._migrations_facade = migrations.MigrationsFacade(self)
         return facade
 
-    def _maybe_introspect(self):
-        if not self._is_empty:
-            return
-        if not self._pending_entities and not any(
+    def _needs_introspect(self):
+        return self._is_empty and any(
             entity._root_ is entity for entity in self.entities.values()
-        ):
+        )
+
+    def _maybe_introspect(self):
+        if not self._needs_introspect():
             return
         self.introspect()
 
@@ -1594,17 +1605,23 @@ class Database:
             args = getattr(pool, "args", ())
             kwargs = dict(getattr(pool, "kwargs", {}))
             new_db.bind(type(provider), *args, **kwargs)
+        for app in self._apps.values():
+            # приложения клонируются: миграция работает со своими app
+            # (class X(db.myapp.Entity) / db.introspect('myapp'))
+            new_db.application(app.name, schema=app.schema_name)
         new_db._is_empty = True
         return new_db
 
     @cut_traceback
-    def introspect(self, *entities):
-        """Этап 2 миграций: без имён — достроить entity-классы атрибутами из
-        схемы БД и сгенерировать маппинг; с именами сущностей — вернуть строку
-        с их описаниями, выведенными из схемы (отладочный режим)."""
+    def introspect(self, *apps, dump=None):
+        """Этап 2 миграций: достраивает объявленные entity-классы атрибутами
+        из схемы БД и генерирует маппинг. Позиционные аргументы — приложения
+        (имя строкой или объект Application): интроспекция только их
+        сущностей; без аргументов — все приложения. `dump=path` пишет
+        декларации моделей этих приложений в файл."""
         from pony.orm import introspection
 
-        return introspection.introspect(self, *entities)
+        return introspection.introspect(self, *apps, dump=dump)
 
     @property
     def last_sql(self):

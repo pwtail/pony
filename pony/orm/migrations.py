@@ -515,26 +515,103 @@ def _apply_sql(db, app, name, path, sha256):
     with open(path) as f:
         sql = f.read()
     with db_session(ddl=True):
-        if db.provider.dialect == "PostgreSQL":
+        dialect = db.provider.dialect
+        if dialect == "PostgreSQL":
             # psycopg3 исполняет несколько операторов одним запросом
             if _strip_sql_comments(sql).strip():
                 db.execute(sql)
         else:
-            # SQLite/MySQL: один оператор на execute; режем по ';' (best effort)
-            for statement in _split_sql_statements(sql):
+            # SQLite/MySQL: один оператор на execute; режем по ';' вне
+            # литералов/комментариев (SQLite — с учётом CREATE TRIGGER)
+            for statement in _split_sql_statements(sql, dialect):
                 db.execute(statement)
         _record(db, app, name, sha256)
 
 
+def _scan_sql(sql, backslash_escapes, keep_comments):
+    """Сканер SQL: идёт по скрипту, отслеживая строковые литералы
+    ('...', "...", `...`), комментарии (-- ..., # ..., /* ... */) и точки
+    с запятой. Возвращает список кусков, разрезанных по ';' вне литералов
+    и комментариев. Комментарии в куски включаются (keep_comments) или
+    пропускаются."""
+    pieces = []
+    buf = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in "'\"`":
+            j = i + 1
+            while j < n:
+                if backslash_escapes and sql[j] == "\\":
+                    j += 2
+                    continue
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            buf.append(sql[i:j])
+            i = j
+        elif sql.startswith("--", i) or ch == "#":
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            if keep_comments:
+                buf.append(sql[i:j])
+            i = j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            if keep_comments:
+                buf.append(sql[i:j])
+            i = j
+        elif ch == ";":
+            pieces.append("".join(buf))
+            buf = []
+            i += 1
+        else:
+            buf.append(ch)
+            i += 1
+    tail = "".join(buf)
+    if tail.strip():
+        pieces.append(tail)
+    return pieces
+
+
 def _strip_sql_comments(sql):
-    return re.sub(r"--[^\n]*", "", sql)
+    """SQL без комментариев (литералы не трогаем) — для проверки пустоты."""
+    return ";".join(_scan_sql(sql, backslash_escapes=False, keep_comments=False))
 
 
-def _split_sql_statements(sql):
-    """Режет SQL-миграцию на операторы по ';' (best effort: не учитывает
-    ';' внутри строковых литералов/триггеров)."""
-    sql = _strip_sql_comments(sql)
-    return [s.strip() for s in sql.split(";") if s.strip()]
+def _split_sql_statements(sql, dialect):
+    """Режет SQL-миграцию на операторы по ';': разделитель учитывается
+    только вне строковых литералов и комментариев. Для SQLite куски
+    дополнительно склеиваются через sqlite3.complete_statement — тела
+    CREATE TRIGGER ... BEGIN ... END не режутся. Тела процедур MySQL
+    (DELIMITER) не поддерживаются."""
+    pieces = _scan_sql(
+        sql, backslash_escapes=dialect == "MySQL", keep_comments=True
+    )
+    if dialect == "SQLite":
+        import sqlite3
+
+        merged = []
+        buf = ""
+        for piece in pieces:
+            buf += piece + ";"
+            if sqlite3.complete_statement(buf):
+                merged.append(buf)
+                buf = ""
+        if buf.strip():
+            # незавершённый хвост: выполнение упадёт с ошибкой драйвера
+            merged.append(buf)
+        pieces = merged
+    return [
+        statement
+        for statement in (piece.strip() for piece in pieces)
+        if _strip_sql_comments(statement).strip()
+    ]
 
 
 def _apply_py(db, app, name, path, sha256):

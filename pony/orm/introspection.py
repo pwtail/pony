@@ -3,9 +3,12 @@
 - `db.introspect()` — достраивает объявленные entity-классы атрибутами,
   выводимыми из каталога БД, и генерирует маппинг; после вызова работают
   обычные `db_session` и ORM-запросы.
-- `db.introspect('Person', 'Book')` — отладочный режим: возвращает строку
-  с описаниями указанных сущностей, выведенными из схемы БД (классы при
-  этом не трогает).
+- `db.introspect('app1', app2)` — то же, но только для сущностей
+  перечисленных приложений (имя строкой или объект Application);
+  объявленная сущность вне списка — ошибка.
+- `db.introspect(..., dump='models.py')` — дополнительно пишет декларации
+  всех таблиц этих приложений в файл; без объявленных классов — пассивно
+  (только файл, маппинг не строится).
 
 Диалекты: PostgreSQL (каталог pg_catalog), MySQL/MariaDB (information_schema),
 SQLite (PRAGMA). Sync.
@@ -23,15 +26,6 @@ from pony.orm.ormtypes import FloatArray, IntArray, Json, StrArray
 
 class IntrospectionError(core.OrmError):
     pass
-
-
-class _DumpResult(str):
-    # в консоли/ноутбуке показывается как код, а не как repr строки
-    def __repr__(self):
-        return str(self)
-
-    def _repr_pretty_(self, p, cycle):
-        p.text(str(self))
 
 
 TYPE_PY = {
@@ -363,7 +357,8 @@ def _table_info_mysql(db, table_name):
         "ORDER BY ORDINAL_POSITION",
         {"s": schema_name, "t": base_name},
     )
-    pk = [normalize_name(row.name) for row in pk_rows]
+    # одноколоночный select: db.select возвращает плоский список скаляров
+    pk = [normalize_name(row) for row in pk_rows]
     constraint_rows = _q(
         db,
         "SELECT CONSTRAINT_NAME AS name FROM information_schema.table_constraints "
@@ -539,22 +534,29 @@ def _create_referenced_entities(db):
         core.EntityMeta(name, (base,), {})
 
 
+def _remove_implicit(entity, attr):
+    """Убирает неявный атрибут (авто-id) из класса, pk-учёта и индексов."""
+    entity._attrs_.remove(attr)
+    entity._new_attrs_.remove(attr)
+    del entity._adict_[attr.name]
+    if getattr(entity, attr.name, None) is attr:
+        delattr(entity, attr.name)
+    for index in entity._indexes_:
+        if attr in index.attrs:
+            index.attrs = tuple(a for a in index.attrs if a is not attr)
+    entity._pk_attrs_ = tuple(a for a in entity._pk_attrs_ if a is not attr)
+    entity._pk_is_composite_ = len(entity._pk_attrs_) > 1
+    if entity._pk_is_composite_:
+        entity._pk_ = entity._pk_attrs_
+    else:
+        entity._pk_ = entity._pk_attrs_[0] if entity._pk_attrs_ else None
+
+
 def _add_attr(entity, name, attr):
     existing = entity._adict_.get(name)
     if existing is not None and existing.is_implicit:
-        # неявный атрибут (например, авто-id) замещаем выведенным из схемы
-        entity._attrs_.remove(existing)
-        entity._new_attrs_.remove(existing)
-        del entity._adict_[name]
-        for index in entity._indexes_:
-            if existing in index.attrs:
-                index.attrs = tuple(
-                    attr if a is not existing else attr
-                    for a in index.attrs
-                )
-        if len(entity._pk_attrs_) == 1 and entity._pk_attrs_[0] is existing:
-            entity._pk_attrs_ = (attr,)
-            entity._pk_ = attr
+        # неявный атрибут (авто-id) замещаем выведенным из схемы
+        _remove_implicit(entity, existing)
     elif name in entity._adict_ or hasattr(entity, name):
         raise IntrospectionError(
             "Cannot create attribute %s.%s: the name is already in use"
@@ -565,6 +567,23 @@ def _add_attr(entity, name, attr):
     entity._new_attrs_.append(attr)
     entity._adict_[name] = attr
     setattr(entity, name, attr)
+    if attr.is_pk and not attr.is_collection:
+        # выведенный из схемы PK замещает неявный авто-id независимо от имени
+        # колонки: регистрируем его в pk-учёте и pk-индексе сущности
+        for implicit in [a for a in entity._pk_attrs_ if a.is_implicit]:
+            _remove_implicit(entity, implicit)
+        if attr not in entity._pk_attrs_:
+            entity._pk_attrs_ += (attr,)
+        entity._pk_is_composite_ = len(entity._pk_attrs_) > 1
+        entity._pk_ = (
+            entity._pk_attrs_
+            if entity._pk_is_composite_
+            else entity._pk_attrs_[0]
+        )
+        attr.pk_offset = entity._pk_attrs_.index(attr)
+        for index in entity._indexes_:
+            if index.is_pk and not index.attrs:
+                index.attrs = (attr,)
     return attr
 
 
@@ -574,9 +593,144 @@ def _attr_name_for_fk(column):
     return column
 
 
-def introspect(db, *entities):
-    """db.introspect(*entities): без имён заполняет классы из схемы БД и
-    строит маппинг; с именами — возвращает описания указанных сущностей."""
+def _lookup_table_entity(table_map, pschema, ptable):
+    """Сущность по (schema, table) родителя FK в карте объявленных таблиц."""
+    parent_key = "%s.%s" % (pschema, ptable)
+    return (
+        table_map.get(parent_key)
+        or table_map.get(ptable)
+        or table_map.get(parent_key.lower())
+        or table_map.get((ptable or "").lower())
+    )
+
+
+def _link_table_parents(info):
+    """Связочная таблица m2m: ровно две колонки, обе — одиночные FK на разные
+    таблицы, и PK состоит ровно из них. Возвращает
+    ((col_a, fk_a), (col_b, fk_b)) или None."""
+    columns = info["column_list"]
+    if len(columns) != 2:
+        return None
+    names = [name for name, _info in columns]
+    if len(info["pk"]) != 2 or set(info["pk"]) != set(names):
+        return None
+    fks = []
+    for name in names:
+        fk = info["fks"].get(name)
+        if fk is None or fk.ncols != 1:
+            return None
+        fks.append((name, fk))
+    (_col_a, fk_a), (_col_b, fk_b) = fks
+    if fk_a.pschema == fk_b.pschema and fk_a.ptable == fk_b.ptable:
+        return None  # симметричный m2m — только явным объявлением
+    return fks[0], fks[1]
+
+
+def _m2m_table_arg(db, schema, table):
+    if schema and schema != db.provider.default_schema_name:
+        return (schema, table)
+    return table
+
+
+def _declared_m2m(entity_a, entity_b):
+    """Уже объявленная пользователем пара Set+Set между сущностями
+    (решение 9: объявленное интроспекция не дополняет)."""
+    for attr in entity_a._new_attrs_:
+        if attr.is_collection and attr.py_type is entity_b:
+            return True
+    for attr in entity_b._new_attrs_:
+        if attr.is_collection and attr.py_type is entity_a:
+            return True
+    return False
+
+
+def _add_m2m_pair(db, entity_a, entity_b, table_name, col_a, col_b):
+    """Пара Set на родителях связочной таблицы; col_a/col_b — FK-колонки,
+    ссылающиеся на таблицы entity_a/entity_b. В pony column= — это колонка,
+    ссылающаяся на таблицу ЦЕЛИ атрибута (reverse_column — только для
+    симметричных связей), поэтому сторона entity_a получает col_b и наоборот.
+    Конвенция pony об именах колонок связи может не совпадать со схемой —
+    задаём явно."""
+    name_a = entity_b.__name__.lower() + "_set"  # на стороне entity_a
+    name_b = entity_a.__name__.lower() + "_set"  # на стороне entity_b
+    _add_attr(
+        entity_a,
+        name_a,
+        Set(entity_b, table=table_name, column=col_b, reverse=name_b),
+    )
+    _add_attr(
+        entity_b,
+        name_b,
+        Set(entity_a, column=col_a, reverse=name_a),
+    )
+
+
+def _link_m2m_tables(db, table_map):
+    """Находит в схеме связочные таблицы между объявленными сущностями и
+    добавляет пару Set на обоих родителях (сами таблицы entity не становятся)."""
+    for schema, table in _list_tables(db):
+        qname = "%s.%s" % (schema, table) if schema else table
+        if qname in table_map or qname.lower() in table_map:
+            continue  # таблица сопоставлена объявленной сущности
+        table_name = (schema, table) if schema else table
+        link = _link_table_parents(table_info(db, table_name))
+        if link is None:
+            continue
+        (col_a, fk_a), (col_b, fk_b) = link
+        entity_a = _lookup_table_entity(table_map, fk_a.pschema, fk_a.ptable)
+        entity_b = _lookup_table_entity(table_map, fk_b.pschema, fk_b.ptable)
+        if entity_a is None or entity_b is None or entity_a is entity_b:
+            continue
+        if _declared_m2m(entity_a, entity_b):
+            continue
+        _add_m2m_pair(
+            db,
+            entity_a,
+            entity_b,
+            _m2m_table_arg(db, schema, table),
+            col_a,
+            col_b,
+        )
+
+
+def _resolve_apps(db, apps):
+    """Позиционные аргументы introspect — приложения (имя строкой или объект
+    Application). None — без ограничений (все приложения + сущности без
+    приложения)."""
+    if not apps:
+        return None
+    scope = set()
+    for ref in apps:
+        if isinstance(ref, str):
+            app = db._apps.get(ref)
+            if app is None:
+                raise IntrospectionError(
+                    "Unknown application %r. Registered applications: %s"
+                    % (ref, ", ".join(sorted(db._apps)) or "none")
+                )
+        elif isinstance(ref, core.Application):
+            app = db._apps.get(ref.name)
+            if app is None:
+                raise IntrospectionError(
+                    "Application %r is not registered in this database"
+                    % ref.name
+                )
+        else:
+            raise IntrospectionError(
+                "introspect() takes applications (a name or an Application "
+                "object), got %r" % (ref,)
+            )
+        scope.add(app)
+    return scope
+
+
+def introspect(db, *apps, dump=None):
+    """db.introspect(*apps, dump=None): достраивает объявленные entity-классы
+    атрибутами из схемы БД и строит маппинг. Позиционные аргументы —
+    приложения: интроспекция только их сущностей (объявленная сущность
+    другого приложения — ошибка); без аргументов — все приложения и
+    сущности без приложения. `dump=path` дополнительно пишет декларации
+    всех таблиц этих приложений в файл."""
     if db.provider is None:
         raise IntrospectionError("Database object is not bound with a provider yet")
     if db.provider.dialect not in ("PostgreSQL", "MySQL", "SQLite"):
@@ -586,21 +740,45 @@ def introspect(db, *entities):
         )
     if db.schema is not None:
         raise IntrospectionError("Mapping was already generated")
-    if entities:
+    scope = _resolve_apps(db, apps)
+    declared = [
+        entity
+        for entity in sorted(db.entities.values(), key=lambda e: e._id_)
+        if entity._root_ is entity
+    ]
+    if scope is not None:
+        for entity in declared:
+            if getattr(entity, "_app_", None) not in scope:
+                entity_app = getattr(entity, "_app_", None)
+                raise IntrospectionError(
+                    "Entity %s belongs to %s, which is not part of this "
+                    "introspection (scope: %s)"
+                    % (
+                        entity.__name__,
+                        "application %r" % entity_app.name
+                        if entity_app is not None
+                        else "no application",
+                        ", ".join(sorted(app.name for app in scope)),
+                    )
+                )
+    if not declared:
+        if dump is None:
+            raise IntrospectionError(
+                "No entities are declared: declare the entity classes you need "
+                "(even empty ones) before db.introspect()"
+            )
+        # dump без объявленных классов: пассивно пишем файл, маппинг не
+        # строим — ленивый триггер (with db:) остаётся вооружённым
         with core.db_session:
-            return _dump_declarations(db, entities)
-    if not db._pending_entities and not any(
-        entity._root_ is entity for entity in db.entities.values()
-    ):
-        raise IntrospectionError(
-            "No entities are declared: declare the entity classes you need "
-            "(even empty ones) before db.introspect()"
-        )
+            dump_text = _dump_declarations(db, scope)
+        with open(dump, "w") as f:
+            f.write(dump_text)
+        return
     # интроспекция выполняется: флаг снимается, ленивый триггер больше
     # не срабатывает (в т.ч. на внутренних запросах)
     db._is_empty = False
+    dump_text = None
     with core.db_session:
-        _create_pending_entities(db)
         _create_referenced_entities(db)
         entities = [
             entity
@@ -618,7 +796,13 @@ def introspect(db, *entities):
             table_name = _entity_table_name(db, entity)
             info = table_info(db, table_name)
             _fill_entity(db, entity, table_name, table_map, info)
+        _link_m2m_tables(db, table_map)
+        if dump is not None:
+            dump_text = _dump_declarations(db, scope)
     db.generate_mapping(check_tables=False)
+    if dump is not None:
+        with open(dump, "w") as f:
+            f.write(dump_text)
 
 
 def _fill_entity(db, entity, table_name, table_map, info):
@@ -640,13 +824,25 @@ def _fill_entity(db, entity, table_name, table_map, info):
                 )
             covered.add(normalize_name(column))
 
+    if not info["column_list"]:
+        raise IntrospectionError(
+            "Table %s does not exist" % (_qualified_name(table_name),)
+        )
     pk = info["pk"]
-    if len(pk) > 1 and not any(
-        attr.is_pk for attr in entity._new_attrs_ if not attr.is_collection
-    ):
+    declared_pk = any(
+        attr.is_pk and not attr.is_implicit
+        for attr in entity._new_attrs_
+        if not attr.is_collection
+    )
+    if len(pk) > 1 and not declared_pk:
         raise IntrospectionError(
             "Composite primary key of table %s must be declared explicitly: "
-            "PrimaryKey(%s, name=...)" % (table_name, ", ".join(pk))
+            "PrimaryKey(%s, name=...)" % (_qualified_name(table_name), ", ".join(pk))
+        )
+    if not pk and not declared_pk:
+        raise IntrospectionError(
+            "Table %s has no primary key; pony entities require a primary key"
+            % (_qualified_name(table_name),)
         )
 
     for name, cinfo in info["column_list"]:
@@ -659,13 +855,7 @@ def _fill_entity(db, entity, table_name, table_map, info):
         fk = info["fks"].get(name)
 
         if fk is not None and fk.ncols == 1 and not is_pk:
-            parent_key = "%s.%s" % (fk.pschema, fk.ptable)
-            parent_entity = (
-                table_map.get(parent_key)
-                or table_map.get(fk.ptable)
-                or table_map.get((parent_key or "").lower())
-                or table_map.get((fk.ptable or "").lower())
-            )
+            parent_entity = _lookup_table_entity(table_map, fk.pschema, fk.ptable)
             attr_name = _attr_name_for_fk(name)
             kwargs = {}
             if normalize_name(attr_name) != normalize_name(name):
@@ -738,10 +928,12 @@ def _list_tables(db):
             "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
             {},
         )
-        return [(None, row.name) for row in rows]
+        # одноколоночный select: db.select возвращает плоский список скаляров
+        return [(None, row) for row in rows]
     rows = _q(
         db,
-        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name",
         {},
     )
     return [(None, row) for row in rows]
@@ -749,21 +941,15 @@ def _list_tables(db):
 
 def _declared_entities(db, tables):
     declared = {}
+    table_keys = set(tables)
     for entity in db.entities.values():
         if entity._root_ is not entity:
             continue
-        table_name = entity._table_
-        if isinstance(table_name, tuple):
-            key = (table_name[0], table_name[1])
-            if key in tables:
-                declared[key] = entity
-            continue
-        if not isinstance(table_name, str):
-            table_name = db.provider.get_default_entity_table_name(entity)
-        for schema, table in tables:
-            if table.lower() == table_name.lower():
-                declared[(schema, table)] = entity
-                break
+        table_name = _entity_table_name(db, entity)
+        schema, base = db.provider.split_table_name(table_name)
+        key = _catalog_key_for(table_keys, schema, base)
+        if key is not None:
+            declared[key] = entity
     return declared
 
 
@@ -797,136 +983,110 @@ def _declared_attr_name(entity, column):
     return None
 
 
-def _resolve_names(db, tables, names):
-    by_name = {}
-    for schema, table in tables:
-        by_name.setdefault(_entity_name(table).lower(), []).append((schema, table))
-
-    def catalog_key(table_name):
-        if isinstance(table_name, tuple):
-            schema, table = table_name
-            for key in tables:
-                if key == (schema, table):
-                    return key
-        else:
-            for key in tables:
-                if key[1].lower() == table_name.lower():
-                    return key
-        return None
-
-    def entity_key(entity):
-        key = catalog_key(_entity_table_name(db, entity))
-        if key is None:
-            raise IntrospectionError(
-                "Entity %s is not mapped to a table" % entity.__name__
-            )
+def _catalog_key_for(table_keys, pschema, ptable):
+    """Ключ каталога (schema, table) для родителя FK: точное совпадение,
+    иначе единственная таблица с таким именем (MySQL: ключи без схемы)."""
+    key = (pschema, ptable)
+    if key in table_keys:
         return key
-
-    resolved = []
-    for ref in names:
-        if isinstance(ref, core.EntityMeta):
-            resolved.append((ref.__name__, entity_key(ref)))
-            continue
-        if not isinstance(ref, str):
-            raise IntrospectionError(
-                "Entity reference must be a string or an entity class, got %r"
-                % (ref,)
-            )
-        if "." in ref:
-            app_name, entity_name = ref.split(".", 1)
-            app = db._apps.get(app_name)
-            if app is None:
-                raise IntrospectionError(
-                    "Unknown application %r in entity reference %r"
-                    % (app_name, ref)
-                )
-            entity = db.entities.get(entity_name)
-            if entity is not None and getattr(entity, "_app_", None) is app:
-                resolved.append((entity_name, entity_key(entity)))
-                continue
-            table_name = db.provider.normalize_name(entity_name)
-            if db.provider.dialect == "PostgreSQL":
-                table_name = (app.schema_name, table_name)
-            key = catalog_key(table_name)
-            if key is None:
-                raise IntrospectionError(
-                    "Unknown entity %r: table %r does not exist"
-                    % (ref, _qualified_name(table_name))
-                )
-            resolved.append((entity_name, key))
-            continue
-        entity = db.entities.get(ref)
-        if entity is not None:
-            resolved.append((ref, entity_key(entity)))
-            continue
-        matched = by_name.get(ref.lower())
-        if not matched:
-            available = sorted(
-                set(db.entities) | {_entity_name(table) for _, table in tables}
-            )
-            raise IntrospectionError(
-                "Unknown entity %r; expected one of: %s"
-                % (ref, ", ".join(available))
-            )
-        for key in matched:
-            item = (ref, key)
-            if item not in resolved:
-                resolved.append(item)
-    return resolved
+    # регистронезависимо: имена таблиц в SQLite/MySQL регистронезависимы
+    matches = [k for k in table_keys if k[1].lower() == ptable.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    for k in matches:
+        if k[0] is None or k[0] == pschema:
+            return k
+    return None
 
 
-def _create_pending_entities(db):
-    for name, key in db._pending_entities:
-        if name in db.entities:
-            continue
-        schema, table = key
-        attrs = {}
-        default = db.provider.normalize_name(name)
-        if schema and schema != "public":
-            attrs["_table_"] = (schema, table)
-        elif default != table:
-            attrs["_table_"] = table
-        type(name, (db.Entity,), attrs)
+def _wanted_tables(db, scope, tables, declared):
+    """Таблицы дампа по скоупу приложений. PostgreSQL — все таблицы схем
+    приложений; MySQL/SQLite — таблицы объявленных сущностей приложений
+    (схемной границы нет, pony-apps решение 8). None — весь каталог."""
+    if scope is None:
+        return set(tables)
+    if db.provider.dialect == "PostgreSQL":
+        schemas = {app.schema_name for app in scope}
+        return {key for key in tables if key[0] in schemas}
+    return {
+        key
+        for key, entity in declared.items()
+        if getattr(entity, "_app_", None) in scope
+    }
 
 
-def _dump_declarations(db, names=()):
+def _dump_declarations(db, scope=None):
+    """Текст деклараций моделей приложений скоупа (все их таблицы) —
+    для записи в файл опцией dump=."""
     tables = _list_tables(db)
-    resolved = _resolve_names(db, tables, names) if names else []
-    if db._is_empty:
-        db._pending_entities = list(resolved)
     infos = {}
     children = {}
     for schema, table in tables:
         key = (schema, table)
         table_name = key if schema else table
         infos[key] = table_info(db, table_name)
+    table_keys = set(tables)
+    link_pairs = {}  # связочная таблица -> ((родитель_a, col_a), (родитель_b, col_b))
     for key, info in infos.items():
+        link = _link_table_parents(info)
+        if link is None:
+            continue
+        (col_a, fk_a), (col_b, fk_b) = link
+        parent_a = _catalog_key_for(table_keys, fk_a.pschema, fk_a.ptable)
+        parent_b = _catalog_key_for(table_keys, fk_b.pschema, fk_b.ptable)
+        if parent_a is None or parent_b is None or parent_a == parent_b:
+            continue
+        link_pairs[key] = ((parent_a, col_a), (parent_b, col_b))
+    declared = _declared_entities(db, tables)
+    wanted = _wanted_tables(db, scope, tables, declared)
+    selected_set = set(wanted)
+    m2m = {}  # родитель -> [(другой родитель, связочная, своя FK-колонка)]
+    dropped_links = set()
+    for link_key, ((parent_a, col_a), (parent_b, col_b)) in link_pairs.items():
+        if parent_a not in wanted or parent_b not in wanted:
+            continue  # без обоих родителей в скоупе — не связочная
+        selected_set.discard(link_key)
+        dropped_links.add(link_key)
+        # column= — колонка, ссылающаяся на таблицу цели атрибута,
+        # поэтому родителю достаётся ЧУЖАЯ FK-колонка
+        m2m.setdefault(parent_a, []).append((parent_b, link_key, col_b))
+        m2m.setdefault(parent_b, []).append((parent_a, link_key, col_a))
+    for key, info in infos.items():
+        if key in dropped_links:
+            continue  # ставшие Set-парой связочные — не «дети» через FK
         for col, fk in info["fks"].items():
             if fk.ncols != 1:
                 continue
-            parent_key = (fk.pschema, fk.ptable)
-            children.setdefault(parent_key, []).append((key, col))
-    declared = _declared_entities(db, tables)
+            parent_key = _catalog_key_for(table_keys, fk.pschema, fk.ptable)
+            if parent_key is not None:
+                children.setdefault(parent_key, []).append((key, col))
     declared_sets = _declared_sets(children, declared)
-    if names:
-        selected = list(dict.fromkeys(key for _name, key in resolved))
-    else:
-        selected = tables
     lines = ["from pony.orm import *", "", ""]
-    for schema, table in selected:
+    for schema, table in tables:
         key = (schema, table)
+        if key not in selected_set:
+            continue
         lines.extend(
             _dump_entity(
-                db, key, infos[key], children.get(key, []), declared, declared_sets
+                db,
+                key,
+                infos[key],
+                children.get(key, []),
+                declared,
+                declared_sets,
+                m2m.get(key, []),
             )
         )
-    return _DumpResult("\n".join(lines))
+    return "\n".join(lines)
 
 
-def _dump_entity(db, key, info, child_list, declared=None, declared_sets=None):
+def _dump_entity(
+    db, key, info, child_list, declared=None, declared_sets=None, m2m_list=None
+):
     schema, table = key
     declared = declared or {}
     declared_sets = declared_sets or {}
+    m2m_list = m2m_list or []
     entity = declared.get(key)
     lines = []
     cls = entity.__name__ if entity is not None else _entity_name(table)
@@ -1006,5 +1166,58 @@ def _dump_entity(db, key, info, child_list, declared=None, declared_sets=None):
             "    %s = Set(%r, reverse=%r)"
             % (set_name, _entity_name(child_table), fk_name)
         )
+    for other_key, link_key, own_col in sorted(
+        m2m_list, key=lambda item: (str(item[0][0]), item[0][1])
+    ):
+        other_entity = declared.get(other_key)
+        other_cls = (
+            other_entity.__name__
+            if other_entity is not None
+            else _entity_name(other_key[1])
+        )
+        reverse_name = cls.lower() + "_set"
+        existing = None
+        if entity is not None:
+            for a in entity._new_attrs_:
+                if a.is_collection and (
+                    a.py_type is other_entity
+                    or getattr(a.py_type, "__name__", a.py_type) == other_cls
+                ):
+                    existing = a
+                    break
+        if existing is not None:
+            # пара уже есть на сущности (объявлена или добавлена fill'ом) —
+            # дампим её как есть, со своими именем/table=/column=
+            args = [repr(other_cls)]
+            if existing.table:
+                args.append("table=%r" % (existing.table,))
+            existing_col = (
+                existing.columns[0] if existing.columns else existing.column
+            )
+            if existing_col:
+                args.append("column=%r" % existing_col)
+            existing_reverse = existing.reverse
+            args.append(
+                "reverse=%r"
+                % (
+                    existing_reverse
+                    if isinstance(existing_reverse, str)
+                    else reverse_name
+                )
+            )
+            lines.append("    %s = Set(%s)" % (existing.name, ", ".join(args)))
+            continue
+        set_name = other_cls.lower() + "_set"
+        first = sorted(
+            [key, other_key], key=lambda k: (str(k[0]), k[1])
+        )[0] == key
+        args = [repr(other_cls)]
+        if first:
+            args.append(
+                "table=%r" % (_m2m_table_arg(db, link_key[0], link_key[1]),)
+            )
+        args.append("column=%r" % own_col)
+        args.append("reverse=%r" % reverse_name)
+        lines.append("    %s = Set(%s)" % (set_name, ", ".join(args)))
     lines.append("")
     return lines
