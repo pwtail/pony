@@ -1,4 +1,17 @@
-# PonyORM unreleased
+# poney release 0.8.0 (2026-09-25)
+
+First release of the `poney` distribution — a fork of Pony ORM published on PyPI
+under the name `poney`. The distribution name changes, the import name stays
+`pony`.
+
+## Features
+
+* Native asyncio support: `async with db_session`, `await select(...)`, `async for` and explicit loading of related objects (PostgreSQL via psycopg3, MariaDB via the async connector)
+* MariaDB support (sync and async) via the `mariadb` 2.0 connector
+* Database applications: named `Database` instances, `Database.instance()` and sessions scoped to a database (`with db:`)
+* Migrations and schema introspection: the `pony migrations` command (`make` / `apply` / `plan` / `merge`), the `pony_migrations` table and the migration dependency graph
+* Declarative entity extensions: `@constraint.check` CHECK constraints, explicit names for indexes and constraints, PostgreSQL index shapes, identity primary keys and column comments
+* Automatic reverse `Set` for one-to-many declarations
 
 ## Breaking changes
 

@@ -1,9 +1,16 @@
 # Downloads
-[![Downloads](https://pepy.tech/badge/pony)](https://pepy.tech/project/pony) [![Downloads](https://pepy.tech/badge/pony/month)](https://pepy.tech/project/pony/month) [![Downloads](https://pepy.tech/badge/pony/week)](https://pepy.tech/project/pony/week)
+[![Downloads](https://pepy.tech/badge/poney)](https://pepy.tech/project/poney) [![Downloads](https://pepy.tech/badge/poney/month)](https://pepy.tech/project/poney/month) [![Downloads](https://pepy.tech/badge/poney/week)](https://pepy.tech/project/poney/week)
 
 
 Pony Object-Relational Mapper
 =============================
+
+This is the `poney` distribution — a fork of Pony ORM. It is installed as
+`pip install poney`, while the import name stays `pony`:
+
+```console
+python -m pip install poney
+```
 
 Pony is an advanced object-relational mapper. The most interesting feature of Pony is its ability to write queries to the database using Python generator expressions and lambdas. Pony analyzes the abstract syntax tree of the expression and translates it into a SQL query.
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from setuptools import setup
 
 
-name = "pony"
+name = "poney"
 version_file = Path(__file__).parent / "pony" / "__init__.py"
 version_match = re.search(
     r'^__version__ = ["\']([^"\']+)["\']',
@@ -43,7 +43,7 @@ Installation
 =================
 ::
 
-    pip install pony
+    pip install poney
 
 Entity-Relationship Diagram Editor
 =============================================
@@ -89,7 +89,7 @@ author_email = "team@ponyorm.com"
 url = "https://ponyorm.com"
 project_urls = {
     "Documentation": "https://docs.ponyorm.org",
-    "Source": "https://github.com/ponyorm/pony",
+    "Source": "https://github.com/pwtail/pony",
 }
 packages = [
     "pony",
@@ -109,7 +109,7 @@ package_data = {
     "pony.orm.tests": ["queries.txt"],
 }
 
-download_url = "http://pypi.python.org/pypi/pony/"
+download_url = "http://pypi.python.org/pypi/poney/"
 
 if __name__ == "__main__":
     pv = sys.version_info[:2]

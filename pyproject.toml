@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pony"
+name = "poney"
 dynamic = ["version"]
 description = "Pony Object-Relational Mapper"
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -37,7 +37,10 @@ classifiers = [
 [project.urls]
 Homepage = "https://ponyorm.com"
 Documentation = "https://docs.ponyorm.org"
-Source = "https://github.com/ponyorm/pony"
+Source = "https://github.com/pwtail/pony"
+
+[project.scripts]
+pony = "pony.migrations:main"
 
 [project.optional-dependencies]
 postgres = ["psycopg>=3.3", "psycopg-pool>=3.3"]
