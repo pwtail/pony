@@ -134,8 +134,8 @@ class TestAppMigrations(unittest.TestCase):
 
     def test_add_per_app_initial_sql(self):
         db, accounts, orders, Customer, Order, Item = self._make_db()
-        p1 = accounts.migrations.add(self.dir)
-        p2 = orders.migrations.add(self.dir)
+        p1 = accounts.migrations.make(self.dir)
+        p2 = orders.migrations.make(self.dir)
         self.assertTrue(p1.endswith(os.path.join("accounts", "0001_initial.sql")))
         self.assertTrue(p2.endswith(os.path.join("orders", "0001_initial.sql")))
         with open(p1) as f:
@@ -150,8 +150,8 @@ class TestAppMigrations(unittest.TestCase):
 
     def test_apply_aggregate_in_order(self):
         db, accounts, orders, Customer, Order, Item = self._make_db()
-        accounts.migrations.add(self.dir)
-        orders.migrations.add(self.dir)
+        accounts.migrations.make(self.dir)
+        orders.migrations.make(self.dir)
         self.assertEqual(
             db.migrations.apply(self.dir),
             ["accounts/0001_initial.sql", "orders/0001_initial.sql"],
@@ -172,8 +172,8 @@ class TestAppMigrations(unittest.TestCase):
 
     def test_per_app_apply(self):
         db, accounts, orders, Customer, Order, Item = self._make_db()
-        accounts.migrations.add(self.dir)
-        orders.migrations.add(self.dir)
+        accounts.migrations.make(self.dir)
+        orders.migrations.make(self.dir)
         self.assertEqual(accounts.migrations.apply(self.dir), ["0001_initial.sql"])
         self.assertEqual(orders.migrations.apply(self.dir), ["0001_initial.sql"])
         self.assertEqual(
@@ -183,16 +183,16 @@ class TestAppMigrations(unittest.TestCase):
 
     def test_per_app_apply_requires_cross_app_dep(self):
         db, accounts, orders, Customer, Order, Item = self._make_db()
-        accounts.migrations.add(self.dir)
-        orders.migrations.add(self.dir)
+        accounts.migrations.make(self.dir)
+        orders.migrations.make(self.dir)
         with self.assertRaises(migrations.MigrationError) as ctx:
             orders.migrations.apply(self.dir)
         self.assertIn("accounts/0001_initial.sql", str(ctx.exception))
 
     def test_plan_aggregate_and_per_app(self):
         db, accounts, orders, Customer, Order, Item = self._make_db()
-        accounts.migrations.add(self.dir)
-        orders.migrations.add(self.dir)
+        accounts.migrations.make(self.dir)
+        orders.migrations.make(self.dir)
         infos = db.migrations.plan(self.dir)
         self.assertEqual(
             [(i.app, i.name) for i in infos],
@@ -268,8 +268,8 @@ class TestAppMigrationsSQLite(unittest.TestCase):
 
     def test_add_per_app_initial_sql(self):
         db, accounts, orders, Customer, Order = self._make_db()
-        p1 = accounts.migrations.add(self.dir)
-        p2 = orders.migrations.add(self.dir)
+        p1 = accounts.migrations.make(self.dir)
+        p2 = orders.migrations.make(self.dir)
         self.assertTrue(p1.endswith(os.path.join("accounts", "0001_initial.sql")))
         self.assertTrue(p2.endswith(os.path.join("orders", "0001_initial.sql")))
         with open(p1) as f:
@@ -284,8 +284,8 @@ class TestAppMigrationsSQLite(unittest.TestCase):
 
     def test_apply_aggregate_in_order(self):
         db, accounts, orders, Customer, Order = self._make_db()
-        accounts.migrations.add(self.dir)
-        orders.migrations.add(self.dir)
+        accounts.migrations.make(self.dir)
+        orders.migrations.make(self.dir)
         self.assertEqual(
             db.migrations.apply(self.dir),
             ["accounts/0001_initial.sql", "orders/0001_initial.sql"],
@@ -301,8 +301,8 @@ class TestAppMigrationsSQLite(unittest.TestCase):
 
     def test_per_app_apply_requires_cross_app_dep(self):
         db, accounts, orders, Customer, Order = self._make_db()
-        accounts.migrations.add(self.dir)
-        orders.migrations.add(self.dir)
+        accounts.migrations.make(self.dir)
+        orders.migrations.make(self.dir)
         with self.assertRaises(migrations.MigrationError) as ctx:
             orders.migrations.apply(self.dir)
         self.assertIn("accounts/0001_initial.sql", str(ctx.exception))

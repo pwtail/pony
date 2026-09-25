@@ -68,14 +68,14 @@ class TestMigrations(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        path = migrations.add_migration(db, self.dir, app="main")
+        path = migrations.make_migration(db, self.dir, app="main")
         self.assertEqual(os.path.basename(path), "0001_initial.sql")
         with open(path) as f:
             content = f.read()
         self.assertIn('CREATE TABLE "public"."person"', content)
         self.assertEqual(content.rstrip(), db.schema.generate_create_script())
         with self.assertRaises(migrations.MigrationError):
-            migrations.add_migration(db, self.dir, app="main")
+            migrations.make_migration(db, self.dir, app="main")
 
     def test_migrate_sql_and_py_in_order(self):
         db = self.db
@@ -104,7 +104,7 @@ class TestMigrations(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        migrations.add_migration(db, self.dir, app="main")  # 0001_initial.sql
+        migrations.make_migration(db, self.dir, app="main")  # 0001_initial.sql
         self._write(
             "0002_seed.py",
             "# depends: 0001_initial.sql\n"
@@ -127,7 +127,7 @@ class TestMigrations(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        migrations.add_migration(db, self.dir, app="main")  # 0001_initial.sql
+        migrations.make_migration(db, self.dir, app="main")  # 0001_initial.sql
         self._write(
             "0002_seed.py",
             "# depends: 0001_initial.sql\n"
@@ -162,7 +162,7 @@ class TestMigrations(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        migrations.add_migration(db, self.dir, app="main")  # 0001_initial.sql
+        migrations.make_migration(db, self.dir, app="main")  # 0001_initial.sql
         self._write(
             "0002_seed.py",
             "# depends: 0001_initial.sql\n"
@@ -185,7 +185,7 @@ class TestMigrations(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        migrations.add_migration(db, self.dir, app="main")  # 0001_initial.sql
+        migrations.make_migration(db, self.dir, app="main")  # 0001_initial.sql
         self._write(
             "0002_seed.py",
             "# depends: 0001_initial.sql\n"
@@ -257,7 +257,7 @@ class TestMigrations(unittest.TestCase):
 
     def test_add_named_data_migration(self):
         db = self.db
-        path = migrations.add_named_migration(db, self.dir, "some_name.py", app="main")
+        path = migrations.make_named_migration(db, self.dir, "some_name.py", app="main")
         self.assertEqual(os.path.basename(path), "0001_some_name.py")
         with open(path) as f:
             content = f.read()
@@ -266,7 +266,7 @@ class TestMigrations(unittest.TestCase):
         self.assertIn("if __name__ == '__main__':", content)
         self.assertIn("with db_session:", content)
         self.assertNotIn("depends", content)
-        path2 = migrations.add_named_migration(db, self.dir, "second.py", app="main")
+        path2 = migrations.make_named_migration(db, self.dir, "second.py", app="main")
         self.assertEqual(os.path.basename(path2), "0002_second.py")
         with open(path2) as f:
             self.assertIn("# depends: 0001_some_name.py", f.read())
@@ -277,7 +277,7 @@ class TestMigrations(unittest.TestCase):
 
     def test_add_named_sql_migration(self):
         db = self.db
-        path = migrations.add_named_migration(db, self.dir, "add_orders.sql", app="main")
+        path = migrations.make_named_migration(db, self.dir, "add_orders.sql", app="main")
         self.assertEqual(os.path.basename(path), "0001_add_orders.sql")
         with open(path) as f:
             self.assertNotIn("depends", f.read())
@@ -390,7 +390,7 @@ class TestMigrations(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        paths = db.migrations.add(self.dir)
+        paths = db.migrations.make(self.dir)
         self.assertEqual(
             [os.path.basename(path) for path in paths], ["0001_initial.sql"]
         )
@@ -503,13 +503,13 @@ class TestMigrationsSQLite(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        path = migrations.add_migration(db, self.dir, app="main")
+        path = migrations.make_migration(db, self.dir, app="main")
         self.assertEqual(os.path.basename(path), "0001_initial.sql")
         with open(path) as f:
             content = f.read()
         self.assertIn('CREATE TABLE "Person"', content)
         with self.assertRaises(migrations.MigrationError):
-            migrations.add_migration(db, self.dir, app="main")
+            migrations.make_migration(db, self.dir, app="main")
 
     def test_migrate_sql_and_py_in_order(self):
         db = self.db
@@ -537,7 +537,7 @@ class TestMigrationsSQLite(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        migrations.add_migration(db, self.dir, app="main")  # 0001_initial.sql
+        migrations.make_migration(db, self.dir, app="main")  # 0001_initial.sql
         self._write(
             "0002_seed.py",
             "# depends: 0001_initial.sql\n"
@@ -559,7 +559,7 @@ class TestMigrationsSQLite(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        migrations.add_migration(db, self.dir, app="main")  # 0001_initial.sql
+        migrations.make_migration(db, self.dir, app="main")  # 0001_initial.sql
         self._write(
             "0002_seed.py",
             "# depends: 0001_initial.sql\n"
@@ -632,7 +632,7 @@ class TestMigrationsSQLite(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        paths = db.migrations.add(self.dir)
+        paths = db.migrations.make(self.dir)
         self.assertEqual(
             [os.path.basename(path) for path in paths], ["0001_initial.sql"]
         )
@@ -830,8 +830,8 @@ class TestNoApplications(unittest.TestCase):
         db = Database("sqlite", ":memory:")
         try:
             for call in (
-                lambda: migrations.add_migration(db, "/tmp/unused-migs"),
-                lambda: migrations.add_named_migration(
+                lambda: migrations.make_migration(db, "/tmp/unused-migs"),
+                lambda: migrations.make_named_migration(
                     db, "/tmp/unused-migs", "x.py"
                 ),
                 lambda: migrations.apply_migrations(db, "/tmp/unused-migs"),
@@ -928,7 +928,7 @@ class TestMigrationsMariaDB(unittest.TestCase):
         class Person(self.app.Entity):
             name = Required(str)
 
-        path = migrations.add_migration(db, self.dir, app="main")
+        path = migrations.make_migration(db, self.dir, app="main")
         self.assertEqual(os.path.basename(path), "0001_initial.sql")
         with open(path) as f:
             self.assertIn("CREATE TABLE `person`", f.read())

@@ -125,7 +125,7 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
 
    Реализовано: `pony/orm/migrations.py`, точка входа `pony/migrations.py`
    (`python -m pony.migrations` и команда `pony migrations`), Python API
-   `db.migrations.add()` / `apply()`. `make` без имени — `0001_initial.sql`
+   `db.migrations.make()` / `apply()`. `make` без имени — `0001_initial.sql`
    из моделей, `make <имя>.py|.sql` — следующая по номеру миграция с шапкой
    `depends:`. `--fake` — пометить применённой. Трекинг — таблица
    `pony_migrations` (app, name, sha256, applied_at); каждая миграция — в

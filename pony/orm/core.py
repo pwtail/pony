@@ -1567,7 +1567,7 @@ class Database:
 
     @property
     def migrations(self):
-        """Объект db.migrations: db.migrations.add() / db.migrations.apply()."""
+        """Объект db.migrations: db.migrations.make() / db.migrations.apply()."""
         facade = getattr(self, "_migrations_facade", None)
         if facade is None:
             from pony.orm import migrations

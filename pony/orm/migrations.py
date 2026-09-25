@@ -1,11 +1,11 @@
 """Миграции pony ORM, этапы 1 и 3, с поддержкой приложений (application).
 
-- `db.migrations.add()` — `0001_initial.sql` из деклараций моделей
+- `db.migrations.make()` — `0001_initial.sql` из деклараций моделей
   (вместо `generate_mapping(create_tables=True)`);
 - `db.migrations.apply()` — применить неприменённые миграции (все applications);
 - `db.migrations.plan()` — вычисленный порядок применения;
 - `db.migrations.merge()` — миграция слияния для двух разошедшихся веток;
-- `myapplication.migrations.add()/apply()/plan()/merge()` — то же для одного
+- `myapplication.migrations.make()/apply()/plan()/merge()` — то же для одного
   application.
 
 Миграции лежат в `migrations/<application>/`; корня нет — без application
@@ -144,12 +144,12 @@ class MigrationsFacade:
         self.db = db
         self.app = app
 
-    def add(self, directory="migrations", name=None):
+    def make(self, directory="migrations", name=None):
         """Без имени — 0001_initial.sql из деклараций моделей;
-        `add('some.py')` — следующая по номеру дата-миграция."""
+        `make('some.py')` — следующая по номеру дата-миграция."""
         if name:
-            return add_named_migration(self.db, directory, name, app=self.app)
-        return add_migration(self.db, directory, app=self.app)
+            return make_named_migration(self.db, directory, name, app=self.app)
+        return make_migration(self.db, directory, app=self.app)
 
     def apply(self, directory="migrations", fake=False):
         """Применяет неприменённые миграции в порядке графа."""
@@ -435,7 +435,7 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def add_migration(db, directory, name="0001_initial.sql", app=None):
+def make_migration(db, directory, name="0001_initial.sql", app=None):
     """Вместо generate_mapping(create_tables=True): пишет 0001_initial.sql
     из деклараций моделей. Для application — только его таблицы + авто-зависимости
     от applications, на которые идут FK. Без application — по всем applications,
@@ -443,7 +443,7 @@ def add_migration(db, directory, name="0001_initial.sql", app=None):
     if app is None:
         _require_apps(db)
         return [
-            add_migration(db, directory, name, application)
+            make_migration(db, directory, name, application)
             for application in _registered_apps(db)
         ]
     _check_supported(db)
@@ -465,16 +465,16 @@ def add_migration(db, directory, name="0001_initial.sql", app=None):
     return path
 
 
-def add_named_migration(db, directory, file_name, app=None):
+def make_named_migration(db, directory, file_name, app=None):
     """Создаёт следующую по номеру миграцию с указанным именем:
-    `add some_name.py` → `000N_some_name.py` (дата-миграция-скрипт),
-    `add some_name.sql` → `000N_some_name.sql` (заготовка SQL-миграции).
+    `make some_name.py` → `000N_some_name.py` (дата-миграция-скрипт),
+    `make some_name.sql` → `000N_some_name.sql` (заготовка SQL-миграции).
     В шапку подставляется текущая голова графа application (`-- depends:` /
     `# depends:`). Без application — по всем applications, список путей."""
     if app is None:
         _require_apps(db)
         return [
-            add_named_migration(db, directory, file_name, application)
+            make_named_migration(db, directory, file_name, application)
             for application in _registered_apps(db)
         ]
     base, ext = os.path.splitext(file_name)
@@ -1081,11 +1081,11 @@ def main(argv=None):
             )
         if args.command == "make":
             if args.name:
-                paths = add_named_migration(
+                paths = make_named_migration(
                     db, directory, args.name, app=application
                 )
             else:
-                paths = add_migration(db, directory, app=application)
+                paths = make_migration(db, directory, app=application)
             if not isinstance(paths, list):
                 paths = [paths]
             if not paths:

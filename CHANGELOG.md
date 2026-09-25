@@ -1,3 +1,10 @@
+# poney unreleased
+
+## Breaking changes
+
+* Migrations Python API now uses the same verbs as the CLI: `db.migrations.make()` (was `add()`), `make_migration()` (was `add_migration()`) and `make_named_migration()` (was `add_named_migration()`)
+
+
 # poney release 0.8.0 (2026-09-25)
 
 First release of the `poney` distribution — a fork of Pony ORM published on PyPI
