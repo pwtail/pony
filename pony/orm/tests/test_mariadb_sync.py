@@ -1,7 +1,10 @@
 import os
 import unittest
 
-import mariadb as mariadb_module
+try:
+    import mariadb as mariadb_module
+except ImportError:
+    mariadb_module = None
 
 from pony.orm import (
     Database,
@@ -24,6 +27,8 @@ MDB = dict(
 
 
 def _mariadb_available():
+    if mariadb_module is None:
+        return False
     try:
         conn = mariadb_module.connect(**MDB)
     except Exception:

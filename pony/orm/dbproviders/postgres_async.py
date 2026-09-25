@@ -11,6 +11,7 @@ per running event loop (a pool is bound to the loop it was opened on).
 
 import asyncio
 import threading
+import weakref
 from functools import wraps
 
 import psycopg
@@ -28,7 +29,7 @@ from pony.orm.core import (
     ProgrammingError,
     log_orm,
 )
-from pony.orm.dbproviders.postgres import PGProvider
+from pony.orm.dbproviders.postgres import PGProvider, register_pony_list_dumpers
 from pony.orm.ops import AsyncOps
 
 
@@ -56,29 +57,61 @@ def async_wrap_dbapi_exceptions(func):
 
 
 class _AsyncPools:
-    """One AsyncConnectionPool per running event loop (pools are loop-bound)."""
+    """One AsyncConnectionPool per running event loop (pools are loop-bound).
+
+    Ключи слабые: закрытый loop не удерживает пул — среды с loop-per-test
+    (pytest-asyncio, asyncio.run) не утекают соединениями, как это было с
+    обычным dict. Пул открывается один раз (`open()` под локом на каждый
+    checkout — лишняя точка сериализации).
+    """
 
     def __init__(self, provider):
         self.provider = provider
-        self._pools = {}
+        self._pools = weakref.WeakKeyDictionary()
+        self._opened = weakref.WeakSet()
         self._lock = threading.Lock()
 
     def get_pool(self):
         loop = asyncio.get_running_loop()
         with self._lock:
-            pool = self._pools.get(loop)
-            if pool is None:
-                args, pool_kwargs = self.provider._async_pool_args
-                pool = psycopg_pool.AsyncConnectionPool(
-                    *args,
-                    kwargs=pool_kwargs,
-                    min_size=1,
-                    max_size=10,
-                    open=False,  # открывается лениво при первом async-использовании
-                    configure=self.provider._async_configure,
-                )
-                self._pools[loop] = pool
+            try:
+                return self._pools[loop]
+            except KeyError:
+                pass
+            provider = self.provider
+            args, pool_kwargs = provider._async_pool_args
+            pool = psycopg_pool.AsyncConnectionPool(
+                *args,
+                kwargs=pool_kwargs,
+                min_size=provider._async_pool_min_size,
+                max_size=provider._async_pool_max_size,
+                open=False,  # открывается лениво при первом async-использовании
+                configure=provider._async_configure,
+            )
+            self._pools[loop] = pool
+            return pool
+
+    async def get_open_pool(self):
+        pool = self.get_pool()
+        if pool not in self._opened:
+            await pool.open(wait=False)
+            self._opened.add(pool)
         return pool
+
+    def close_all(self):
+        """Best-effort закрытие пулов из sync Database.disconnect().
+
+        Пул можно закрыть только на его loop'е; мёртвые loop'ы отдаём GC
+        (слабые ключи), живым шлём close через run_coroutine_threadsafe.
+        """
+        for loop, pool in list(self._pools.items()):
+            try:
+                if loop.is_running() and not loop.is_closed():
+                    future = asyncio.run_coroutine_threadsafe(pool.close(), loop)
+                    future.result(timeout=5)
+            except Exception:
+                pass
+        self._pools.clear()
 
 
 class AsyncPostgreSQLProvider(PGProvider):
@@ -90,6 +123,10 @@ class AsyncPostgreSQLProvider(PGProvider):
     """
 
     def __init__(self, database, *args, **kwargs):
+        # pony_async_pool_* — до super().__init__: в sync-пул они не нужны,
+        # а в kwargs соединения psycopg попасть не должны
+        self._async_pool_min_size = int(kwargs.pop("pony_async_pool_min_size", 1))
+        self._async_pool_max_size = int(kwargs.pop("pony_async_pool_max_size", 10))
         super().__init__(database, *args, **kwargs)
         self.async_ops = AsyncOps(self)  # self.sync_ops (SyncOps) наследуется от DBAPIProvider
         pool_kwargs = dict(kwargs)
@@ -101,11 +138,13 @@ class AsyncPostgreSQLProvider(PGProvider):
         pool_kwargs.setdefault("client_encoding", "UTF8")
         if conninfo is not None:
             args = args + (conninfo,)
-        configure_cb = getattr(database, "call_on_connect", None)
 
         async def configure(conn):
-            if configure_cb is not None:
-                configure_cb(conn)
+            # Вызывается psycopg_pool на каждом НОВОМ соединении. on_connect-
+            # хуки сюда сознательно не подключаем: они sync API (и там ещё
+            # sync `con.commit()`), им async-соединение не отдать; хуки
+            # срабатывают на sync-соединениях (bind-time, sync-пул).
+            register_pony_list_dumpers(conn)
 
         self._async_configure = configure
         self._async_pool_args = (args, pool_kwargs)
@@ -117,8 +156,12 @@ class AsyncPostgreSQLProvider(PGProvider):
 
     @async_wrap_dbapi_exceptions
     async def async_connect(self):
-        await self.async_pool.open(wait=False)
-        return await self.async_pool.getconn()
+        pool = await self._async_pools.get_open_pool()
+        return await pool.getconn()
+
+    def disconnect(self):
+        super().disconnect()
+        self._async_pools.close_all()
 
     @async_wrap_dbapi_exceptions
     async def async_set_transaction_mode(self, connection, cache):

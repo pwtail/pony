@@ -24,6 +24,18 @@ from pony.thirdparty.decorator import decorator as _decorator
 
 from contextvars import ContextVar as _ContextVar
 
+try:
+    # приватный, но стабильный с 3.7: возвращает None вместо RuntimeError —
+    # исключение на каждом чтении в sync-режиме стоило бы ~250 ns
+    from asyncio.events import _get_running_loop as _running_loop_or_none
+except ImportError:  # pragma: no cover
+
+    def _running_loop_or_none():
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
 if pony.MODE.startswith("GAE-"):
     localbase = object
 else:
@@ -51,11 +63,9 @@ class ContextLocal:
 
     @staticmethod
     def _execution_unit():
-        try:
-            task = asyncio.current_task()
-        except RuntimeError:
-            task = None
-        return (threading.get_ident(), task)
+        if _running_loop_or_none() is None:
+            return (threading.get_ident(), None)
+        return (threading.get_ident(), asyncio.current_task())
 
     def __getattr__(self, name):
         if name in ("_vars", "_args"):
@@ -72,6 +82,15 @@ class ContextLocal:
             self._init_context(*self._args[0], **self._args[1])
             key, value = var.get()
         else:
+            # fast path: значение записано в этом же потоке вне asyncio-задач
+            # и running loop сейчас тоже нет — юнит заведомо тот же, полную
+            # проверку с аллокацией кортежа не строим
+            if (
+                key[1] is None
+                and _running_loop_or_none() is None
+                and key[0] == threading.get_ident()
+            ):
+                return value
             if key != self._execution_unit():
                 self._init_context(*self._args[0], **self._args[1])
                 key, value = var.get()
@@ -92,7 +111,10 @@ class ContextLocal:
                 % (type(self).__module__, type(self).__name__, name, id(self))
             )
             self._vars[name] = var
-        var.set((self._execution_unit(), value))
+        if _running_loop_or_none() is None:
+            var.set(((threading.get_ident(), None), value))
+        else:
+            var.set((self._execution_unit(), value))
 
 
 class PonyDeprecationWarning(DeprecationWarning):

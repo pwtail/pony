@@ -16,8 +16,8 @@ Gen-код написан один раз в async стиле; единстве�
 расходятся физически — ProviderOps (provider.sync_ops / provider.async_ops).
 
 Names owned by core (core.num_counter, core.local, exceptions, ...) are
-resolved lazily: core.py imports this module, so module-level attribute
-access at import time save_updated_gen would be circular.
+resolved lazily at call time: core.py imports this module, so touching those
+attributes at import time would be circular.
 """
 
 import sys
@@ -42,6 +42,9 @@ class AbstractSessionCache:
         self.is_alive = True
         self.num = next(core.num_counter)
         self.database = database
+        # выбор режима инвариантен за жизнь кэша — ops вычисляем один раз
+        provider = database.provider
+        self.ops = provider.async_ops if self.is_async else provider.sync_ops
         self.objects = set()
         self.indexes = defaultdict(dict)
         self.seeds = defaultdict(set)
@@ -171,10 +174,7 @@ class SessionCacheGen:
         self.cache = cache
 
     def _ops(self):
-        provider = self.cache.database.provider
-        if self.cache.is_async:
-            return provider.async_ops
-        return provider.sync_ops
+        return self.cache.ops
 
     async def connect(self):
         assert self.cache.connection is None
@@ -472,7 +472,10 @@ def _get_async_caches():
 
 
 async def async_flush():
-    for cache in _get_async_caches():
+    caches = core._async_caches()
+    if caches is None:
+        return
+    for cache in caches:
         await cache.flush()
 
 
@@ -516,7 +519,7 @@ async def async_commit():
 async def async_rollback():
     exceptions = []
     try:
-        for cache in _get_async_caches():
+        for cache in core._async_caches() or []:
             try:
                 await cache.rollback()
             except BaseException:

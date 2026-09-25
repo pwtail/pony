@@ -19,6 +19,16 @@ db = Database("mariadb", user="...", password="...", host="...", database="...")
 adb = Database("mariadb_async", user="...", password="...", host="...", database="...")  # sync + async
 ```
 
+Async-пул создаётся лениво, по одному на запущенный event loop. Размеры
+настраиваются bind-параметрами (по умолчанию 1/10):
+
+```python
+db = Database("postgres_async", dsn="...", pony_async_pool_min_size=2, pony_async_pool_max_size=20)
+```
+
+`on_connect`-хуки (`db.on_connect()`) — sync API: они срабатывают на
+sync-соединениях (bind-time и sync-пул), но не на соединениях async-пула.
+
 ## Сессии и запросы
 
 ```python
@@ -39,8 +49,12 @@ async with db_session:
 
 - Смешивать режимы нельзя: **синхронный** `with db_session:` внутри асинхронной сессии
   (`async with db_session:` или `@db_session`-корутины) — ошибка (`TransactionError`
-  с подсказкой). Вне async-сессии синхронный код работает и внутри корутины: это
-  осознанный блокирующий вызов, поэтому sync-ячейки Jupyter тоже продолжают работать.
+  с подсказкой); симметрично, `async with db_session:` внутри уже открытой синхронной
+  сессии — тоже `TransactionError`. Вне async-сессии синхронный код работает и внутри
+  корутины: это осознанный блокирующий вызов, поэтому sync-ячейки Jupyter тоже продолжают
+  работать. Учтите: sync-провайдер, использованный из asyncio-задачи, получает
+  соединение **на задачу** (пул привязан к задаче, как и сессия) — для sqlite `:memory:`
+  это означает отдельную пустую БД в каждой задаче.
 - Одна async-сессия = одна задача; две задачи одновременно — две независимые
   сессии (соединения из общего пула, identity map изолирован).
 
@@ -98,6 +112,17 @@ async with db_session:
     # удаление
     deleted = await delete(x for x in Person if x.age < 18)          # по объектам
     deleted = await select(x for x in Person if x.age < 18).delete(bulk=True)   # одним SQL
+
+    # сырые запросы и вставка
+    rows = await db.select("select * from person where age > $min_age", globals(), locals())
+    new_id = await db.insert("person", name="Ann", age=30)
+    new_id = await db.insert("person", name="Bob", returning="id")
+    await db.execute("update person set age = age + 1")
+    conn = await db.get_connection()   # сырое async-соединение (psycopg/mariadb)
+
+    # async-итерация по срезу
+    async for p in select(x for x in Person).order_by(Person.name)[:10]:
+        ...
 
     # m2m-мутации
     person.tags.add(tag)
@@ -191,7 +216,9 @@ async def flaky():
 - Async-генераторы (`async def` с `yield`) декоратор `@db_session` не поддерживает —
   оборачивайте итерацию в `async with db_session:`. Обычные корутины и синхронные
   генераторы — поддерживаются.
-- Смешение sync- и async-сессий в одной транзакции не поддерживается.
+- Смешение sync- и async-сессий в одной транзакции не поддерживается (любая
+  вложенность одного режима в другой — `TransactionError` на входе).
+- `on_connect`-хуки не вызываются на соединениях async-пула (см. «Подключение»).
 - Синхронная операция, вызванная в async-сессии, поднимает `TransactionError`
   с подсказкой (раньше в части путей она давала невнятную ошибку или `None`).
 

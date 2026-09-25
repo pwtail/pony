@@ -4,7 +4,6 @@ from itertools import starmap
 from operator import attrgetter
 
 from pony.orm import core
-from pony.orm.ops import ops_for
 from pony.orm.session_cache import AbstractSessionCache
 from pony.utils import throw
 
@@ -29,8 +28,7 @@ async def exec_sql_gen(
     cursor = connection.cursor()
     if core.local.debug:
         core.log_sql(sql, arguments)
-    provider = database.provider
-    ops = provider.async_ops if cache.is_async else provider.sync_ops
+    ops = cache.ops
     t = time.time()
     try:
         new_id = await ops.execute(cursor, sql, arguments, returning_id)
@@ -309,7 +307,7 @@ async def fetch_objects_gen(
 ):
     if max_fetch_count is None:
         max_fetch_count = core.options.MAX_FETCH_COUNT
-    ops = ops_for(cls._database_.provider, cls._database_._get_cache().is_async)
+    ops = cls._database_._get_cache().ops
     if max_fetch_count is not None:
         rows = await ops.fetchmany(cursor, max_fetch_count + 1)
         if len(rows) == max_fetch_count + 1:
@@ -360,8 +358,8 @@ async def load_many_gen(cls, objects):
         cursor = await exec_sql_gen(database, sql, arguments)
         result = await fetch_objects_gen(cls, cursor, attr_offsets)
         if len(result) < len(batch):
-            for obj in result:
-                if obj not in batch:
+            for obj in batch:
+                if obj not in result:
                     throw(
                         core.UnrepeatableReadError,
                         "Phantom object %s disappeared" % core.safe_repr(obj),
@@ -398,7 +396,7 @@ async def query_fetch_gen(query, limit=None, offset=None):
                 core.TransactionError,
                 "query fetch requires a pony session cache",
             )
-        ops = ops_for(database.provider, cache.is_async)
+        ops = cache.ops
         if query._for_update:
             cache.immediate = True
         await cache._gen.prepare_connection_for_query_execution()
@@ -455,7 +453,7 @@ async def prefetch_load_all_gen(attr, objects):
     rentity = reverse.entity
     objects = sorted(objects, key=entity._get_raw_pkval_)
     max_batch_size = database.provider.max_params_count // len(entity._pk_columns_)
-    ops = ops_for(database.provider, cache.is_async)
+    ops = cache.ops
     result = set()
     if not reverse.is_collection:
         for i in range(0, len(objects), max_batch_size):
@@ -658,7 +656,7 @@ async def load_attr_gen(obj, attr):
             sql, adapter, offsets = attr.lazy_sql_cache
         arguments = adapter(obj._get_raw_pkval_())
         cursor = await exec_sql_gen(database, sql, arguments)
-        ops = ops_for(database.provider, cache.is_async)
+        ops = cache.ops
         row = await ops.fetchone(cursor)
         dbval = attr.parse_value(row, offsets, cache.dbvals_deduplication_cache)
         attr.db_set(obj, dbval)
@@ -687,7 +685,14 @@ async def load_collection_gen(obj, attr, items=None):
     reverse = attr.reverse
     rentity = reverse.entity
     database = obj._database_
-    ops = ops_for(database.provider, cache.is_async)
+    if cache is not database._get_cache():
+        # проверка была в sync Set.load: коллекцию грузит только её транзакция
+        throw(
+            core.TransactionError,
+            "Transaction of object %s belongs to different thread or task"
+            % core.safe_repr(obj),
+        )
+    ops = cache.ops
 
     if items:
         if not reverse.is_collection:

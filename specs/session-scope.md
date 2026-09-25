@@ -76,7 +76,8 @@ tags: [session, db_session, permissions, async, sync]
   allowed_exceptions / retry_exceptions / sql_debug / show_values`) сохраняют смысл
   в обоих скоупах; `retry` по-прежнему нельзя использовать как context manager.
 - **I4.** Sync/async-симметрия: `with db:` и `async with db:` проходят одни и те же
-  проверки; запрет смешения режимов (sync внутри async-сессии) действует и для
+  проверки; запрет смешения режимов действует в обе стороны (sync внутри
+  async-сессии и async внутри sync-сессии — `TransactionError` на входе) и для
   per-db скоупа.
 - **I5.** Разрешения не переживают внешний скоуп: следующий скоуп начинает с
   чистого набора.

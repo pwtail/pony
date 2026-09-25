@@ -9,6 +9,7 @@ ops — он делегирует этим async_* методам.
 
 import asyncio
 import threading
+import weakref
 from functools import wraps
 
 import mariadb as mariadb_module
@@ -56,27 +57,55 @@ def async_wrap_dbapi_exceptions(func):
 
 
 class _AsyncPools:
-    """Один AsyncConnectionPool на запущенный event loop (пулы привязаны к loop)."""
+    """Один AsyncConnectionPool на запущенный event loop (пулы привязаны к loop).
+
+    Ключи слабые: закрытый loop не удерживает пул (среды с loop-per-test не
+    утекают соединениями). Пул открывается один раз.
+    """
 
     def __init__(self, provider):
         self.provider = provider
-        self._pools = {}
+        self._pools = weakref.WeakKeyDictionary()
+        self._opened = weakref.WeakSet()
         self._lock = threading.Lock()
 
     def get_pool(self):
         loop = asyncio.get_running_loop()
         with self._lock:
-            pool = self._pools.get(loop)
-            if pool is None:
-                pool = AsyncConnectionPool(
-                    connection_factory=mariadb.asyncio.connect,
-                    config=PoolConfig(
-                        min_size=1, max_size=10, reset_connection=True
-                    ),
-                    **self.provider._async_pool_params,
-                )
-                self._pools[loop] = pool
+            try:
+                return self._pools[loop]
+            except KeyError:
+                pass
+            provider = self.provider
+            pool = AsyncConnectionPool(
+                connection_factory=mariadb.asyncio.connect,
+                config=PoolConfig(
+                    min_size=provider._async_pool_min_size,
+                    max_size=provider._async_pool_max_size,
+                    reset_connection=True,
+                ),
+                **provider._async_pool_params,
+            )
+            self._pools[loop] = pool
+            return pool
+
+    async def get_open_pool(self):
+        pool = self.get_pool()
+        if pool not in self._opened:
+            await pool.open()
+            self._opened.add(pool)
         return pool
+
+    def close_all(self):
+        """Best-effort закрытие пулов из sync Database.disconnect()."""
+        for loop, pool in list(self._pools.items()):
+            try:
+                if loop.is_running() and not loop.is_closed():
+                    future = asyncio.run_coroutine_threadsafe(pool.close(), loop)
+                    future.result(timeout=5)
+            except Exception:
+                pass
+        self._pools.clear()
 
 
 class MariadbAsyncProvider(MariaDBProvider):
@@ -87,9 +116,15 @@ class MariadbAsyncProvider(MariaDBProvider):
     """
 
     def __init__(self, _database, *args, **kwargs):
+        # pony_async_pool_* — до super().__init__: в sync-пул не нужны
+        self._async_pool_min_size = int(kwargs.pop("pony_async_pool_min_size", 1))
+        self._async_pool_max_size = int(kwargs.pop("pony_async_pool_max_size", 10))
         super().__init__(_database, *args, **kwargs)
         self.async_ops = AsyncOps(self)
         self._async_pool_params = dict(kwargs)
+        # внутренние ключи core — не опции коннектора (как в postgres_async)
+        self._async_pool_params.pop("pony_call_on_connect", None)
+        self._async_pool_params.pop("pony_pool_mockup", None)
         # как MySQLProvider: rowcount = число совпавших строк (для optimistic check)
         self._async_pool_params.setdefault("client_flag", CLIENT.FOUND_ROWS)
         self._async_pools = _AsyncPools(self)
@@ -100,9 +135,12 @@ class MariadbAsyncProvider(MariaDBProvider):
 
     @async_wrap_dbapi_exceptions
     async def async_connect(self):
-        pool = self.async_pool
-        await pool.open()
+        pool = await self._async_pools.get_open_pool()
         return await pool.acquire()
+
+    def disconnect(self):
+        super().disconnect()
+        self._async_pools.close_all()
 
     @async_wrap_dbapi_exceptions
     async def async_set_transaction_mode(self, connection, cache):
@@ -135,7 +173,10 @@ class MariadbAsyncProvider(MariaDBProvider):
             assert arguments and not returning_id
             await cursor.executemany(sql, arguments)
         else:
-            await cursor.execute(sql, arguments)
+            if arguments is None:
+                await cursor.execute(sql)
+            else:
+                await cursor.execute(sql, arguments)
             if returning_id:
                 return cursor.lastrowid
 

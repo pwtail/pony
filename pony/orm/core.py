@@ -42,7 +42,6 @@ from pony.orm.dbapiprovider import (
 )
 from pony.orm.decompiling import decompile
 from pony.orm.drive import drive
-from pony.orm.ops import ops_for
 # Gen-функции и кэш сессии импортируются на уровне модуля: core_gen обращается
 # к атрибутам core только во время вызова, поэтому цикл core <-> core_gen
 # безопасен (раньше импорт был ленивым — внутри каждой функции).
@@ -850,6 +849,13 @@ class DBSessionContextManager:
 
     async def _async_enter(self):
         """Вход в сессию без проверок, рассчитанных на пользователя (для декоратора)."""
+        if local.db_context_counter and not local.async_db_context:
+            # обратный гард к __enter__: sync-сессия уже открыта в этой задаче
+            throw(
+                TransactionError,
+                "async db_session cannot be used inside a sync db_session: "
+                "mixing the two modes is not supported, use 'with db_session:'",
+            )
         local.async_db_context += 1
         try:
             self._begin()
@@ -889,7 +895,14 @@ class DBSessionContextManager:
                 try:
                     can_commit = self.allowed_exceptions(exc)
                 except BaseException:
-                    rollback_and_reraise(sys.exc_info())
+                    # sync rollback_and_reraise здесь не подходит: глобальный
+                    # rollback() в async-режиме возвращает корутину, которую
+                    # некому ждать — откатываем напрямую через async_rollback
+                    exc_info = sys.exc_info()
+                    try:
+                        await async_rollback()
+                    finally:
+                        reraise(*exc_info)
             if can_commit:
                 await async_commit()
                 for cache in _get_async_caches():
@@ -1645,9 +1658,21 @@ class Database:
     @cut_traceback
     def get_connection(self):
         cache = self._get_cache()
+        if cache.is_async:
+            # В async-сессии: await db.get_connection()
+            return self._async_get_connection(cache)
         if not cache.in_transaction:
             cache.immediate = True
             cache.prepare_connection_for_query_execution()
+            cache.in_transaction = True
+        connection = cache.connection
+        assert connection is not None
+        return connection
+
+    async def _async_get_connection(self, cache):
+        if not cache.in_transaction:
+            cache.immediate = True
+            await cache._gen.prepare_connection_for_query_execution()
             cache.in_transaction = True
         connection = cache.connection
         assert connection is not None
@@ -1692,10 +1717,18 @@ class Database:
             )
         if local.async_db_context:
             if not hasattr(self.provider, "async_pool"):
+                async_name = "%s_async" % self.provider_name
+                if async_name not in known_providers:
+                    throw(
+                        NotImplementedError,
+                        "async db_session requires an async-capable provider, "
+                        "and provider %r has no async variant (available: "
+                        "'postgres_async', 'mariadb_async')" % self.provider_name,
+                    )
                 throw(
                     NotImplementedError,
                     "async db_session requires an async-capable provider; "
-                    "bind the database as Database(%s, ...)" % "'postgres_async'",
+                    "bind the database as Database(%r, ...)" % async_name,
                 )
             cache = local.db2cache[self] = AsyncSessionCache(self)
         else:
@@ -1791,7 +1824,7 @@ class Database:
         cursor = await self._async_exec_raw_sql(
             sql, globals, locals, frame_depth=frame_depth + 1
         )
-        ops = ops_for(self.provider, True)
+        ops = self._get_cache().ops
         max_fetch_count = options.MAX_FETCH_COUNT
         if max_fetch_count is not None:
             result = await ops.fetchmany(cursor, max_fetch_count)
@@ -1825,7 +1858,7 @@ class Database:
         cursor = await self._async_exec_raw_sql(
             sql, globals, locals, frame_depth=frame_depth + 1
         )
-        ops = ops_for(self.provider, True)
+        ops = self._get_cache().ops
         return bool(await ops.fetchone(cursor))
 
     @cut_traceback
@@ -1908,11 +1941,22 @@ class Database:
         arguments = adapter(
             list(kwargs.values())
         )  # order of values same as order of keys
+        if _async_caches() is not None or local.async_db_context:
+            # В async-сессии: await db.insert(...)
+            return self._async_insert(sql, arguments, returning)
         if returning is not None:
             return self._exec_sql(
                 sql, arguments, returning_id=True, start_transaction=True
             )
         cursor = self._exec_sql(sql, arguments, start_transaction=True)
+        return getattr(cursor, "lastrowid", None)
+
+    async def _async_insert(self, sql, arguments, returning):
+        if returning is not None:
+            return await exec_sql_gen(
+                self, sql, arguments, returning_id=True, start_transaction=True
+            )
+        cursor = await exec_sql_gen(self, sql, arguments, start_transaction=True)
         return getattr(cursor, "lastrowid", None)
 
     def _ast2sql(self, sql_ast):
@@ -2663,6 +2707,11 @@ class Database:
     @cut_traceback
     @db_session
     def from_json(self, changes, observer=None):
+        if _async_caches() is not None or local.async_db_context:
+            throw(
+                TransactionError,
+                "from_json() is a sync-only operation and cannot be used in an async session",
+            )
         changes = json.loads(changes)
 
         import pprint
@@ -6076,7 +6125,8 @@ class AsyncEntityLookup:
             kwargs = {attr.name: seed._vals_[attr] for attr in cls._pk_attrs_}
             obj = await cls.select().filter(**kwargs).get()
             if obj is None:
-                throw(ObjectNotFound, cls, seed)
+                self._discard_seed(cls, seed)
+                throw(ObjectNotFound, cls, seed._pkval_)
             return obj
         kwargs = {attr.name: value for attr, value in zip(cls._pk_attrs_, key)}
         avdict, pkval = cls._prepare_key_(kwargs)
@@ -6089,6 +6139,34 @@ class AsyncEntityLookup:
         if obj is None:
             throw(ObjectNotFound, cls, pkval)
         return obj
+
+    @staticmethod
+    def _discard_seed(cls, seed):
+        """Убирает призрачный seed из identity map после неудачного lookup'а.
+
+        Raw-key конвертация материализует seed до запроса; запрос доказал,
+        что строки нет, — seed надо убрать (иначе он останется в indexes/seeds
+        и фантомом всплывёт в батчах load_many и в коллекциях связанных
+        объектов). Вложенные seed'ы связанных сущностей не трогаем: их
+        существование запрос не опровергает.
+        """
+        cache = seed._session_cache_
+        pk_attrs = cls._pk_attrs_
+        if seed not in cache.seeds[pk_attrs]:
+            return  # это не seed (уже загруженный объект) — не наш случай
+        for attr in pk_attrs:
+            if attr.reverse:
+                val = seed._vals_[attr]
+                if val is not None:
+                    # зеркально созданию seed'а в _get_from_identity_map_
+                    # (там db_update_reverse(obj, NOT_LOADED, val)): old=val
+                    # снимает обратную связь, new=None — ничего не добавляет
+                    attr.db_update_reverse(seed, val, None)
+        cache.seeds[pk_attrs].discard(seed)
+        cache.objects.discard(seed)
+        if cache.indexes[pk_attrs].get(seed._pkval_) is seed:
+            del cache.indexes[pk_attrs][seed._pkval_]
+        seed._session_cache_ = None
 
     def __getattr__(self, name):
         if name.startswith("__"):
@@ -6898,6 +6976,10 @@ class EntityMeta(type):
                         throw(ObjectNotFound, cls, pkval)
                     seeds = cache.seeds[cls._pk_attrs_]
                     if obj in seeds:
+                        if cache.is_async:
+                            # sync _load_() в async-режиме недоступен; считаем
+                            # промахом — запрос догрузит seed и переклассифицирует
+                            return None, unique
                         obj._load_()
                 if not isinstance(obj, cls):
                     throw(ObjectNotFound, cls, pkval)
@@ -8537,6 +8619,11 @@ class Entity(metaclass=EntityMeta):
         )
         cache = self._session_cache_
         assert cache is not None and cache.is_alive and not cache.saved_objects
+        if cache.is_async:
+            throw(
+                TransactionError,
+                "obj.flush() is a sync operation; use 'await flush()' in an async session",
+            )
         with cache.flush_disabled():
             self._before_save_()  # should be inside flush_disabled to prevent infinite recursion
             # TODO: add to documentation that flush is disabled inside before_xxx hooks
@@ -8589,6 +8676,11 @@ class Entity(metaclass=EntityMeta):
     ):
         cache = self._session_cache_
         if cache is not None and cache.is_alive and cache.modified:
+            if cache.is_async:
+                throw(
+                    TransactionError,
+                    "to_dict() cannot flush in an async session; use 'await flush()' first",
+                )
             cache.flush()
         attrs = self.__class__._get_attrs_(only, exclude, with_collections, with_lazy)
         result = {}
@@ -9715,14 +9807,14 @@ class Query:
             aggr_func_name=aggr_func_name, aggr_func_distinct=distinct, sep=sep
         )
         cache = self._database._get_cache()
+        if cache.is_async:
+            # В async-сессии агрегаты всегда возвращают корутину: await query.count()
+            return self._async_aggregate(
+                aggr_func_name, sql, arguments, query_key, translator
+            )
         try:
             result = cache.query_results[query_key]
         except KeyError:
-            if cache.is_async:
-                # В async-сессии агрегаты возвращают корутину: await query.count()
-                return self._async_aggregate(
-                    aggr_func_name, sql, arguments, query_key, translator
-                )
             cursor = self._database._exec_sql(sql, arguments)
             row = cursor.fetchone()
             result = self._aggregate_result(
@@ -9739,8 +9831,12 @@ class Query:
 
         database = self._database
         cache = database._get_cache()
+        try:
+            return cache.query_results[query_key]
+        except KeyError:
+            pass
         cursor = await exec_sql_gen(database, sql, arguments)
-        ops = ops_for(database.provider, cache.is_async)
+        ops = cache.ops
         row = await ops.fetchone(cursor)
         result = self._aggregate_result(
             aggr_func_name, None if row is None else row[0], translator
@@ -9931,6 +10027,11 @@ class QueryResult:
     def __await__(self):
         """`await query[:10]` / `await query.limit(5)` — выборка среза в async-режиме."""
         return query_fetch_gen(self._query, self._limit, self._offset).__await__()
+
+    async def __aiter__(self):
+        """`async for x in query[:10]` — выборка среза и итерация в async-режиме."""
+        for item in await self:
+            yield item
 
     def _is_async(self):
         return self._query._is_async()

@@ -32,6 +32,7 @@ def drive(coro):
         next(iterator)
     except StopIteration as ex:
         return ex.value
+    coro.close()  # даём finally-блокам отработать перед тем как бросить
     raise RuntimeError(
         "drive() got a coroutine with real await points: "
         "an async session reached a sync-only code path (see docs/async.md)"

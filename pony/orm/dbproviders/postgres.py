@@ -41,8 +41,11 @@ class PonyListBinaryDumper(_PonyListDumperMixin, ListBinaryDumper):
     pass
 
 
-psycopg.adapters.register_dumper(list, PonyListBinaryDumper)
-psycopg.adapters.register_dumper(list, PonyListDumper)
+def register_pony_list_dumpers(conn):
+    """Per-connection регистрация: глобальный `psycopg.adapters.register_dumper`
+    менял бы поведение psycopg во всём процессе, включая чужой код."""
+    conn.adapters.register_dumper(list, PonyListBinaryDumper)
+    conn.adapters.register_dumper(list, PonyListDumper)
 
 from pony.orm import core, dbapiprovider, dbschema, ormtypes
 from pony.orm.core import log_orm
@@ -283,6 +286,7 @@ class PGPool(Pool):
             self.con = self.dbapi_module.connect(conninfo, **kwargs)
         else:
             self.con = self.dbapi_module.connect(*self.args, **kwargs)
+        register_pony_list_dumpers(self.con)
 
     def release(self, con):
         assert con is self.con
