@@ -111,7 +111,9 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
     деклараций моделей; `make <имя>.py` — следующая по номеру дата-миграция
     (заготовка: `# зависит: <голова>`, `from pony.orm import *`,
     `db = Database.instance().new()`,
-    `if __name__ == '__main__':` + `with db_session:`); `make <имя>.sql` —
+    `if __name__ == '__main__':` + `db.introspect()`; `with db_session:` не
+    генерится — миграция и так исполняется внутри сессии раннера, а
+    заготовка применяется после объявления нужных сущностей); `make <имя>.sql` —
     заготовка SQL-миграции
     с `-- depends:`; `apply`; `plan`; `merge`. Application — позиционный
     аргумент перед командой (`pony migrations myapplication make`); без него
