@@ -262,7 +262,7 @@ class TestMigrations(unittest.TestCase):
         self.assertEqual(os.path.basename(path), "0001_some_name.py")
         with open(path) as f:
             content = f.read()
-        self.assertIn("from pony.orm import Database, db_session", content)
+        self.assertIn("from pony.orm import *", content)
         self.assertIn("db = Database.instance().new()", content)
         self.assertIn("if __name__ == '__main__':", content)
         self.assertIn("with db_session:", content)
