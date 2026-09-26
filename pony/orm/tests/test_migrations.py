@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import sys
@@ -1058,6 +1059,122 @@ class TestMigrationsMariaDB(unittest.TestCase):
             )
         finally:
             paste_db.disconnect()
+
+
+class TestMigrationsConfig(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dir = os.path.join(self.tmp, "migrations")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _config(self):
+        return os.path.join(self.dir, "config.ini")
+
+    def test_save_creates_dir_and_reads_back(self):
+        path = migrations.save_config_db(self.dir, "myapp.models:db")
+        self.assertEqual(path, self._config())
+        self.assertTrue(os.path.isdir(self.dir))
+        self.assertEqual(migrations.read_config_db(self.dir), "myapp.models:db")
+        with open(path) as f:
+            content = f.read()
+        self.assertIn("[database]", content)
+        self.assertIn("path = myapp.models:db", content)
+
+    def test_save_preserves_other_sections(self):
+        os.makedirs(self.dir)
+        with open(self._config(), "w") as f:
+            f.write("[other]\nkey = value\n\n[database]\npath = old:db\n")
+        migrations.save_config_db(self.dir, "new:db")
+        self.assertEqual(migrations.read_config_db(self.dir), "new:db")
+        with open(self._config()) as f:
+            content = f.read()
+        self.assertIn("key = value", content)
+        self.assertIn("path = new:db", content)
+
+    def test_read_missing_or_empty_is_none(self):
+        self.assertIsNone(migrations.read_config_db(self.dir))
+        os.makedirs(self.dir)
+        with open(self._config(), "w") as f:
+            f.write("[other]\nkey = value\n")
+        self.assertIsNone(migrations.read_config_db(self.dir))
+        with open(self._config(), "w") as f:
+            f.write("[database]\npath =   \n")
+        self.assertIsNone(migrations.read_config_db(self.dir))
+
+    def test_malformed_config_is_an_error(self):
+        os.makedirs(self.dir)
+        with open(self._config(), "w") as f:
+            f.write("not an ini file\n")
+        with self.assertRaises(migrations.MigrationError):
+            migrations.read_config_db(self.dir)
+        with self.assertRaises(migrations.MigrationError):
+            migrations.save_config_db(self.dir, "x:y")
+
+    def test_config_is_not_a_migration(self):
+        migrations.save_config_db(self.dir, "x:y")
+        self.assertEqual(migrations.list_migrations(self.dir), [])
+
+
+class TestMigrationsConfigCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dir = os.path.join(self.tmp, "migrations")
+        self.db = Database("sqlite", os.path.join(self.tmp, "t.db"), create_db=True)
+        self.db.application("main", schema="public")
+        self.module = types.ModuleType("pony_config_test_mod")
+        self.module.db = self.db
+        sys.modules[self.module.__name__] = self.module
+        self.spec = self.module.__name__ + ":db"
+
+    def tearDown(self):
+        sys.modules.pop(self.module.__name__, None)
+        self.db.disconnect()
+        shutil.rmtree(self.tmp)
+
+    def _run(self, argv):
+        stderr = io.StringIO()
+        original = sys.stderr
+        sys.stderr = stderr
+        try:
+            code = migrations.main(argv)
+        finally:
+            sys.stderr = original
+        return code, stderr.getvalue()
+
+    def _config(self):
+        return os.path.join(self.dir, "config.ini")
+
+    def test_db_is_saved_and_reused(self):
+        code, _ = self._run(
+            ["migrations", "plan", "--db", self.spec, "--dir", self.dir]
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(self._config()))
+        self.assertEqual(migrations.read_config_db(self.dir), self.spec)
+        code, _ = self._run(["migrations", "plan", "--dir", self.dir])
+        self.assertEqual(code, 0)
+
+    def test_db_overrides_saved_config(self):
+        migrations.save_config_db(self.dir, "old.module:db")
+        code, _ = self._run(
+            ["migrations", "plan", "--db", self.spec, "--dir", self.dir]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(migrations.read_config_db(self.dir), self.spec)
+
+    def test_missing_db_and_config_mentions_config_path(self):
+        code, err = self._run(["migrations", "plan", "--dir", self.dir])
+        self.assertEqual(code, 1)
+        self.assertIn(self._config(), err)
+
+    def test_invalid_db_is_not_saved(self):
+        code, _ = self._run(
+            ["migrations", "plan", "--db", "not_a_spec", "--dir", self.dir]
+        )
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(self._config()))
 
 
 if __name__ == "__main__":
