@@ -3,7 +3,7 @@ import os
 import sys
 from os.path import dirname
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 
 def detect_mode():

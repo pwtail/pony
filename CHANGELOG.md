@@ -1,3 +1,16 @@
+# poney release 0.8.2 (2026-09-26)
+
+## Features
+
+* Migrations CLI remembers the database: `--db <module>:<attr>` is saved to `<dir>/config.ini` (`[database] path`), so later commands need no `--db`; the file lives in the migrations directory, is created with it and keeps unrelated sections on rewrite
+* Data migration template (`pony migrations <app> make <name>.py`) now starts with `from pony.orm import *` and ends with an explicit `db.introspect()`; the redundant `with db_session:` wrapper is no longer generated (the runner already owns the session)
+* Merge migration `.txt` history is written as plain ASCII art without the `--` comment prefix (the first line stays `-- depends:`)
+
+## Breaking changes
+
+* `python -m pony.migrations` takes the command directly (`python -m pony.migrations apply`); the leading `migrations` word — a subcommand of the `pony` command — is now rejected
+
+
 # poney release 0.8.1 (2026-09-25)
 
 ## Breaking changes
