@@ -27,6 +27,11 @@ myapplication/0002.sql`). Порядок применения — тополог
 лексикографическим tie-break; у графа каждого application должна быть ровно
 одна голова.
 
+Спецификация БД (`--db`) сохраняется в `<dir>/config.ini` (секция
+`[database]`, ключ `path`); последующие вызовы обходятся без `--db`. Конфиг
+лежит в папке миграций (`--dir`, по умолчанию `migrations`) и создаётся
+вместе с ней.
+
 CLI::
 
     pony migrations make --db myapp.models:db
@@ -37,6 +42,7 @@ CLI::
 """
 
 import argparse
+import configparser
 import hashlib
 import heapq
 import importlib
@@ -51,6 +57,9 @@ from pony.orm.core import Database, db_session
 
 
 MIGRATIONS_TABLE = "pony_migrations"
+CONFIG_FILE_NAME = "config.ini"
+DATABASE_SECTION = "database"
+DATABASE_PATH_OPTION = "path"
 
 MigrationInfo = namedtuple("MigrationInfo", "app name dependencies applied")
 
@@ -952,6 +961,52 @@ def merge_migration(db, directory, name="merge", app=None):
     return path
 
 
+def config_path(directory):
+    """Путь к конфигу миграций: `<directory>/config.ini`."""
+    return os.path.join(directory, CONFIG_FILE_NAME)
+
+
+def read_config_db(directory):
+    """Спецификация БД из `<directory>/config.ini` (`[database] path`).
+    None — файла, секции или значения нет."""
+    path = config_path(directory)
+    if not os.path.exists(path):
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path) as f:
+            parser.read_file(f)
+    except (configparser.Error, OSError) as e:
+        raise MigrationError("Cannot read %s: %s" % (path, e))
+    if not parser.has_option(DATABASE_SECTION, DATABASE_PATH_OPTION):
+        return None
+    spec = parser.get(DATABASE_SECTION, DATABASE_PATH_OPTION).strip()
+    return spec or None
+
+
+def save_config_db(directory, spec):
+    """Пишет `[database] path = spec` в `<directory>/config.ini`, сохраняя
+    остальные секции и ключи. Создаёт папку миграций, если её нет."""
+    path = config_path(directory)
+    parser = configparser.ConfigParser(interpolation=None)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                parser.read_file(f)
+        except (configparser.Error, OSError) as e:
+            raise MigrationError("Cannot read %s: %s" % (path, e))
+    if not parser.has_section(DATABASE_SECTION):
+        parser.add_section(DATABASE_SECTION)
+    parser.set(DATABASE_SECTION, DATABASE_PATH_OPTION, spec)
+    os.makedirs(directory, exist_ok=True)
+    try:
+        with open(path, "w") as f:
+            parser.write(f)
+    except OSError as e:
+        raise MigrationError("Cannot write %s: %s" % (path, e))
+    return path
+
+
 def _load_db(spec):
     if ":" not in spec:
         raise MigrationError(
@@ -1019,7 +1074,8 @@ def main(argv=None):
     common.add_argument(
         "--db",
         default=argparse.SUPPRESS,
-        help="database object as <module>:<attr> (e.g. myapp.models:db)",
+        help="database object as <module>:<attr> (e.g. myapp.models:db); "
+        "saved to <dir>/config.ini for subsequent runs",
     )
     common.add_argument(
         "--dir",
@@ -1067,13 +1123,20 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
-        spec = getattr(args, "db", None)
-        if not spec:
-            raise MigrationError(
-                "Database is not specified: use --db <module>:<attr>"
-            )
-        db = _load_db(spec)
         directory = getattr(args, "directory", None) or "migrations"
+        spec = getattr(args, "db", None)
+        if spec:
+            db = _load_db(spec)
+            save_config_db(directory, spec)
+        else:
+            spec = read_config_db(directory)
+            if not spec:
+                raise MigrationError(
+                    "Database is not specified: use --db <module>:<attr> or "
+                    "put `path = <module>:<attr>` into [%s] of %s"
+                    % (DATABASE_SECTION, config_path(directory))
+                )
+            db = _load_db(spec)
         if application is not None and application not in db._apps:
             raise MigrationError(
                 "Unknown application %r. Registered applications: %s"
