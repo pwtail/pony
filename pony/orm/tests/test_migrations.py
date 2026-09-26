@@ -265,16 +265,28 @@ class TestMigrations(unittest.TestCase):
         self.assertIn("from pony.orm import *", content)
         self.assertIn("db = Database.instance().new()", content)
         self.assertIn("if __name__ == '__main__':", content)
-        self.assertIn("with db_session:", content)
+        self.assertIn("db.introspect()", content)
+        self.assertNotIn("with db_session:", content)
         self.assertNotIn("depends", content)
         path2 = migrations.make_named_migration(db, self.dir, "second.py", app="main")
         self.assertEqual(os.path.basename(path2), "0002_second.py")
         with open(path2) as f:
             self.assertIn("# depends: 0001_some_name.py", f.read())
+        # заготовка зовёт db.introspect(), поэтому применяется только после
+        # объявления сущностей — порядок проверяем через plan (не исполняет)
+        infos = migrations.plan_migrations(db, self.dir, app="main")
         self.assertEqual(
-            migrations.apply_migrations(db, self.dir),
-            ["main/0001_some_name.py", "main/0002_second.py"],
+            [info.name for info in infos],
+            ["0001_some_name.py", "0002_second.py"],
         )
+
+    def test_named_data_migration_needs_declared_entities(self):
+        from pony.orm import introspection
+
+        db = self.db
+        migrations.make_named_migration(db, self.dir, "seed.py", app="main")
+        with self.assertRaises(introspection.IntrospectionError):
+            migrations.apply_migrations(db, self.dir, app="main")
 
     def test_add_named_sql_migration(self):
         db = self.db
