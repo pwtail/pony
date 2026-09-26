@@ -201,6 +201,10 @@ class TestMigrationGraph(unittest.TestCase):
         self.assertIn("┴", content)
         self.assertIn("┬", content)
         lines = content.splitlines()
+        art_lines = [line for line in lines[1:] if line.strip()]
+        self.assertTrue(
+            all(not line.startswith("--") for line in art_lines)
+        )
         merge_line = next(
             i for i, line in enumerate(lines) if "0004_merge.txt" in line
         )
