@@ -8,7 +8,7 @@ apply`); слово `migrations` — подкоманда консольного
 внутри внешней `db_session` раннера — одна транзакция на миграцию); свежую
 базу к той же БД скрипт создаёт сам::
 
-    from pony.orm import Database, db_session
+    from pony.orm import *
 
     db = Database.instance().new()
 

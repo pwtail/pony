@@ -512,7 +512,7 @@ def make_named_migration(db, directory, file_name, app=None):
     if ext == ".py":
         if lines:
             lines.append("")
-        lines.append("from pony.orm import Database, db_session")
+        lines.append("from pony.orm import *")
         lines.append("")
         lines.append("db = Database.instance().new()")
         lines.append("")
