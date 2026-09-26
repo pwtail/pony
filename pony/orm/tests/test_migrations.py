@@ -304,24 +304,6 @@ class TestMigrations(unittest.TestCase):
         migrations.apply_migrations(db, self.dir)
         self.assertEqual(self._applied_names(), ["0001_x.py"])
 
-    def test_module_entry_point(self):
-        import subprocess
-
-        root = os.path.dirname(
-            os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            )
-        )
-        result = subprocess.run(
-            [sys.executable, "-m", "pony.migrations", "--help"],
-            capture_output=True,
-            text=True,
-            cwd=root,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("merge", result.stdout)
-        self.assertIn("pony migrations", result.stdout)
-
     def test_modified_after_apply_is_an_error(self):
         db = self.db
         self._write("0001_a.sql", 'CREATE TABLE "ta" (id integer)')
@@ -1175,6 +1157,36 @@ class TestMigrationsConfigCLI(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertFalse(os.path.exists(self._config()))
+
+
+class TestMigrationsModuleEntry(unittest.TestCase):
+    """`python -m pony.migrations` принимает команду сразу, без `migrations`."""
+
+    def _run(self, *args):
+        import subprocess
+
+        root = os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+        )
+        return subprocess.run(
+            [sys.executable, "-m", "pony.migrations", *args],
+            capture_output=True,
+            text=True,
+            cwd=root,
+        )
+
+    def test_help(self):
+        result = self._run("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("merge", result.stdout)
+        self.assertIn("pony migrations", result.stdout)
+
+    def test_rejects_migrations_prefix(self):
+        result = self._run("migrations", "apply")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("python -m pony.migrations apply", result.stderr)
 
 
 if __name__ == "__main__":
