@@ -39,6 +39,9 @@ CLI::
     pony migrations plan --db myapp.models:db
     pony migrations merge --db myapp.models:db [--name NAME]
     pony migrations <application> make --db myapp.models:db
+
+`python -m pony.migrations` — то же самое без слова `migrations` (команда
+идёт сразу: `python -m pony.migrations apply`)
 """
 
 import argparse

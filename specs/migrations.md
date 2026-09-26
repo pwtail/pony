@@ -104,7 +104,10 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
    Откат данных (`down`) не определён — вне этапов 1–3.
 10. **CLI** (решение пользователя): команда `pony`, подкоманда `migrations`
     (`pony migrations ...`) и запуск `python -m pony.migrations` (модуль
-    `pony/migrations.py`). `make` без аргумента — `0001_initial.sql` из
+    `pony/migrations.py`). В модульном запуске команда идёт сразу, без
+    подкоманды `migrations` (`python -m pony.migrations apply`); ведущий
+    `migrations` — ошибка, это слово принадлежит консольной команде `pony`.
+    `make` без аргумента — `0001_initial.sql` из
     деклараций моделей; `make <имя>.py` — следующая по номеру дата-миграция
     (заготовка: `# зависит: <голова>`, `from pony.orm import Database, db_session`,
     `db = Database.instance().new()`,
