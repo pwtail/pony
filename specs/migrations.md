@@ -109,7 +109,7 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
     `migrations` — ошибка, это слово принадлежит консольной команде `pony`.
     `make` без аргумента — `0001_initial.sql` из
     деклараций моделей; `make <имя>.py` — следующая по номеру дата-миграция
-    (заготовка: `# зависит: <голова>`, `from pony.orm import Database, db_session`,
+    (заготовка: `# зависит: <голова>`, `from pony.orm import *`,
     `db = Database.instance().new()`,
     `if __name__ == '__main__':` + `with db_session:`); `make <имя>.sql` —
     заготовка SQL-миграции
