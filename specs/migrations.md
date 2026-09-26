@@ -153,7 +153,8 @@ references: [pony-async-goal-and-requirements, pony-entity-declarations, pony-in
 3. **Граф зависимостей** (`pony-migration-graph`): зависимости в шапке файла
    (`-- depends:` / `# depends:`), топосорт с ветками; граф обязан иметь ровно
    одну голову — иначе `apply`/`plan` требуют слияния, а `pony migrations merge`
-   создаёт `.txt` с ASCII-историей двух веток (новые миграции — сверху);
+   создаёт `.txt` с ASCII-историей двух веток (новые миграции — сверху;
+   первая строка — `-- depends:`, дальше голая ASCII-история без `--`-префикса);
    команда `pony migrations plan` и `db.migrations.plan()` вместо `--dry-run`.
 
 # Вне области (non-goals)
