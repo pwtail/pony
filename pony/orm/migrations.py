@@ -956,8 +956,8 @@ def merge_migration(db, directory, name="merge", app=None):
     if os.path.exists(path):
         raise MigrationError("Migration %r already exists" % path)
     art = _render_history(file_name, left_names, right_names, common_names)
-    lines = ["-- depends: %s, %s" % (head_a, head_b), "--"]
-    lines.extend(("-- " + line).rstrip() for line in art)
+    lines = ["-- depends: %s, %s" % (head_a, head_b), ""]
+    lines.extend(art)
     with open(path, "w") as f:
         f.write("\n".join(lines))
         f.write("\n")
