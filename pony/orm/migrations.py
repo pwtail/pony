@@ -517,8 +517,7 @@ def make_named_migration(db, directory, file_name, app=None):
         lines.append("db = Database.instance().new()")
         lines.append("")
         lines.append("if __name__ == '__main__':")
-        lines.append("    with db_session:")
-        lines.append("        pass")
+        lines.append("    db.introspect()")
     elif not lines:
         lines.append("-- migration has no dependencies")
     with open(path, "w") as f:

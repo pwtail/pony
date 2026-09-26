@@ -13,8 +13,7 @@ apply`); слово `migrations` — подкоманда консольного
     db = Database.instance().new()
 
     if __name__ == '__main__':
-        with db_session:
-            ...
+        db.introspect()
 """
 
 import sys
